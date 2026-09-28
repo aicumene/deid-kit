@@ -1,0 +1,181 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 Alexandra Bernadotte
+"""The proxy end to end, against a scripted upstream that plays the model."""
+
+import json
+import re
+
+import pytest
+
+aiohttp = pytest.importorskip("aiohttp")
+from aiohttp import web                                     # noqa: E402
+from aiohttp.test_utils import TestClient, TestServer       # noqa: E402
+
+from deidkit.patterns import RegexDetector                  # noqa: E402
+from deidkit.proxy.server import Proxy, ProxyConfig         # noqa: E402
+from deidkit.seeds import InMemorySeedSource, SeedEntity    # noqa: E402
+from deidkit.sqlite_store import SQLiteTokenStore           # noqa: E402
+
+TOKEN = re.compile(r"PERSON_\d+")
+
+
+def sse(name, data):
+    return f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+class Model:
+    """Plays the provider: records what it received, answers with the person's token."""
+
+    def __init__(self):
+        self.received: list[dict] = []
+        self.headers: list[dict] = []
+
+    async def messages(self, request):
+        body = await request.json()
+        self.received.append(body)
+        self.headers.append(dict(request.headers))
+        token = TOKEN.search(json.dumps(body)).group(0)
+        text = f"I read the letter from {token}. Writing the summary."
+        tool = json.dumps({"file_path": "/work/summary.md", "content": f"{token} confirmed the terms."})
+        resp = web.StreamResponse(headers={"content-type": "text/event-stream",
+                                           "request-id": "req_1", "x-should-retry": "false"})
+        await resp.prepare(request)
+        await resp.write(sse("message_start", {"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "content": [],
+            "model": body["model"], "usage": {"input_tokens": 1, "output_tokens": 0}}}))
+        await resp.write(sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                                     "content_block": {"type": "text", "text": ""}}))
+        cut = text.index(token) + 4
+        for part in (text[:cut], text[cut:]):
+            await resp.write(sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                         "delta": {"type": "text_delta", "text": part}}))
+            await resp.write(sse("ping", {"type": "ping"}))
+        await resp.write(sse("content_block_stop", {"type": "content_block_stop", "index": 0}))
+        await resp.write(sse("content_block_start", {"type": "content_block_start", "index": 1,
+                                                     "content_block": {"type": "tool_use", "id": "tu_1",
+                                                                       "name": "Write", "input": {}}}))
+        for part in (tool[:20], tool[20:]):
+            await resp.write(sse("content_block_delta", {"type": "content_block_delta", "index": 1,
+                                                         "delta": {"type": "input_json_delta",
+                                                                   "partial_json": part}}))
+        await resp.write(sse("content_block_stop", {"type": "content_block_stop", "index": 1}))
+        await resp.write(sse("message_delta", {"type": "message_delta",
+                                               "delta": {"stop_reason": "tool_use"},
+                                               "usage": {"output_tokens": 20}}))
+        await resp.write(sse("message_stop", {"type": "message_stop"}))
+        await resp.write_eof()
+        return resp
+
+    async def count(self, request):
+        self.received.append(await request.json())
+        return web.json_response({"input_tokens": 42})
+
+
+async def read_stream(resp):
+    text, tool, names = "", "", []
+    async for raw in resp.content:
+        line = raw.decode().strip()
+        if line.startswith("event:"):
+            names.append(line[6:].strip())
+        if not line.startswith("data:"):
+            continue
+        data = json.loads(line[5:])
+        if data.get("type") == "content_block_delta":
+            d = data["delta"]
+            text += d.get("text", "")
+            tool += d.get("partial_json", "")
+    return text, tool, names
+
+
+@pytest.fixture
+async def rig(tmp_path):
+    model = Model()
+    upstream_app = web.Application()
+    upstream_app.router.add_post("/v1/messages", model.messages)
+    upstream_app.router.add_post("/v1/messages/count_tokens", model.count)
+    upstream = TestServer(upstream_app)
+    await upstream.start_server()
+
+    seeds = InMemorySeedSource()
+    seeds.add_entity("case-1", SeedEntity("individual", "Ada Brenner", role="Director"))
+    store = SQLiteTokenStore(tmp_path / "vault.sqlite")
+    record = tmp_path / "record.jsonl"
+    cfg = ProxyConfig(default_scope="case-1", upstream=str(upstream.make_url("")).rstrip("/"),
+                      record=record, audit=tmp_path / "audit.jsonl", detector=RegexDetector(),
+                      seeds=seeds)
+    client = TestClient(TestServer(Proxy(store, cfg).app()))
+    await client.start_server()
+    yield model, client, record, tmp_path
+    await client.close()
+    await upstream.close()
+
+
+def first_request():
+    return {"model": "claude-test", "max_tokens": 200, "stream": True,
+            "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=9; cch=1;"},
+                       {"type": "text", "text": "Working directory: /work/Brenner"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text":
+                          "Summarise the letter Ada Brenner sent (ada.brenner@harrowgate.example)."}]}]}
+
+
+async def test_a_turn_through_the_proxy(rig):
+    model, client, record, tmp = rig
+    resp = await client.post("/v1/messages", json=first_request(),
+                             headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01",
+                                      "anthropic-beta": "a,b"})
+    assert resp.status == 200
+    assert resp.headers["request-id"] == "req_1" and resp.headers["x-should-retry"] == "false"
+    text, tool, names = await read_stream(resp)
+
+    sent = json.dumps(model.received[0])
+    assert "Brenner" not in sent and "ada.brenner@" not in sent        # nothing real crossed
+    assert model.headers[0]["x-api-key"] == "test-key"                   # credentials pass through
+    assert model.headers[0]["anthropic-beta"] == "a,b"
+    assert "x-deid-scope" not in {k.lower() for k in model.headers[0]}
+    assert text == "I read the letter from Ada Brenner. Writing the summary."
+    assert json.loads(tool) == {"file_path": "/work/summary.md", "content": "Ada Brenner confirmed the terms."}
+    assert names.count("ping") == 2                                      # keep-alives forwarded
+
+    # The record holds what crossed, in tokens; the audit holds hashes, never content.
+    crossed = record.read_text()
+    assert "Brenner" not in crossed and "PERSON_" in crossed
+    audit = (tmp / "audit.jsonl").read_text()
+    assert "Brenner" not in audit and "sha256" in audit
+
+    # Next turn: the agent sends back what it was shown; the model gets its own words again.
+    body = first_request()
+    body["messages"] += [
+        {"role": "assistant", "content": [
+            {"type": "text", "text": text},
+            {"type": "tool_use", "id": "tu_1", "name": "Write", "input": json.loads(tool)}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1",
+                                      "content": "File written: /work/summary.md"}]}]
+    resp = await client.post("/v1/messages", json=body, headers={"x-api-key": "test-key"})
+    await read_stream(resp)
+    second = model.received[1]
+    assert second["messages"][:1] == model.received[0]["messages"]       # history unchanged
+    token = TOKEN.search(json.dumps(model.received[0])).group(0)
+    assert second["messages"][1]["content"][0]["text"] == \
+        f"I read the letter from {token}. Writing the summary."
+    assert second["messages"][1]["content"][1]["input"]["content"] == f"{token} confirmed the terms."
+    assert "Brenner" not in json.dumps(second)
+
+
+async def test_count_tokens_is_tokenised_too(rig):
+    model, client, record, tmp = rig
+    body = first_request()
+    body.pop("stream")
+    resp = await client.post("/v1/messages/count_tokens", json=body)
+    assert resp.status == 200 and (await resp.json()) == {"input_tokens": 42}
+    assert "Brenner" not in json.dumps(model.received[0])
+
+
+async def test_what_the_proxy_cannot_read_is_not_sent(rig):
+    model, client, record, tmp = rig
+    body = first_request()
+    body["messages"][0]["content"].append({"type": "hologram"})
+    resp = await client.post("/v1/messages", json=body)
+    assert resp.status == 400 and "hologram" in (await resp.json())["error"]["message"]
+    resp = await client.post("/v1/files", data=b"x")
+    assert resp.status == 403
+    assert model.received == []

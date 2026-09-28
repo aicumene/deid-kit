@@ -6,10 +6,58 @@ data (client documents, e-mails, test fixtures, logs, database exports), that da
 machine on every turn. This page describes how to put deid-kit between the agent and the model,
 so that the agent works on the real files while the model receives tokens.
 
-**Status.** deid-kit is a library: the vault, the gateway, the detector interface and the
-probe described in the [README](../README.md). The proxy, the hook scripts, the working-copy
-commands and the scanner below are small programs built on it. This page specifies them. They
-are not part of the package yet.
+**Status.** The proxy for Claude Code (Anthropic's Messages API) is in the package:
+`deid-proxy`, with the extra `proxy`. The proxy for Codex, the hook scripts, the working-copy
+commands and the scanner are specified on this page but are not part of the package yet.
+
+## Quick start: Claude Code
+
+```sh
+pip install -e '.[proxy]'                       # from a checkout of this repository
+deid-proxy --scope client-a --seeds ~/private/deid.toml
+```
+
+`deid.toml` lists the people and organisations you already know (see `src/deidkit/seedfile.py`
+for the format). It holds real names, so keep it outside the repository you work in:
+
+```toml
+[[entity]]
+type = "individual"
+name = "Ada Brenner"
+
+[[entity]]
+type = "company"
+name = "Harrowgate Freight Ltd"
+```
+
+Then, in the shell where you start Claude Code:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_CUSTOM_HEADERS="x-deid-scope: client-a"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+claude
+```
+
+- **Where things are kept.** The vault goes to `~/.deid/vault.sqlite` and the audit to
+  `~/.deid/audit.jsonl`; both files are readable by their owner only.
+- **Recording.** `--record FILE` also writes what crossed, in tokens, so that you can check it.
+- **What is detected.** Besides the known names, the proxy detects only patterns: e-mail
+  addresses, IBANs, payment cards and international phone numbers (`deidkit.patterns`). It runs
+  no name recognition, because such a model reads identifiers in code as people. A person whose
+  e-mail address appears is enrolled from the address as well.
+- **Not applied yet.** Street addresses and initials, which the vault can tokenize, are not yet
+  applied by the proxy.
+
+**Measured on 28 September 2026.** The test used Claude Code 2.1.263 signed in with a claude.ai
+subscription and a folder of invented names. Claude Code read a letter, wrote a summary file and
+answered.
+- **What crossed:** none of the names, e-mail addresses, the phone number or the IBAN, checked
+  word by word and through the vault. The model saw `PERSON_85844766`, `EMAIL_53250088`,
+  `IBAN_97199306`.
+- **What stayed on the machine:** the summary file and the answer, both with the real values.
+- **Across turns:** the second turn read 36,563 tokens from the prompt cache. The model's
+  reasoning blocks went back and forth without a rejection.
 
 ## The idea
 
@@ -72,9 +120,10 @@ way back. The agent's credentials pass through the proxy; the proxy does not sto
    cached pieces that contain it are tokenized again, which costs one prompt-cache miss.
 3. **Merge.** It combines the mappings of all the pieces with `vault.merge_mappings`, so each
    person is written one way in the reply.
-4. **Refuse what it cannot read.** Images, PDFs and other binary blocks are refused with an
-   error the agent shows; convert documents to text on the machine first. Block types it does
-   not know are refused too. The model's reasoning (`thinking` and `redacted_thinking` blocks,
+4. **Withhold what it cannot read.** Images, PDFs and other binary blocks are replaced with a
+   short note telling the model they were withheld; with `--binary refuse` the request is refused
+   instead. Convert documents to text on the machine first. A block type the proxy does not
+   know refuses the request. The model's reasoning (`thinking` and `redacted_thinking` blocks,
    OpenAI `reasoning` items) passes through untouched. It was produced from tokenized input,
    and it is signed or encrypted, so it must go back to the provider unchanged.
 5. **Audit.** It records the crossing with `PrivacyGateway.cross_to_cloud(..., pre_redacted=...)`:
@@ -381,7 +430,7 @@ the vault did not recognise.
   Measure before trusting it with real data (next section).
 - Tokens hide who. Dates, amounts, places and the shape of a document can still point to a
   case. The probe measures this.
-- Text only. Images, screenshots and PDFs are refused, not tokenized.
+- Text only. Images, screenshots and PDFs are withheld (or refused), not tokenized.
 - A newly enrolled name changes how earlier turns read, which costs one prompt-cache miss.
 - The model reasons about tokens, so it cannot see the spelling, the length or the initials of a
   name.

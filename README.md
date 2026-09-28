@@ -65,6 +65,10 @@ src/deidkit/
   textmatch.py       normalize — the comparison form every fold builds on
   lang.py            detect_language (Cyrillic share)
   jsonutil.py        extract_json — tolerant JSON from a model answer
+  sqlite_store.py    SQLiteTokenStore — the vault in one SQLite file, for one process
+  patterns.py        RegexDetector — e-mail, IBAN, card and phone patterns, no name recognition
+  seedfile.py        load_seed_files — known people and organisations from a TOML file
+  proxy/             deid-proxy — the local proxy between Claude Code and Anthropic's API
 tests/               pytest suite, no network, no database, invented names only
 ```
 
@@ -76,9 +80,10 @@ python3 -m venv .venv
 .venv/bin/pytest
 ```
 
-No runtime dependencies (standard library only). Optional extra `presidio` for
+No runtime dependencies (standard library only). Optional extra `proxy` (`aiohttp`) for
+`deid-proxy`; optional extra `presidio` for
 `PresidioDetector` and the gateway's default redactor (both import it lazily; a spaCy model such
-as `en_core_web_sm` is installed separately). Test extra: `pytest`, `pytest-asyncio`.
+as `en_core_web_sm` is installed separately). Test extra: `pytest`, `pytest-asyncio`, `aiohttp`.
 Python 3.11 or newer. llm-kit is not required; when it is installed, `Sensitivity`,
 `PrivacyViolation` and the request types are llm-kit's own objects (see `model.py`).
 
@@ -126,16 +131,20 @@ word for word from the code's first deployment, including its wording ("in this 
 ## Coding agents
 
 deid-kit can sit between a coding agent (Claude Code, Codex) and its model, so that the agent
-works on the real files while the model receives tokens. It can run as a local proxy in front of
-the model API, as Claude Code hooks, or through a tokenized working copy, and a pre-commit scan
-covers the other direction. See [docs/coding-agents.md](docs/coding-agents.md). That page
-specifies these programs; they are not part of the package yet.
+works on the real files while the model receives tokens. For Claude Code this works today:
+`deid-proxy` (extra `proxy`) runs on your machine in front of Anthropic's API. Point Claude Code at
+it with `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`, and list the names you know in a TOML file.
+[docs/coding-agents.md](docs/coding-agents.md) has the quick start and a measured run. It also
+specifies what is not built yet: the proxy for Codex, Claude Code hooks, a tokenized working
+copy, and a pre-commit scan.
 
 ## Tests
 
-`pytest` runs 241 tests (155 functions), with no network and no database. They are the original
-deployment's tests of this code re-expressed with invented names against the in-memory store,
-seed source and a scripted detector, plus tests of the interfaces themselves. Names are Latin
+`pytest` runs 267 tests, with no network and no database. Most are the original deployment's
+tests of this code re-expressed with invented names against the in-memory store, seed source and
+a scripted detector. The rest test the interfaces themselves, the SQLite store, the pattern
+detector and the proxy; the proxy is tested end to end against a scripted upstream on the
+loopback interface. Names are Latin
 script; Cyrillic behaviour is exercised through code points and through spellings the module
 generates from a Latin name.
 
