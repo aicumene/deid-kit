@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use deid-kit, please cite it as below."
+title: "deid-kit: reversible, per-scope de-identification of text sent to cloud models"
+type: software
+authors:
+  - family-names: Bernadotte
+    given-names: Alexandra
+    affiliation: AICumene
+version: 0.1.0
+date-released: 2026-09-28
+license: AGPL-3.0-only
+repository-code: "https://github.com/aicumene/deid-kit"
+keywords:
+  - de-identification
+  - pseudonymization
+  - privacy
+  - large language models
+  - personal data
