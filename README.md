@@ -123,6 +123,14 @@ Runtime text — the glossary lines and header, the probe's judge prompt, log me
 word for word from the code's first deployment, including its wording ("in this matter",
 "case file").
 
+## Coding agents
+
+deid-kit can sit between a coding agent (Claude Code, Codex) and its model, so that the agent
+works on the real files while the model receives tokens. It can run as a local proxy in front of
+the model API, as Claude Code hooks, or through a tokenized working copy, and a pre-commit scan
+covers the other direction. See [docs/coding-agents.md](docs/coding-agents.md). That page
+specifies these programs; they are not part of the package yet.
+
 ## Tests
 
 `pytest` runs 241 tests (155 functions), with no network and no database. They are the original
