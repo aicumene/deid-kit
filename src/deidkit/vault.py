@@ -1095,8 +1095,8 @@ async def _absorb(store: TokenStore, scope_id: ScopeId,
 # requirement this pass tokenised the word Cyprus, which is a JURISDICTION the design
 # deliberately preserves, in a document whose company number is legitimately enrolled.
 # Exactly 7 (IMO) or 9 (MMSI) digits, standing alone. The boundary classes are plain
-# alphanumerics: a comma legitimately FOLLOWS an identifier in a list — "(211000001,
-# 351000002)" is two MMSIs — and excluding it silently dropped the first of every such pair,
+# alphanumerics: a comma legitimately FOLLOWS an identifier in a list — "(200000001,
+# 200000002)" is two MMSIs — and excluding it silently dropped the first of every such pair,
 # which is how a primary MMSI stayed in clear next to its own hull's token.
 _ID_LITERAL = re.compile(r"(?<![0-9A-Za-z])(\d{9}|\d{7})(?![0-9A-Za-z])")
 _CALLSIGN = re.compile(r"(?<![0-9A-Za-z])(?=[A-Z0-9]{4,7}(?![0-9A-Za-z]))"
@@ -1150,7 +1150,7 @@ def _recall_identifiers(store: TokenStore, idx: _Index, scope_id: ScopeId,
                         text: str) -> bool:
     """Enrol identifier literals that sit beside an already-tokenised identifier of one hull.
 
-    MEASURED: "VESSEL_2 IMO: ID_5 MMSI: ID_13 (351000469) Flag: … Call sign: ID_14" — the
+    MEASURED: "VESSEL_2 IMO: ID_5 MMSI: ID_13 (200000469) Flag: … Call sign: ID_14" — the
     primary MMSI is a token and the alternate, in parentheses beside it, is in clear; the same
     shape leaked six MMSIs and one call sign across one document set, and one of them was a
     PRIMARY, not an alternate. The glossary's own exclusion list says flag, year built and all

@@ -35,7 +35,7 @@ def _fleet() -> Scope:
             ent("individual", "Nils Ostrander", role="Shareholder"),
             ent("individual", "Jonas Peter Mayer", role="Shareholder"),
             ent("individual", "Mira Novakova", role="Shareholder"),
-            ent("company", "SILVER BAY ASIA LIMITED", "5820417", identifier_type="company_no",
+            ent("company", "SILVER BAY ASIA LIMITED", "5820418", identifier_type="company_no",
                 jurisdiction_country="HK", role="Ship Owner"),
             ent("company", "Silver Bay Shipping Ltd", jurisdiction_country="CY"),
             ent("company", "Silver Rock Corporation, Ltd", jurisdiction_country="VG",
@@ -49,9 +49,9 @@ def _fleet() -> Scope:
             ent("company", "S.B. Argentina S.R.L.", jurisdiction_country="AR"),
             ent("company", "Marlix"),
             ent("vessel", "MARLIX"),
-            ent("vessel", "SILVER ROCK", "9418262", identifier_type="imo"),
+            ent("vessel", "SILVER ROCK", "2345674", identifier_type="imo"),
             ent("vessel", "SEA FINDER", "1234567", identifier_type="imo",
-                attributes={"imo": "1234567", "mmsi": "219000123", "callsign": "QX7Z3",
+                attributes={"imo": "1234567", "mmsi": "200000123", "callsign": "QX7Z3",
                             "year_built": "2011", "valuation_usd_low": 13800000}),
             ent("property", "Suburban house in Dayton, Ohio"),
         ],
@@ -98,7 +98,7 @@ async def test_a_country_name_is_never_tokenised():
 async def test_no_word_boundary_defect():
     """The measured payload said "Certificate of inPERSON_28"."""
     s = _fleet()
-    red = await s.tokenize("Certificate of incorporation: 5820417", language="en")
+    red = await s.tokenize("Certificate of incorporation: 5820418", language="en")
     assert red.text.startswith("Certificate of incorporation:")
     assert "ID_" in red.text                      # the number IS tokenised
 
@@ -218,8 +218,8 @@ async def test_mmsi_and_callsign_cross_as_tokens_not_in_clear():
     """The IMO was tokenised while the MMSI and call sign of the SAME hull crossed in clear on
     the same line, which re-identifies the token that was protecting it."""
     s = _fleet()
-    red = await s.tokenize("IMO: 1234567 MMSI: 219000123 Callsign: QX7Z3", language="en")
-    assert "219000123" not in red.text and "QX7Z3" not in red.text
+    red = await s.tokenize("IMO: 1234567 MMSI: 200000123 Callsign: QX7Z3", language="en")
+    assert "200000123" not in red.text and "QX7Z3" not in red.text
 
 
 async def test_diacritics_are_matched_against_the_ascii_enrolment():
@@ -444,7 +444,7 @@ async def test_glossary_never_names_anything():
                            language="en")
     blob = "\n".join(red.glossary)
     for real in ("Henry", "Zielinski", "SILVER BAY", "Silver Bay", "FINDER", "1234567",
-                 "Quorvane", "219000123", "QX7Z3"):
+                 "Quorvane", "200000123", "QX7Z3"):
         assert real not in blob, f"glossary leaked {real!r}"
 
 
@@ -452,7 +452,7 @@ async def test_glossary_excludes_identifiers_valuations_and_notes():
     s = _fleet()
     red = await s.tokenize("SEA FINDER and its owner SILVER BAY ASIA LIMITED", language="en")
     blob = "\n".join(red.glossary)
-    for excluded in ("2011", "13800000", "QX7Z3", "219000123", "Direct ownership", "5820417"):
+    for excluded in ("2011", "13800000", "QX7Z3", "200000123", "Direct ownership", "5820418"):
         assert excluded not in blob
 
 
@@ -817,9 +817,9 @@ async def test_a_secondary_mmsi_and_call_sign_beside_a_tokenised_one_do_not_cros
     one call sign leaked this way, and one of them was a PRIMARY, not an alternate."""
     s = _fleet()
     red = await s.tokenize(
-        "SEA FINDER\nIMO: 1234567\nMMSI: 219000123 (351000735, 219000987)\n"
+        "SEA FINDER\nIMO: 1234567\nMMSI: 200000123 (200000735, 200000987)\n"
         "Call sign: QX7Z3 (QX7Z4)\nFlag: PANAMA\nYear built: 2011", language="en")
-    for literal in ("351000735", "219000987", "QX7Z4"):
+    for literal in ("200000735", "200000987", "QX7Z4"):
         assert literal not in red.text, literal
     # ...and inside that same identifier record, a word is still a word: a call sign carries
     # digits; a flag name does not.
@@ -833,7 +833,7 @@ async def test_a_figure_inside_an_identifier_record_is_not_an_imo():
     Digit; a sum of money satisfies neither."""
     s = _fleet()
     red = await s.tokenize(
-        "SEA FINDER\nIMO: 1234567\nMMSI: 219000123\nValuation: 1380000 USD\n"
+        "SEA FINDER\nIMO: 1234567\nMMSI: 200000123\nValuation: 1380000 USD\n"
         "Purchase price 8250000", language="en")
     assert "1234567" not in red.text          # the real identifier is still caught
     assert "1380000" in red.text and "8250000" in red.text

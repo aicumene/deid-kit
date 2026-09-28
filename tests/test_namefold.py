@@ -219,12 +219,12 @@ def test_greek_homoglyphs_no_longer_hide_a_registration_number():
     """MEASURED: a company's registration number is "HE …" (Latin H, E); the document writes
     "ΗΕ …" (U+0397 U+0395) and it crossed in clear beside the token of the company it
     identifies."""
-    raw = "Marlow House Registration Number: ΗΕ 104857 Registration Date: 23.01.2008"
+    raw = "Marlow House Registration Number: ΗΕ 999817 Registration Date: 23.01.2008"
     hay, folded = nf.fold_haystack(raw)
-    hits = nf.find_all(hay, nf.key("HE 104857"))
+    hits = nf.find_all(hay, nf.key("HE 999817"))
     assert len(hits) == 1
     start, end = folded.raw_span(*hits[0])
-    assert raw[start:end] == "ΗΕ 104857"
+    assert raw[start:end] == "ΗΕ 999817"
 
 
 def test_russian_case_endings_are_generated_for_a_surname_but_not_for_a_latin_word():
