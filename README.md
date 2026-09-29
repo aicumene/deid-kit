@@ -137,12 +137,14 @@ works on the real files while the model receives tokens. This works today for bo
 Point the agent at it: `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` for Claude Code, a provider in
 `~/.codex/config.toml` for Codex. List the names you know in a TOML file.
 [docs/coding-agents.md](docs/coding-agents.md) has the quick start and a measured run with each
-agent. It also specifies what is not built yet: Claude Code hooks, a tokenized working copy, and
+agent. [docs/agent-setup.md](docs/agent-setup.md) is written for a coding agent: it walks through
+connecting a project, config for both agents, a check with invented names, and the working rules
+to add to the project's `CLAUDE.md` or `AGENTS.md`. It also specifies what is not built yet: Claude Code hooks, a tokenized working copy, and
 a pre-commit scan.
 
 ## Tests
 
-`pytest` runs 277 tests, with no network and no database. Most are the original deployment's
+`pytest` runs 280 tests, with no network and no database. Most are the original deployment's
 tests of this code re-expressed with invented names against the in-memory store, seed source and
 a scripted detector. The rest test the interfaces themselves, the SQLite store, the pattern
 detector and the proxy; the proxy is tested end to end against a scripted upstream on the

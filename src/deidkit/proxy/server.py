@@ -167,6 +167,8 @@ class Proxy:
         return self.cfg.upstream.rstrip("/") + request.path_qs
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
+        if request.path == "/deid/health":
+            return web.json_response({"ok": True, "service": "deid-proxy"})
         if request.headers.get("upgrade", "").lower() == "websocket":
             return web.Response(status=426, text="deid proxy: HTTP only")
         if request.method == "POST" and request.path in ("/v1/messages", "/v1/messages/count_tokens"):

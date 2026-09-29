@@ -8,7 +8,9 @@
 
 The vault (``~/.deid/vault.sqlite``) and the audit (``~/.deid/audit.jsonl``) stay on this machine;
 both are readable by their owner only. ``--record FILE`` also writes what crossed, in tokens,
-for checking that nothing else did.
+for checking that nothing else did:
+
+    deid-proxy check --record FILE --scope client-a      # exit status 1 when a known value crossed
 """
 
 from __future__ import annotations
@@ -27,7 +29,30 @@ from deidkit.seedfile import load_seed_files
 from deidkit.sqlite_store import SQLiteTokenStore
 
 
+def seed_files(files: list[str], directory: str | None) -> list[Path]:
+    """The seed files to load: those named, then every ``*.toml`` in ``directory`` (sorted)."""
+    out = [Path(f).expanduser() for f in files]
+    if directory:
+        out += sorted(Path(directory).expanduser().glob("*.toml"))
+    return out
+
+
+def check(argv: list[str]) -> None:
+    from deidkit.proxy.check import run
+    ap = argparse.ArgumentParser(prog="deid-proxy check",
+                                 description="Report whether a known value crossed, from a record.")
+    ap.add_argument("--record", required=True, help="the file written by deid-proxy --record")
+    ap.add_argument("--vault", default="~/.deid/vault.sqlite")
+    ap.add_argument("--scope", action="append", required=True, help="scope(s) to check against")
+    args = ap.parse_args(argv)
+    sys.exit(run(Path(args.record).expanduser(), Path(args.vault).expanduser(), args.scope))
+
+
 def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["check"]:
+        check(argv[1:])
+        return
     ap = argparse.ArgumentParser(prog="deid-proxy", description=__doc__.split("\n\n")[0])
     ap.add_argument("--host", default="127.0.0.1", help="address to listen on (default: loopback)")
     ap.add_argument("--port", type=int, default=8787)
@@ -42,6 +67,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="scope for requests without an x-deid-scope header")
     ap.add_argument("--seeds", action="append", default=[], metavar="TOML",
                     help="known people and organisations (repeatable)")
+    ap.add_argument("--seeds-dir", metavar="DIR",
+                    help="load every *.toml in DIR; each file names its scope (scope = \"…\")")
     ap.add_argument("--audit", default="~/.deid/audit.jsonl")
     ap.add_argument("--record", help="write what crossed (tokens only) to this JSONL file")
     ap.add_argument("--binary", choices=["withhold", "refuse"], default="withhold",
@@ -61,7 +88,7 @@ def main(argv: list[str] | None = None) -> None:
               "read the answers in clear", file=sys.stderr)
 
     store = SQLiteTokenStore(args.vault)
-    seeds = load_seed_files(args.seeds, args.scope)
+    seeds = load_seed_files(seed_files(args.seeds, args.seeds_dir), args.scope)
     kinds = tuple(k.strip().upper() for k in args.kinds.split(",") if k.strip())
     cfg = ProxyConfig(default_scope=args.scope, upstream=args.upstream,
                       upstream_openai=args.upstream_openai, upstream_chatgpt=args.upstream_chatgpt,

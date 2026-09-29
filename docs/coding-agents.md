@@ -13,6 +13,11 @@ the package yet.
 
 ## Quick start
 
+To have a coding agent set this up for a project, point it at
+[agent-setup.md](agent-setup.md): step-by-step instructions written for an agent, with the
+config for both agents, a check with invented names, and a block for the project's `CLAUDE.md` or
+`AGENTS.md`.
+
 ```sh
 pip install -e '.[proxy]'                       # from a checkout of this repository
 deid-proxy --scope client-a --seeds ~/private/deid.toml
@@ -58,7 +63,9 @@ enable_request_compression = false
 
 - **Where things are kept.** The vault goes to `~/.deid/vault.sqlite` and the audit to
   `~/.deid/audit.jsonl`; both files are readable by their owner only.
-- **Recording.** `--record FILE` also writes what crossed, in tokens, so that you can check it.
+- **Recording.** `--record FILE` also writes what crossed, in tokens.
+  `deid-proxy check --record FILE --scope client-a` then reports whether any known value crossed
+  as a word of its own. It gives counts only, and its exit status is 1 when a value crossed.
 - **What is detected.** Besides the known names, the proxy detects only patterns: e-mail
   addresses, IBANs, payment cards and international phone numbers (`deidkit.patterns`). It runs
   no name recognition, because such a model reads identifiers in code as people. A person whose
