@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Matter agent</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #5d6675; --line: #e3e6eb;
+  --accent: #2f5d8a; --accent-ink: #ffffff; --warn-bg: #fff4e0; --warn-ink: #7a4b00;
+  --ok: #2e7d4f; --bad: #b3261e; --soft: #eef2f7; --thought: #7a8190;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14171c; --panel: #1b1f26; --ink: #e6e9ee; --muted: #9aa3b1; --line: #2b313b;
+    --accent: #6f9fd0; --accent-ink: #0d1117; --warn-bg: #3a2c12; --warn-ink: #f2c77b;
+    --ok: #6cc596; --bad: #f08a80; --soft: #222833; --thought: #8a93a3;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+.chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--soft); color: var(--muted); white-space: nowrap; }
+.chip.warn { background: var(--warn-bg); color: var(--warn-ink); }
+.chip.ok { color: var(--ok); }
+.spacer { flex: 1; }
+main { display: grid; grid-template-columns: 250px 1fr; height: calc(100% - 53px); }
+aside { border-right: 1px solid var(--line); background: var(--panel); overflow: auto; padding: 10px 0; }
+aside h2 { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 6px 16px; }
+.file { display: flex; align-items: center; gap: 8px; padding: 5px 16px; cursor: pointer; font-size: 13px; word-break: break-all; }
+.file:hover, .file.active { background: var(--soft); }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: transparent; }
+.dot.changed { background: var(--accent); } .dot.added { background: var(--ok); }
+section.work { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+#log { overflow: auto; padding: 18px 22px; display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: 820px; white-space: pre-wrap; }
+.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); padding: 8px 12px; border-radius: 12px 12px 2px 12px; max-width: 70%; }
+.agent { background: var(--panel); border: 1px solid var(--line); padding: 10px 14px; border-radius: 2px 12px 12px 12px; }
+.thought { color: var(--thought); font-size: 12px; border-left: 2px solid var(--line); padding-left: 10px; }
+.thought::before { content: "reasoning (as the model saw it) — "; font-style: italic; }
+.tool { font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: baseline; }
+.tool .st { font-family: var(--mono); font-size: 11px; padding: 0 6px; border-radius: 4px; background: var(--soft); }
+.tool .st.completed { color: var(--ok); } .tool .st.failed { color: var(--bad); }
+.card { border: 1px solid var(--accent); background: var(--panel); border-radius: 10px; padding: 12px 14px; max-width: 820px; }
+.card .t { font-weight: 600; margin-bottom: 4px; }
+.card .p { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.card .done { color: var(--muted); font-size: 12px; }
+button { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 6px 12px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .5; cursor: default; }
+.notice { font-size: 13px; color: var(--warn-ink); background: var(--warn-bg); padding: 6px 10px; border-radius: 6px; max-width: 820px; }
+.error { font-size: 13px; color: var(--bad); }
+.files-note { font-size: 13px; color: var(--muted); }
+form { display: flex; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--line); background: var(--panel); }
+textarea { flex: 1; resize: vertical; min-height: 44px; max-height: 200px; font: inherit; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+#viewer { position: fixed; inset: 60px 40px 40px 290px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.18); display: none; flex-direction: column; }
+#viewer header { border-radius: 10px 10px 0 0; }
+#viewer pre { margin: 0; padding: 16px 20px; overflow: auto; white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px; flex: 1; }
+@media (prefers-reduced-motion: no-preference) { .msg, .card, .tool { animation: in .15s ease-out; } @keyframes in { from { opacity: 0; transform: translateY(2px); } } }
+@media (max-width: 720px) { main { grid-template-columns: 1fr; } aside { display: none; } #viewer { inset: 20px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Matter agent</h1>
+  <span class="chip" id="scope"></span>
+  <span class="chip" id="auth"></span>
+  <span class="spacer"></span>
+  <span class="chip" id="status">connecting…</span>
+</header>
+<main>
+  <aside>
+    <h2>Documents</h2>
+    <div id="files"></div>
+  </aside>
+  <section class="work">
+    <div id="log" aria-live="polite"></div>
+    <form id="ask">
+      <textarea id="task" placeholder="Give the agent a task on this matter, e.g. “Draft a reply to the latest letter”" aria-label="Task"></textarea>
+      <button class="primary" id="send" type="submit">Give task</button>
+      <button id="stop" type="button">Stop</button>
+    </form>
+  </section>
+</main>
+<div id="viewer" role="dialog" aria-modal="true">
+  <header><h1 id="vtitle"></h1><span class="spacer"></span><button id="vclose" type="button">Close</button></header>
+  <pre id="vbody"></pre>
+</div>
+<script>
+const token = new URLSearchParams(location.hash.slice(1)).get("t") || "";
+const api = (name, opts = {}) => fetch("/deid-agent/api/" + name, { ...opts, headers: { "content-type": "application/json", "x-deid-agent-token": token, ...(opts.headers || {}) } });
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+let current = null, changed = new Set(), added = new Set();
+const tools = new Map();
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function scroll() { log.scrollTop = log.scrollHeight; }
+function setBusy(b) { $("send").disabled = b; $("status").textContent = b ? "working…" : "ready"; }
+
+function renderFiles(state) {
+  changed = new Set(state.changed || []); added = new Set(state.added || []);
+  const box = $("files"); box.textContent = "";
+  for (const f of state.files || []) {
+    const row = el("div", "file"); const dot = el("span", "dot" + (added.has(f) ? " added" : changed.has(f) ? " changed" : ""));
+    row.append(dot, el("span", null, f)); row.onclick = () => openFile(f); box.append(row);
+  }
+}
+async function openFile(path) {
+  const r = await api("file?path=" + encodeURIComponent(path)); if (!r.ok) return;
+  const d = await r.json(); $("vtitle").textContent = path + (added.has(path) ? "  (new)" : changed.has(path) ? "  (changed)" : "");
+  $("vbody").textContent = d.text; $("viewer").style.display = "flex";
+}
+$("vclose").onclick = () => { $("viewer").style.display = "none"; };
+
+function onEvent(ev) {
+  if (ev.kind !== "message") current = null;
+  if (ev.kind === "user") { log.append(el("div", "msg user", ev.text)); setBusy(true); }
+  else if (ev.kind === "message") {
+    if (!current) { current = el("div", "msg agent"); log.append(current); }
+    current.textContent += ev.text;
+  }
+  else if (ev.kind === "thought") { log.append(el("div", "msg thought", ev.text)); }
+  else if (ev.kind === "tool") {
+    const row = el("div", "tool"); const st = el("span", "st " + (ev.status || ""), ev.status || "pending");
+    row.append(st, el("span", null, ev.title || ev.tool || "tool")); tools.set(ev.id, { row, st }); log.append(row);
+  }
+  else if (ev.kind === "tool_update") {
+    const t = tools.get(ev.id); if (t && ev.status) { t.st.textContent = ev.status; t.st.className = "st " + ev.status; }
+  }
+  else if (ev.kind === "plan") {
+    const box = el("div", "msg agent"); box.append(el("div", "files-note", "Plan"));
+    for (const e of ev.entries) box.append(el("div", null, (e.status === "completed" ? "✓ " : "• ") + e.content));
+    log.append(box);
+  }
+  else if (ev.kind === "permission") {
+    const card = el("div", "card"); card.id = "perm-" + ev.id;
+    card.append(el("div", "t", ev.title));
+    if (ev.paths && ev.paths.length) card.append(el("div", "p", ev.paths.join("\n")));
+    const row = el("div");
+    for (const o of ev.options) {
+      const b = el("button", o.kind && o.kind.startsWith("allow") ? "primary" : null, o.name);
+      b.style.marginRight = "8px";
+      b.onclick = async () => { row.querySelectorAll("button").forEach(x => x.disabled = true);
+        await api("permission", { method: "POST", body: JSON.stringify({ id: ev.id, optionId: o.optionId }) }); };
+      row.append(b);
+    }
+    card.append(row); log.append(card);
+  }
+  else if (ev.kind === "permission_done") {
+    const card = $("perm-" + ev.id); if (card) { card.querySelectorAll("button").forEach(x => x.disabled = true); card.append(el("div", "done", "answered")); }
+  }
+  else if (ev.kind === "turn_end") { setBusy(false); }
+  else if (ev.kind === "files") {
+    renderFiles(ev);
+    const n = (ev.changed || []).length + (ev.added || []).length;
+    if (n) log.append(el("div", "files-note", `${n} document(s) changed — marked on the left. Open one to review it.`));
+  }
+  else if (ev.kind === "notice") { log.append(el("div", "notice", ev.text)); }
+  else if (ev.kind === "error") { log.append(el("div", "error", ev.text)); setBusy(false); }
+  else if (ev.kind === "status") { $("status").textContent = ev.status; }
+  scroll();
+}
+
+async function boot() {
+  const r = await api("state");
+  if (!r.ok) { $("status").textContent = "not authorised"; $("status").className = "chip warn"; return; }
+  const s = await r.json();
+  $("title").textContent = s.title; document.title = s.title;
+  $("scope").textContent = "scope " + s.scope;
+  $("auth").textContent = s.auth; $("auth").className = "chip" + (s.auth.startsWith("personal") ? " warn" : " ok");
+  $("status").textContent = s.status; renderFiles(s); setBusy(s.busy);
+  const es = new EventSource("/deid-agent/api/events?t=" + encodeURIComponent(token));
+  es.onmessage = (m) => onEvent(JSON.parse(m.data));
+}
+$("ask").onsubmit = async (e) => {
+  e.preventDefault(); const text = $("task").value.trim(); if (!text) return;
+  const r = await api("prompt", { method: "POST", body: JSON.stringify({ text }) });
+  if (r.ok) $("task").value = ""; else { const d = await r.json(); log.append(el("div", "error", d.error)); }
+};
+$("task").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) $("ask").requestSubmit(); });
+$("stop").onclick = () => api("cancel", { method: "POST" });
+boot();
+</script>
+</body>
+</html>

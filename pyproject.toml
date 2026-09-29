@@ -34,9 +34,13 @@ test = [
 
 [project.scripts]
 deid-proxy = "deidkit.proxy.cli:main"
+deid-agent = "deidkit.agents.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+deidkit = ["agents/page.html"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
