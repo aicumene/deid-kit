@@ -916,6 +916,27 @@ def spelling_variants(surface: str, *, genitive: bool = False) -> list[str]:
     return [f for f in _dedupe(sorted(forms)) if key(f) != key(s)]
 
 
+def surname_first(surface: str) -> list[str]:
+    """A person's name with the surname first, the way lists of parties, registers and file names
+    write it: "Brenner, Ada" and "Brenner Ada" for "Ada Brenner"; with several given names, the
+    first one alone as well.
+
+    MEASURED 29.09.2026: in ``04 Brenner, Ada - note.md`` the surname matched and the given name
+    crossed in clear, because a given name shorter than four letters is no key of its own ("ADA"
+    is also a statute). :func:`person_variants` enrols the other orders ("Brenner Ada", "A. Brenner")
+    as aliases; these are matching keys only, like :func:`spelling_variants`, and they are applied
+    after the names written given name first, so that "Ada Brenner, Tom Brenner" stays two people
+    instead of yielding "Brenner, Tom" (``vault._apply_index``).
+    """
+    parts = [p for p in name_parts(surface) if not is_honorific(p)]
+    if len(parts) < 2:
+        return []
+    out: list[str] = []
+    for given in dict.fromkeys((" ".join(parts[:-1]), parts[0])):
+        out += [f"{parts[-1]}, {given}", f"{parts[-1]} {given}"]
+    return out
+
+
 def person_fragments(name: str) -> list[tuple[str, str]]:
     """Distinctive single parts of a person name, as (surface, role).
 

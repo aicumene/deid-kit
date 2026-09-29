@@ -8,8 +8,8 @@ anything that must match the disk exactly. MEASURED 29.09.2026: a matter file wa
 the client's short name, the agent saw it as ``03-Reply-to-ORG_1-Freight.md``, and its call to
 read the file came back as ``03-Reply-to-Harrowgate Freight Ltd-Freight.md``, a file that does
 not exist; the agent had to fall back to a shell glob. ``letters/04 Brenner, Ada - note.md``
-would have come back as ``letters/04 Ada Brenner, Ada - note.md``, and a line an edit must find
-in a file the same way.
+would have come back as ``letters/04 Ada Brenner - note.md``, and a line an edit must find in a
+file the same way.
 
 So, per request, the text around each token is remembered as it was written before tokenising
 (:func:`spellings`), at two sizes:

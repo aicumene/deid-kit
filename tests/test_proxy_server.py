@@ -286,7 +286,9 @@ async def test_the_agent_opens_a_file_named_after_a_party(tmp_path):
                     inputs[d["index"]] = inputs.get(d["index"], "") + d["delta"]["partial_json"]
         assert json.loads(inputs[0]) == {"file_path": "/work/Brenner/letters/03-Reply-to-Harrowgate-Freight.md"}
         assert json.loads(inputs[1]) == {"command": 'cat "letters/04 Brenner, Ada - note.md" | head -5'}
-        assert "Harrowgate" not in json.dumps(received[0]) and "Brenner" not in json.dumps(received[0])
+        sent = json.dumps(received[0])
+        assert "Harrowgate" not in sent and "Brenner" not in sent
+        assert "Ada" not in sent                    # "Brenner, Ada": the given name used to cross
     finally:
         await client.close()
         await upstream.close()

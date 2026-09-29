@@ -329,3 +329,11 @@ def test_a_backslash_escape_before_a_name_is_a_boundary():
 def test_an_escaped_backslash_before_a_letter_is_not_a_line_break():
     hay, folded = nf.fold_haystack("C:\\\\nBrightwater")          # the text  C:\\nBrightwater
     assert nf.find_all(hay, nf.key("Brightwater")) == []
+
+
+def test_a_person_is_met_surname_first_the_way_lists_and_registers_write_it():
+    assert nf.surname_first("Ada Brenner") == ["Brenner, Ada", "Brenner Ada"]
+    forms = nf.surname_first("Ada Maria Brenner")
+    assert "Brenner, Ada Maria" in forms and "Brenner, Ada" in forms      # all given names, or the first
+    assert nf.surname_first("Dr Ada Brenner") == ["Brenner, Ada", "Brenner Ada"]   # no honorific
+    assert nf.surname_first("Brenner") == []

@@ -301,6 +301,7 @@ async def test_codex_names_a_file_the_way_it_is_on_disk():
         assert done == ['cat "/work/Brenner/letters/04 Brenner, Ada - note.md" '
                         'letters/03-Reply-to-Harrowgate-Freight.md']
         assert leaks(received[0]) == []
+        assert "Ada" not in json.dumps(received[0])  # "Brenner, Ada": the given name used to cross
     finally:
         await client.close()
         await upstream.close()

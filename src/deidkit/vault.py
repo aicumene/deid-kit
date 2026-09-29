@@ -172,6 +172,7 @@ class _Index:
         "alias_keys",
         "aliases",
         "by_token",
+        "inverted",
         "keys",
         "legacy_keys",
         "norms",
@@ -224,6 +225,9 @@ class _Index:
         # "Müller", "Albrechts" for "Albrecht") — keys for MATCHING only: never a row, never seen by
         # enrolment (which reads ``keys``), and a key of the vault always wins over a variant.
         self.variants: dict[str, str] = {}
+        # The variants that put a person's surname first ("Brenner, Ada"): matched after the names
+        # written given name first, so that a list of such names is not read across (_apply_index).
+        self.inverted: set[str] = set()
         held = [(r.real_value, r.token) for r in rows] + [(a.surface, a.token) for a in aliases]
         for surface, token in held:
             row = self.by_token.get(token)
@@ -233,6 +237,14 @@ class _Index:
                 k = _normalize(v)
                 if len(k) >= _MIN_KEY_LEN and k not in self.keys and k not in _FRAME_KEYS:
                     self.variants.setdefault(k, token)
+            if row.kind != "PERSON":
+                continue
+            for form in (surface, *nf.spelling_variants(surface)):
+                for v in nf.surname_first(form):
+                    k = _normalize(v)
+                    if len(k) >= _MIN_KEY_LEN and k not in self.keys and k not in _FRAME_KEYS \
+                            and self.variants.setdefault(k, token) == token:
+                        self.inverted.add(k)
 
     def token_for(self, surface: str) -> str | None:
         return self.keys.get(_normalize(surface))
@@ -1269,7 +1281,17 @@ def _apply_index(text: str, keys: dict[str, str],
     hay, folded = nf.fold_haystack(text)
     taken = bytearray(len(hay))
     hits: list[tuple[int, int, str]] = []
-    for k in sorted(keys, key=len, reverse=True):
+    # Names of several words written given name first, then the same with the surname first,
+    # then single words; the longest first within each. A surname-first form can then take only
+    # what no name claims: in "Ada Brenner, Tom Brenner" it would otherwise read "Brenner, Tom"
+    # across the two people and leave "Ada" in clear. A single word overlaps a longer name only
+    # by lying inside it, so the order changes nothing for the other keys.
+    inverted = idx.inverted if idx is not None else set()
+
+    def order(k: str) -> tuple[int, int]:
+        return (1 if k in inverted else 0 if " " in k else 2, -len(k))
+
+    for k in sorted(keys, key=order):
         for start, end in nf.find_all(hay, k):
             if any(taken[start:end]):
                 continue
