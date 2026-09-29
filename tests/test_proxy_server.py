@@ -238,7 +238,14 @@ async def test_the_agent_opens_a_file_named_after_a_party(tmp_path):
         await resp.write(sse("message_start", {"type": "message_start", "message": {
             "id": "msg_2", "type": "message", "role": "assistant", "content": [],
             "model": body["model"], "usage": {"input_tokens": 1, "output_tokens": 0}}}))
-        for i, (name, args) in enumerate(calls):
+        say = f"Opening `letters/{glued}` now."
+        await resp.write(sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                                     "content_block": {"type": "text", "text": ""}}))
+        for part in (say[:20], say[20:35], say[35:]):
+            await resp.write(sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                         "delta": {"type": "text_delta", "text": part}}))
+        await resp.write(sse("content_block_stop", {"type": "content_block_stop", "index": 0}))
+        for i, (name, args) in enumerate(calls, start=1):
             raw = json.dumps(args)
             await resp.write(sse("content_block_start", {"type": "content_block_start", "index": i,
                                                          "content_block": {"type": "tool_use", "id": f"tu_{i + 1}",
@@ -278,14 +285,18 @@ async def test_the_agent_opens_a_file_named_after_a_party(tmp_path):
         resp = await client.post("/v1/messages", json=body)
         assert resp.status == 200
         inputs: dict[int, str] = {}
+        said = ""
         async for raw in resp.content:
             line = raw.decode().strip()
             if line.startswith("data:"):
                 d = json.loads(line[5:])
                 if d.get("type") == "content_block_delta" and d["delta"].get("type") == "input_json_delta":
                     inputs[d["index"]] = inputs.get(d["index"], "") + d["delta"]["partial_json"]
-        assert json.loads(inputs[0]) == {"file_path": "/work/Brenner/letters/03-Reply-to-Harrowgate-Freight.md"}
-        assert json.loads(inputs[1]) == {"command": 'cat "letters/04 Brenner, Ada - note.md" | head -5'}
+                if d.get("type") == "content_block_delta" and d["delta"].get("type") == "text_delta":
+                    said += d["delta"]["text"]
+        assert said == "Opening `letters/03-Reply-to-Harrowgate-Freight.md` now."
+        assert json.loads(inputs[1]) == {"file_path": "/work/Brenner/letters/03-Reply-to-Harrowgate-Freight.md"}
+        assert json.loads(inputs[2]) == {"command": 'cat "letters/04 Brenner, Ada - note.md" | head -5'}
         sent = json.dumps(received[0])
         assert "Harrowgate" not in sent and "Brenner" not in sent
         assert "Ada" not in sent                    # "Brenner, Ada": the given name used to cross

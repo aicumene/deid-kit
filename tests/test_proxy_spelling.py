@@ -103,3 +103,63 @@ def test_a_token_already_in_the_text_is_passed_over_and_a_mismatch_is_dropped():
     assert table["ORG_1-Freight.md"] == "Harrowgate-Freight.md"
     wrong = Redaction(text="ORG_1-Freight.md", surfaces={"ORG_1": ["Elsewhere"]})
     assert spellings(["Harrowgate-Freight.md"], [wrong]) == {}
+
+
+async def test_prose_gets_file_names_back_and_keeps_names_in_sentences(request_seen):
+    eng, mapping, table, sent, person, org = request_seen
+    glued, spaced = sent[1].splitlines()
+    copied = sent[2].split("→")[2].strip()         # a line of the letter, as the model read it
+    answer = f"I read `{glued}` and `{spaced}`. {copied}"
+    shown = await eng.detokenize(answer, mapping, table, prose=True)
+    assert shown.startswith("I read `letters/03-Reply-to-Harrowgate-Freight.md` and "
+                            "`letters/04 Brenner, Ada - note.md`. ")
+    # a sentence of prose keeps the usual value, even one copied from a file
+    assert shown.endswith(await eng.detokenize(copied, mapping))
+
+
+async def test_streamed_prose_shows_file_names_as_written_whatever_the_chunks(request_seen):
+    from deidkit.proxy.anthropic import StreamRestorer
+    eng, mapping, table, sent, person, org = request_seen
+    glued, spaced = sent[1].splitlines()
+    answer = (f"I read `{glued}` and the note `{spaced}`; {person} wrote it. "
+              f"See {glued.split('/')[1]}. The folder /work/{person}/letters holds both.")
+    want = ("I read `letters/03-Reply-to-Harrowgate-Freight.md` and the note "
+            "`letters/04 Brenner, Ada - note.md`; Ada Brenner wrote it. "
+            "See 03-Reply-to-Harrowgate-Freight.md. The folder /work/Brenner/letters holds both.")
+    for size in (1, 2, 3, 5, 8, 13, len(answer)):
+        restorer = StreamRestorer(eng, mapping, lambda key, value: None, spellings=table)
+        events = [("content_block_start", {"type": "content_block_start", "index": 0,
+                                           "content_block": {"type": "text", "text": ""}})]
+        events += [("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                            "delta": {"type": "text_delta", "text": answer[i:i + size]}})
+                   for i in range(0, len(answer), size)]
+        events.append(("content_block_stop", {"type": "content_block_stop", "index": 0}))
+        shown = ""
+        for name, data in events:                  # the restorer raises if shown text would change
+            for _, d in await restorer.event(name, data):
+                if d.get("type") == "content_block_delta":
+                    shown += d["delta"].get("text", "")
+        assert shown == want, size
+
+
+async def test_codex_prose_gets_file_names_and_its_tail_without_a_done_event(request_seen):
+    from deidkit.proxy.openai import ResponsesRestorer
+    eng, mapping, table, sent, _, _ = request_seen
+    text = f"I read `{sent[1].splitlines()[0]}`."
+    restorer = ResponsesRestorer(eng, mapping, lambda key, value: None, spellings=table)
+    events = [("response.output_text.delta", {"type": "response.output_text.delta", "item_id": "m",
+                                               "output_index": 0, "content_index": 0,
+                                               "delta": text[i:i + 4]})
+              for i in range(0, len(text), 4)]
+    events.append(("response.output_item.done", {"type": "response.output_item.done", "output_index": 0,
+                                                  "item": {"type": "message", "id": "m", "role": "assistant",
+                                                           "content": [{"type": "output_text", "text": text}]}}))
+    shown, item = "", None
+    for name, data in events:
+        for _, d in await restorer.event(name, data):
+            if d["type"] == "response.output_text.delta":
+                shown += d["delta"]
+            elif d["type"] == "response.output_item.done":
+                item = d["item"]
+    assert shown == "I read `letters/03-Reply-to-Harrowgate-Freight.md`."
+    assert item["content"][0]["text"] == shown

@@ -106,11 +106,13 @@ class ScopeEngine:
         return mapping
 
     async def detokenize(self, text: str, mapping: dict[str, str],
-                         spellings: dict[str, str] | None = None, *, literal: bool = False) -> str:
-        """Tokens back to names. With ``spellings`` (a tool's arguments), a file or folder name
-        seen in the request comes back as it was written (:mod:`deidkit.proxy.spelling`)."""
+                         spellings: dict[str, str] | None = None, *, literal: bool = False,
+                         prose: bool = False) -> str:
+        """Tokens back to names. With ``spellings``, a file or folder name seen in the request
+        comes back as it was written, in a tool's arguments and, with ``prose``, in the answer
+        (:mod:`deidkit.proxy.spelling`)."""
         if spellings:
-            text = respell(text, spellings, literal=literal)
+            text = respell(text, spellings, literal=literal, prose=prose)
         return await vault.detokenize(self.store, self.scope, text, mapping=mapping)
 
     async def residual(self, text: str) -> list[str]:

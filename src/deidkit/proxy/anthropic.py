@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 from deidkit import namefold as nf
 from deidkit.proxy.engine import ScopeEngine
+from deidkit.proxy.spelling import holdback as _spelling_holdback
 from deidkit.proxy.spelling import spellings as _spellings
 
 #: Tools that act on the user's machine: their arguments get the real values back.
@@ -218,7 +219,7 @@ async def restore_json_response(data: dict, engine: ScopeEngine, mapping: dict[s
         t = block.get("type")
         if t == "text":
             original = block.get("text", "")
-            block["text"] = await engine.detokenize(original, mapping)
+            block["text"] = await engine.detokenize(original, mapping, spellings, prose=True)
             restore_put(_key("t:", block["text"]), original)
         elif t == "tool_use" and block.get("name") in local_tools:
             original = block.get("input", {})
@@ -254,16 +255,19 @@ class StreamRestorer:
         self.blocks: dict[int, _Block] = {}
 
     def _holdback(self, text: str) -> int:
+        """The end of the text that may still change: part of a token, or a file name or code
+        span that holds one and is not finished (:func:`deidkit.proxy.spelling.holdback`)."""
+        hold = _spelling_holdback(text, self.spellings)
         for n in range(min(len(text), self.longest), 0, -1):
             if nf.deconfuse_ascii(text[-n:]).casefold() in self.prefixes:
-                return n
-        return 0
+                return max(n, hold)
+        return hold
 
     async def _text(self, b: _Block, final: bool) -> str:
         end = len(b.orig) if final else len(b.orig) - self._holdback(b.orig)
         if end <= b.emitted_orig:
             return ""
-        full = await self.engine.detokenize(b.orig[:end], self.mapping)
+        full = await self.engine.detokenize(b.orig[:end], self.mapping, self.spellings, prose=True)
         if not full.startswith(b.emitted):             # cannot happen: replacements are local
             raise RuntimeError("de-tokenised prefix moved")
         out, b.emitted, b.emitted_orig = full[len(b.emitted):], full, end

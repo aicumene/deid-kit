@@ -28,6 +28,12 @@ its sign. A token that is a whole folder name (``/work/Brenner/``) is remembered
 back only between two slashes: on its own line it is a name in prose. Text the model
 made up, such as the name of a new file, is not in the table and gets the usual value; so does a
 bare token, which is a name in prose rather than part of one.
+
+**Prose** (the model's answer) gets file and folder names back, and an inline code span back in
+full, the way a tool's arguments do; a line of prose is not looked up whole, so a name written in a
+sentence keeps its usual value (``respell(..., prose=True)``). While the answer streams, a name
+that holds a token and may still grow, and an open code span that holds one, are held back until
+they end (:func:`holdback`), so that what was already shown never changes.
 """
 
 from __future__ import annotations
@@ -52,6 +58,9 @@ _WRAP = " \"'`()[]<>{},;:"
 _EDGE = ".-_"
 _QUOTE = re.compile(r"([\"'`])")
 _LAST_RUN = re.compile(r"[\w.\-+~#@%=&]+$")
+#: An inline code span on one line, `like this`.
+_CODE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+_TICKS = re.compile(r"`+")
 #: A longer segment is a paragraph, which no tool call will copy whole.
 _LONGEST = 2000
 
@@ -138,15 +147,30 @@ def spellings(texts: list[str], reds: list[Redaction]) -> dict[str, str]:
     return table
 
 
-def respell(text: str, table: dict[str, str], *, literal: bool = False) -> str:
+def respell(text: str, table: dict[str, str], *, literal: bool = False,
+            prose: bool = False) -> str:
     """``text`` with each remembered segment, or else run, put back as it was written (escaped
-    for a string literal when ``literal``); every other token is left for the usual mapping."""
+    for a string literal when ``literal``); every other token is left for the usual mapping.
+    With ``prose``, only names and inline code spans: a whole line of prose is not looked up."""
     if not table or not text or not TOKEN.search(text):
         return text
 
     def put(written: str) -> str:
         return json.dumps(written, ensure_ascii=False)[1:-1] if literal else written
 
+    if not prose:
+        return _respell(text, table, put, whole=True)
+    out: list[str] = []
+    cursor = 0
+    for m in _CODE.finditer(text):
+        out.append(_respell(text[cursor:m.start()], table, put, whole=False))
+        out.append("`" + _respell(m.group(1), table, put, whole=True) + "`")
+        cursor = m.end()
+    out.append(_respell(text[cursor:], table, put, whole=False))
+    return "".join(out)
+
+
+def _respell(text: str, table: dict[str, str], put, *, whole: bool) -> str:
     def run(m: re.Match) -> str:
         core, tail = m.group(0), ""
         if not TOKEN.search(core):
@@ -180,9 +204,10 @@ def respell(text: str, table: dict[str, str], *, literal: bool = False) -> str:
     def segment(seg: str, after_slash: bool, before_slash: bool) -> str:
         if not TOKEN.search(seg):
             return seg
-        got = remembered(seg, after_slash or before_slash)
-        if got is not None:
-            return got
+        if whole:
+            got = remembered(seg, after_slash or before_slash)
+            if got is not None:
+                return got
         head = tail = ""
         first = RUN.match(seg) if after_slash else None     # "/work/ORG_1 && ls"
         if first and (name := folder_name(first.group(0))) is not None:
@@ -190,6 +215,8 @@ def respell(text: str, table: dict[str, str], *, literal: bool = False) -> str:
         last = _LAST_RUN.search(seg) if before_slash else None    # "cd ORG_1/letters"
         if last and (name := folder_name(last.group(0))) is not None:
             seg, tail = seg[:last.start()], name
+        if not whole:
+            return head + RUN.sub(run, seg) + tail
         parts = _QUOTE.split(seg)                 # a quoted name inside a command
         return head + "".join(
             p if not TOKEN.search(p) else (remembered(p, False) or RUN.sub(run, p))
@@ -207,4 +234,32 @@ def respell(text: str, table: dict[str, str], *, literal: bool = False) -> str:
     return "".join(out)
 
 
-__all__ = ["RUN", "TOKEN", "respell", "spellings"]
+def _open_code_span(text: str) -> int | None:
+    """Where an inline code span opens on the last line of ``text`` and has not closed yet."""
+    line = text.rfind("\n") + 1
+    opened: int | None = None
+    for m in _TICKS.finditer(text, line):
+        if len(m.group(0)) == 1:
+            opened = None if opened is not None else m.start()
+        else:                                     # a fence, or a span of double ticks
+            opened = None
+    return opened
+
+
+def holdback(text: str, table: dict[str, str]) -> int:
+    """How many characters at the end of streaming prose to hold back: a name that holds a token
+    and may still grow, or an open code span that holds one. Once it ends it comes back as it was
+    written, and what was shown before it never changes."""
+    if not table:
+        return 0
+    hold = 0
+    last = _LAST_RUN.search(text)
+    if last and TOKEN.search(last.group(0)):
+        hold = len(text) - last.start()
+    tick = _open_code_span(text)
+    if tick is not None and TOKEN.search(text, tick):
+        hold = max(hold, len(text) - tick)
+    return hold
+
+
+__all__ = ["RUN", "TOKEN", "holdback", "respell", "spellings"]

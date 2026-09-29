@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from deidkit import namefold as nf
 from deidkit.proxy.anthropic import Refused, _Slot, _strings
 from deidkit.proxy.engine import ScopeEngine
+from deidkit.proxy.spelling import holdback as _spelling_holdback
 from deidkit.proxy.spelling import spellings as _spellings
 
 #: Tools that act on the user's machine: their arguments get the real values back.
@@ -229,7 +230,7 @@ async def restore_item(item: dict, engine: ScopeEngine, mapping: dict[str, str],
         for part in item.get("content") or []:
             if isinstance(part, dict) and part.get("type") == "output_text":
                 original = part.get("text", "")
-                part["text"] = await engine.detokenize(original, mapping)
+                part["text"] = await engine.detokenize(original, mapping, spellings, prose=True)
                 if restore_put:
                     restore_put(_key("t:", part["text"]), original)
     elif t == "function_call" and item.get("name") in local_tools:
@@ -258,6 +259,11 @@ class _Stream:
     orig: str = ""
     emitted_orig: int = 0
     emitted: str = ""
+    #: The answer's text, which gets file names back as written; a script's input is shown as it
+    #: streams and gets them when the call is complete.
+    prose: bool = False
+    #: The stream's last delta event without its delta: the shape of the one that flushes it.
+    shape: dict = field(default_factory=dict)
 
 
 class ResponsesRestorer:
@@ -278,17 +284,19 @@ class ResponsesRestorer:
         self.local_items: set[str] = set()
         self.seq = 0
 
-    def _holdback(self, text: str) -> int:
+    def _holdback(self, text: str, prose: bool) -> int:
+        hold = _spelling_holdback(text, self.spellings) if prose else 0
         for n in range(min(len(text), self.longest), 0, -1):
             if nf.deconfuse_ascii(text[-n:]).casefold() in self.prefixes:
-                return n
-        return 0
+                return max(n, hold)
+        return hold
 
     async def _advance(self, s: _Stream, final: bool) -> str:
-        end = len(s.orig) if final else len(s.orig) - self._holdback(s.orig)
+        end = len(s.orig) if final else len(s.orig) - self._holdback(s.orig, s.prose)
         if end <= s.emitted_orig:
             return ""
-        full = await self.engine.detokenize(s.orig[:end], self.mapping)
+        full = await self.engine.detokenize(s.orig[:end], self.mapping,
+                                            self.spellings if s.prose else None, prose=s.prose)
         if not full.startswith(s.emitted):
             raise RuntimeError("de-tokenised prefix moved")
         out, s.emitted, s.emitted_orig = full[len(s.emitted):], full, end
@@ -318,7 +326,8 @@ class ResponsesRestorer:
                     (data.get("item_id") or str(data.get("output_index"))) not in self.local_items:
                 return [(name, data)]
             key = (t, data.get("item_id"), data.get("content_index"))
-            s = self.streams.setdefault(key, _Stream())
+            s = self.streams.setdefault(key, _Stream(prose=t == "response.output_text.delta"))
+            s.shape = {k: v for k, v in data.items() if k != "delta"}
             s.orig += data.get("delta", "")
             out = await self._advance(s, final=False)
             return [(name, {**data, "delta": out})] if out else []
@@ -337,28 +346,43 @@ class ResponsesRestorer:
             if isinstance(data.get(field_name), str) and (
                     t == "response.output_text.done" or s is not None):
                 data = {**data, field_name: await self.engine.detokenize(
-                    data[field_name], self.mapping,
-                    self.spellings if field_name == "input" else None)}
+                    data[field_name], self.mapping, self.spellings, prose=field_name == "text")}
             return out + [(name, data)]
         if t == "response.content_part.done":
             part = data.get("part") or {}
             if part.get("type") == "output_text":
-                part = {**part, "text": await self.engine.detokenize(part.get("text", ""),
-                                                                     self.mapping)}
+                part = {**part, "text": await self.engine.detokenize(
+                    part.get("text", ""), self.mapping, self.spellings, prose=True)}
                 data = {**data, "part": part}
             return [(name, data)]
         if t == "response.output_item.done":
+            item_id = (data.get("item") or {}).get("id")
+            out = await self._flush(lambda key: key[1] == item_id)
             item = await restore_item(data.get("item") or {}, self.engine, self.mapping,
                                       self.restore_put, self.local_tools, self.spellings)
-            return [(name, {**data, "item": item})]
-        if t == "response.completed" and isinstance(data.get("response"), dict):
-            resp = dict(data["response"])
-            if isinstance(resp.get("output"), list):
-                resp["output"] = [await restore_item(i, self.engine, self.mapping, None,
-                                                     self.local_tools, self.spellings)
-                                  for i in resp["output"]]
-            return [(name, {**data, "response": resp})]
+            return out + [(name, {**data, "item": item})]
+        if t in ("response.completed", "response.incomplete", "response.failed"):
+            out = await self._flush(lambda key: True)
+            if t == "response.completed" and isinstance(data.get("response"), dict):
+                resp = dict(data["response"])
+                if isinstance(resp.get("output"), list):
+                    resp["output"] = [await restore_item(i, self.engine, self.mapping, None,
+                                                         self.local_tools, self.spellings)
+                                      for i in resp["output"]]
+                data = {**data, "response": resp}
+            return out + [(name, data)]
         return [(name, data)]
+
+    async def _flush(self, which) -> list[tuple[str, dict]]:
+        """The text still held back in the streams ``which`` selects, as one last delta each: a
+        stream can end without a done event of its own."""
+        out: list[tuple[str, dict]] = []
+        for key in [k for k in self.streams if which(k)]:
+            s = self.streams.pop(key)
+            rest = await self._advance(s, final=True)
+            if rest:
+                out.append((key[0], {**s.shape, "delta": rest}))
+        return out
 
 
 __all__ = ["LOCAL_TOOLS", "PreparedResponses", "ResponsesRestorer", "prepare_responses",
