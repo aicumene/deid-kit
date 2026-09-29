@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,6 +64,11 @@ class ProxyConfig:
     detector: object | None = None
     glossary: bool = False
     seeds: object | None = None
+    #: ``(folder, scope)`` pairs, longest folder first: a request from an agent working inside a
+    #: listed folder gets that folder's scope when it sends no ``x-deid-scope`` header.
+    scope_paths: list[tuple[str, str]] = field(default_factory=list)
+    #: Refuse a request whose scope comes from neither a header nor a listed folder.
+    require_scope: bool = False
     extra: dict = field(default_factory=dict)
 
 
@@ -86,6 +92,44 @@ def _append(path: Path, obj: dict) -> None:
         fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
     if fresh:
         os.chmod(path, 0o600)
+
+
+_CLAUDE_CWD = re.compile(r"Primary working directory: *([^\n]+)")
+_CODEX_CWD = re.compile(r"<cwd>([^<]+)</cwd>")
+
+
+def working_directory(body: dict) -> str | None:
+    """The folder the agent works in, as the agent itself states it in the request: Claude Code
+    in its system prompt ("Primary working directory: …"), Codex in its environment context
+    (``<cwd>…</cwd>``). Read before tokenising; a folder named after a client is still a folder."""
+    system = body.get("system")
+    texts = [system] if isinstance(system, str) else [
+        b.get("text", "") for b in system or [] if isinstance(b, dict)]
+    for text in texts:
+        m = _CLAUDE_CWD.search(text or "")
+        if m:
+            return m.group(1).strip()
+    for item in body.get("input") or []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        parts = [content] if isinstance(content, str) else [
+            c.get("text", "") for c in content or [] if isinstance(c, dict)]
+        for text in parts:
+            m = _CODEX_CWD.search(text or "")
+            if m:
+                return m.group(1).strip()
+    return None
+
+
+def scope_for_folder(folder: str | None, scope_paths: list[tuple[str, str]]) -> str | None:
+    if not folder:
+        return None
+    real = os.path.realpath(os.path.expanduser(folder))
+    for root, scope in scope_paths:
+        if real == root or real.startswith(root.rstrip(os.sep) + os.sep):
+            return scope
+    return None
 
 
 def _never(text: str) -> Redaction:
@@ -120,6 +164,17 @@ class Proxy:
         sink = JsonlAuditSink(config.audit) if config.audit else InMemoryAuditSink()
         self.gateway = PrivacyGateway(audit=sink, redact_fn=_never)
         self.session: ClientSession | None = None
+
+    def scope(self, request: web.Request, body: dict) -> str | None:
+        """The request's scope: its header, else the listed folder the agent works in, else the
+        default — or None when ``require_scope`` is set and neither names one."""
+        header = request.headers.get("x-deid-scope")
+        if header:
+            return header
+        found = scope_for_folder(working_directory(body), self.cfg.scope_paths)
+        if found:
+            return found
+        return None if self.cfg.require_scope else self.cfg.default_scope
 
     def engine(self, scope: str) -> ScopeEngine:
         if scope not in self.engines:
@@ -248,10 +303,13 @@ class Proxy:
         return resp
 
     async def _responses(self, request: web.Request) -> web.StreamResponse:
-        scope = request.headers.get("x-deid-scope") or self.cfg.default_scope
         body = await self._body(request)
         if isinstance(body, web.Response):
             return body
+        scope = self.scope(request, body)
+        if scope is None:
+            return _error(400, "deid proxy: this folder has no scope; list it under `paths` in a "
+                               "seed file, or send an x-deid-scope header")
         engine = self.engine(scope)
         try:
             prep = await prepare_responses(body, engine, headers=self._headers(request),
@@ -303,10 +361,13 @@ class Proxy:
 
     async def _messages(self, request: web.Request) -> web.StreamResponse:
         counting = request.path.endswith("/count_tokens")
-        scope = request.headers.get("x-deid-scope") or self.cfg.default_scope
         body = await self._body(request)
         if isinstance(body, web.Response):
             return body
+        scope = self.scope(request, body)
+        if scope is None:
+            return _error(400, "deid proxy: this folder has no scope; list it under `paths` in a "
+                               "seed file, or send an x-deid-scope header")
         engine = self.engine(scope)
         try:
             prep = await prepare_request(body, engine, restore_get=self.restore.restore_get,
@@ -353,4 +414,5 @@ class Proxy:
             up.release()
 
 
-__all__ = ["JsonlAuditSink", "MemoryRestore", "Proxy", "ProxyConfig"]
+__all__ = ["JsonlAuditSink", "MemoryRestore", "Proxy", "ProxyConfig", "scope_for_folder",
+           "working_directory"]

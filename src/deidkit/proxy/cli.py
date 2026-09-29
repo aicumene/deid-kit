@@ -25,7 +25,7 @@ from aiohttp import web
 
 from deidkit.patterns import RegexDetector
 from deidkit.proxy.server import Proxy, ProxyConfig
-from deidkit.seedfile import load_seed_files
+from deidkit.seedfile import load_scope_paths, load_seed_files
 from deidkit.sqlite_store import SQLiteTokenStore
 
 
@@ -76,6 +76,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--kinds", default="EMAIL,IBAN,CARD,PHONE",
                     help="pattern kinds to detect beyond the known names")
     ap.add_argument("--glossary", action="store_true", help="send a glossary line per token")
+    ap.add_argument("--require-scope", action="store_true",
+                    help="refuse requests from folders no seed file lists and without a scope header")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -88,7 +90,8 @@ def main(argv: list[str] | None = None) -> None:
               "read the answers in clear", file=sys.stderr)
 
     store = SQLiteTokenStore(args.vault)
-    seeds = load_seed_files(seed_files(args.seeds, args.seeds_dir), args.scope)
+    files = seed_files(args.seeds, args.seeds_dir)
+    seeds = load_seed_files(files, args.scope)
     kinds = tuple(k.strip().upper() for k in args.kinds.split(",") if k.strip())
     cfg = ProxyConfig(default_scope=args.scope, upstream=args.upstream,
                       upstream_openai=args.upstream_openai, upstream_chatgpt=args.upstream_chatgpt,
@@ -96,7 +99,9 @@ def main(argv: list[str] | None = None) -> None:
                       record=Path(args.record).expanduser() if args.record else None,
                       audit=Path(args.audit).expanduser() if args.audit else None,
                       detector=RegexDetector(kinds) if kinds else None,
-                      glossary=args.glossary, seeds=seeds)
+                      glossary=args.glossary, seeds=seeds,
+                      scope_paths=load_scope_paths(files, args.scope),
+                      require_scope=args.require_scope)
     web.run_app(Proxy(store, cfg).app(), host=args.host, port=args.port,
                 print=lambda msg: print(f"deid-proxy: {args.host}:{args.port} -> {args.upstream}, "
                                         f"{args.upstream_chatgpt}, {args.upstream_openai}",

@@ -27,6 +27,9 @@ deid-proxy --scope client-a --seeds ~/private/deid.toml
 for the format). It holds real names, so keep it outside the repository you work in:
 
 ```toml
+scope = "client-a"
+paths = ["~/matters/client-a"]      # the client's project folders
+
 [[entity]]
 type = "individual"
 name = "Ada Brenner"
@@ -35,6 +38,8 @@ name = "Ada Brenner"
 type = "company"
 name = "Harrowgate Freight Ltd"
 ```
+
+An agent working inside a listed folder gets that scope with no setting of its own.
 
 Then, in the shell where you start Claude Code:
 
@@ -46,7 +51,8 @@ claude
 ```
 
 For Codex, add a provider in `~/.codex/config.toml` (the full block is in the Codex section
-below):
+below). It has no scope header, because the proxy takes the scope from the folder. The same
+setting then covers the terminal, the ChatGPT app and the editors.
 
 ```toml
 model_provider = "deid"
@@ -55,7 +61,6 @@ model_provider = "deid"
 name = "OpenAI through deid-kit"
 base_url = "http://127.0.0.1:8787/v1"
 requires_openai_auth = true                     # ChatGPT sign-in or an API key
-http_headers = { "x-deid-scope" = "client-a" }
 
 [features]
 enable_request_compression = false
@@ -138,9 +143,11 @@ way back. The agent's credentials pass through the proxy; the proxy does not sto
 
 ### What the proxy does with a request
 
-1. **Scope.** It reads the scope from a request header (`x-deid-scope: client-a`) and falls back
-   to its default scope. A scope is one salt and one token namespace. Use one scope per client,
-   matter or project.
+1. **Scope.** It reads the scope from a request header (`x-deid-scope: client-a`). Without one it
+   uses the folder the agent works in, as the agent states it in the request (Claude Code:
+   "Primary working directory"; Codex: `<cwd>`), if a seed file lists that folder under `paths`.
+   Otherwise it falls back to its default scope, or refuses with `--require-scope`. A scope is
+   one salt and one token namespace. Use one scope per client, matter or project.
 2. **Tokenize.** It tokenizes every piece of text that came from your side:
    - in Anthropic's Messages API: `system`; the `text` blocks of each message; the content of
      `tool_result` blocks; the string values in `tool_use` inputs; the text of earlier assistant
@@ -251,7 +258,6 @@ check_for_update_on_startup = false
 name = "OpenAI through deid-kit"
 base_url = "http://127.0.0.1:8787/v1"
 requires_openai_auth = true                     # ChatGPT sign-in or an API key
-http_headers = { "x-deid-scope" = "client-a" }
 
 [analytics]
 enabled = false
@@ -269,6 +275,10 @@ apps = false
 remote_plugin = false
 ```
 
+- **Profiles.** A profile file (`codex -p <name>`) works in the terminal only; the ChatGPT app
+  and the editor integrations run `codex app-server`, which accepts no profile. Put the provider
+  in `~/.codex/config.toml` without a scope header, and let the proxy take the scope from the
+  folder.
 - **Credentials.** With `requires_openai_auth = true` you sign in with ChatGPT or use an API
   key; the Codex documentation describes this setting for LLM proxies. Leave `env_key` unset on
   this provider. The proxy receives `Authorization: Bearer …`, plus `ChatGPT-Account-ID` with a

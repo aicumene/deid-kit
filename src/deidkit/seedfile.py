@@ -8,6 +8,7 @@ enrolled before the first request, and the simplest place to list them is a file
 
     # deid.toml
     scope = "client-a"                  # optional; the caller's scope applies when absent
+    paths = ["~/matters/client-a"]      # optional: this client's project folders
 
     [[entity]]
     type = "individual"                 # individual | company | vessel | account | property
@@ -60,4 +61,17 @@ def load_seed_files(paths: list[str | os.PathLike], default_scope: str,
     return src
 
 
-__all__ = ["load_seed_files"]
+def load_scope_paths(paths: list[str | os.PathLike], default_scope: str) -> list[tuple[str, str]]:
+    """``(folder, scope)`` pairs from the seed files' ``paths`` lists, folders resolved (symbolic
+    links followed, so ``/tmp`` and ``/private/tmp`` agree), longest first."""
+    out: list[tuple[str, str]] = []
+    for path in paths:
+        with open(Path(path).expanduser(), "rb") as fh:
+            data = tomllib.load(fh)
+        scope = str(data.get("scope") or default_scope)
+        for folder in data.get("paths", []):
+            out.append((os.path.realpath(os.path.expanduser(str(folder))), scope))
+    return sorted(out, key=lambda pair: -len(pair[0]))
+
+
+__all__ = ["load_scope_paths", "load_seed_files"]

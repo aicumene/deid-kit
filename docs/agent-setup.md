@@ -23,7 +23,7 @@ Background is in [coding-agents.md](coding-agents.md).
   own credentials through; nothing in this setup needs them.
 - **Names.** Ask the user for the names to protect. Do not guess them, and do not collect them
   from other sources without being asked.
-- **Order.** Do not point an agent at the proxy for real work until the check in step 4.3
+- **Order.** Do not point an agent at the proxy for real work until the check in step 4.4
   passes.
 - **If the proxy is down.** An agent pointed at it fails to connect. Never fix that by pointing
   the agent back at the provider. Tell the user.
@@ -49,6 +49,7 @@ Write `~/.deid/seeds/<scope>.toml` with the people and organisations the user na
 
 ```toml
 scope = "client-a"
+paths = ["~/matters/client-a"] # this client's project folders
 
 [[entity]]
 type = "individual"            # individual | company | vessel | account | property
@@ -68,6 +69,9 @@ Then run `chmod 600 ~/.deid/seeds/<scope>.toml`.
 - **Patterns.** E-mail addresses, IBANs, payment cards and international phone numbers are
   detected without being listed. A person whose address has the form `first.last@` is enrolled
   from it.
+- **Folders.** `paths` lists the client's project folders. An agent working in one of them, or
+  in a folder beneath it, gets this scope without any setting in the agent. This is how Codex
+  and the editor windows get the right scope.
 
 ## 3. Run the proxy (once per machine; it serves every scope)
 
@@ -86,6 +90,7 @@ user name:
   <key>ProgramArguments</key><array>
     <string>/Users/YOU/.deid/venv/bin/deid-proxy</string>
     <string>--seeds-dir</string><string>/Users/YOU/.deid/seeds</string>
+    <string>--require-scope</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -104,7 +109,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.aicumene.deid-proxy.p
 Description=deid-proxy
 
 [Service]
-ExecStart=%h/.deid/venv/bin/deid-proxy --seeds-dir %h/.deid/seeds
+ExecStart=%h/.deid/venv/bin/deid-proxy --seeds-dir %h/.deid/seeds --require-scope
 Restart=on-failure
 
 [Install]
@@ -114,6 +119,10 @@ WantedBy=default.target
 ```sh
 systemctl --user enable --now deid-proxy
 ```
+
+`--require-scope` refuses a request from a folder that no seed file lists and that sends no
+scope header, instead of letting it go out under a default scope. Give personal projects a scope
+of their own: a seed file with `scope` and `paths` and no names.
 
 Check that it answers:
 
@@ -145,14 +154,18 @@ in `-p` mode). Choose one of two files:
 }
 ```
 
-Merge these keys into the file if it already exists; do not overwrite other settings.
+When the project's folder is listed under `paths` (step 2), `ANTHROPIC_CUSTOM_HEADERS` can be
+left out: the proxy takes the scope from the folder. Keep it for a project outside its client's
+folders. Merge these keys into the file if it already exists; do not overwrite other settings.
 `ANTHROPIC_CUSTOM_HEADERS` needs Claude Code 2.1.227 or later. A claude.ai subscription sign-in
 works through the proxy as it is, and no API key is needed.
 
 ### 4.2 Codex
 
-Codex ignores provider settings in a project's `.codex/config.toml`, so the setting goes into a
-profile in the user's Codex home. Write `~/.codex/deid-<scope>.config.toml`:
+Codex ignores provider settings in a project's `.codex/config.toml`. The provider therefore goes
+into the user's `~/.codex/config.toml` itself, **without** a scope header; the proxy takes the
+scope from the folder (step 2). This one setting covers the terminal, the Codex window of the
+ChatGPT app and the editor extensions alike.
 
 ```toml
 model_provider = "deid"
@@ -161,7 +174,6 @@ model_provider = "deid"
 name = "OpenAI through deid-kit"
 base_url = "http://127.0.0.1:8787/v1"
 requires_openai_auth = true                     # ChatGPT sign-in or an API key
-http_headers = { "x-deid-scope" = "client-a" }
 
 [features]
 enable_request_compression = false
@@ -173,13 +185,59 @@ enabled = false
 enabled = false
 ```
 
-The user then starts Codex with the profile, `codex -p deid-<scope>`. If `codex` is not on the
-`PATH`, the ChatGPT desktop app on macOS ships it at
-`/Applications/ChatGPT.app/Contents/Resources/codex`. Tell them that a Codex
-started without `-p` talks to OpenAI directly. Codex cloud tasks and the IDE's `/cloud` command
-run in OpenAI's containers and never pass through the proxy.
+Put `model_provider` above the first `[table]`, and merge the rest into the existing file.
 
-### 4.3 Check before real work
+- **What changes.** From then on every Codex session goes through the proxy. With
+  `--require-scope`, a session in an unlisted folder is refused, so list every folder Codex is
+  used in (step 2).
+- **Profiles.** A profile file (`~/.codex/<name>.config.toml`, `codex -p <name>`) works in the
+  terminal only. The ChatGPT app and the editor integrations cannot select one.
+- **Where Codex lives.** If `codex` is not on the `PATH`, the ChatGPT desktop app on macOS ships
+  it at `/Applications/ChatGPT.app/Contents/Resources/codex`.
+- **What never passes the proxy.** Codex cloud tasks and the IDE's `/cloud` command run in
+  OpenAI's containers.
+
+### 4.3 Editors and apps
+
+The proxy is in the path whenever the agent runs on this machine and reads the settings above.
+
+| where you work | what to set |
+|---|---|
+| Claude app, Code tab | the project's `.claude/settings*.json` (4.1). The app reads it as the terminal does, once you trust the folder. |
+| ChatGPT app, Codex window | `~/.codex/config.toml` (4.2) |
+| VS Code or VSCodium | Claude Code extension: the same `.claude/settings*.json`. Codex extension: `~/.codex/config.toml`. VSCodium installs both from Open VSX. |
+| Zed | the agent server's `env` in Zed's settings, shown below |
+| JetBrains IDEs | a custom agent in `~/.jetbrains/acp.json` with the same `env`. Do not use the built-in Claude Agent and Codex entries, whose routing is not documented. |
+
+Zed, in its `settings.json`:
+
+```json
+{
+  "agent_servers": {
+    "claude-acp": { "type": "registry", "env": {
+      "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1" } },
+    "codex-acp": { "type": "registry", "env": { "MODEL_PROVIDER": "deid" } }
+  }
+}
+```
+
+Watch for these:
+
+- **Other AI features.** The built-in AI of Cursor and Windsurf sends files to their own servers
+  and never passes the proxy. Turn it off, or use another editor.
+- **Clients with their own gateway.** A client that signs agents in through its own gateway
+  (ACP's gateway authentication) replaces the base URL. Such a client is unsuitable.
+- **A host that manages the provider.** When the host sets `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`,
+  Claude Code ignores the base URL in settings files.
+- **Worktrees.** A new git worktree has no `.claude/settings.local.json`. Claude Code 2.1.211 or
+  later reads the main checkout's copy, and a worktree inside a listed folder gets its scope from
+  `paths` anyway.
+- **The only hard guarantee is the network.** Any setting can be bypassed by a misconfigured
+  client. On a machine used for client work, add an outbound firewall rule that lets only the
+  proxy's process reach `api.anthropic.com`, `api.openai.com` and `chatgpt.com`.
+
+### 4.4 Check before real work
 
 Run one short task through a separate proxy, on a separate scope, with invented names, and check
 what crossed. Nothing here touches the project or the real vault.
@@ -283,8 +341,9 @@ numbers.
 - **A new name.** Add it to the scope's seed file and restart the proxy: on macOS
   `launchctl kickstart -k gui/$(id -u)/ai.aicumene.deid-proxy`, on Linux
   `systemctl --user restart deid-proxy`. Seed files are read at start.
-- **A new client.** Write a new seed file with its own `scope`, restart the proxy, and repeat
-  step 4 in that client's projects with the new scope name.
+- **A new client.** Write a new seed file with its own `scope` and `paths`, then restart the
+  proxy. Claude Code projects inside those folders need the settings file from 4.1 (the header
+  may be left out). Codex needs nothing more.
 - **Checking a real session.** Run the proxy once with `--record ~/.deid/record.jsonl`. Then run
   `deid-proxy check --record ~/.deid/record.jsonl --scope <scope>`, and delete the record
   afterwards: it holds the session in tokens, with places, dates and amounts in clear.
