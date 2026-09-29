@@ -315,3 +315,17 @@ def test_a_persons_genitive_is_a_spelling_and_an_apostrophe_name_needs_none():
     assert "Muellers" in nf.spelling_variants("Müller", genitive=True)
     assert nf.spelling_variants("Albers", genitive=True) == []          # "Albers'" — the ' is a boundary
     assert nf.spelling_variants("Albrecht") == []                       # no genitive unless asked (companies)
+
+
+def test_a_backslash_escape_before_a_name_is_a_boundary():
+    """MEASURED 28.09.2026: a coding agent's tool output came as JSON text, so a line break before
+    a company's name was the two characters backslash and n, and the name crossed in clear."""
+    raw = '{"output":"Dear Ms Voss,\\n\\nBrightwater Maritime Ltd asks\\tTamsin Okafor\\u00a0Ltd"}'
+    hay, folded = nf.fold_haystack(raw)
+    for name in ("Brightwater Maritime Ltd", "Tamsin Okafor"):
+        assert len(nf.find_all(hay, nf.key(name))) == 1, name
+
+
+def test_an_escaped_backslash_before_a_letter_is_not_a_line_break():
+    hay, folded = nf.fold_haystack("C:\\\\nBrightwater")          # the text  C:\\nBrightwater
+    assert nf.find_all(hay, nf.key("Brightwater")) == []

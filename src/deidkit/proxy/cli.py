@@ -3,7 +3,8 @@
 """``deid-proxy``: run the de-identification proxy on this machine.
 
     deid-proxy --scope client-a --seeds ./deid.toml
-    ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+    ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude          # Claude Code
+    codex -c model_provider=deid ...                          # Codex, see docs/coding-agents.md
 
 The vault (``~/.deid/vault.sqlite``) and the audit (``~/.deid/audit.jsonl``) stay on this machine;
 both are readable by their owner only. ``--record FILE`` also writes what crossed, in tokens,
@@ -30,7 +31,12 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="deid-proxy", description=__doc__.split("\n\n")[0])
     ap.add_argument("--host", default="127.0.0.1", help="address to listen on (default: loopback)")
     ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--upstream", default="https://api.anthropic.com")
+    ap.add_argument("--upstream", default="https://api.anthropic.com",
+                    help="Anthropic's API, for Claude Code")
+    ap.add_argument("--upstream-openai", default="https://api.openai.com/v1",
+                    help="OpenAI's API, for Codex with an API key")
+    ap.add_argument("--upstream-chatgpt", default="https://chatgpt.com/backend-api/codex",
+                    help="the ChatGPT backend, for Codex signed in with ChatGPT")
     ap.add_argument("--vault", default="~/.deid/vault.sqlite", help="token store (SQLite)")
     ap.add_argument("--scope", default="default",
                     help="scope for requests without an x-deid-scope header")
@@ -57,13 +63,16 @@ def main(argv: list[str] | None = None) -> None:
     store = SQLiteTokenStore(args.vault)
     seeds = load_seed_files(args.seeds, args.scope)
     kinds = tuple(k.strip().upper() for k in args.kinds.split(",") if k.strip())
-    cfg = ProxyConfig(default_scope=args.scope, upstream=args.upstream, binary=args.binary,
+    cfg = ProxyConfig(default_scope=args.scope, upstream=args.upstream,
+                      upstream_openai=args.upstream_openai, upstream_chatgpt=args.upstream_chatgpt,
+                      binary=args.binary,
                       record=Path(args.record).expanduser() if args.record else None,
                       audit=Path(args.audit).expanduser() if args.audit else None,
                       detector=RegexDetector(kinds) if kinds else None,
                       glossary=args.glossary, seeds=seeds)
     web.run_app(Proxy(store, cfg).app(), host=args.host, port=args.port,
-                print=lambda msg: print(f"deid-proxy: {args.host}:{args.port} -> {args.upstream}",
+                print=lambda msg: print(f"deid-proxy: {args.host}:{args.port} -> {args.upstream}, "
+                                        f"{args.upstream_chatgpt}, {args.upstream_openai}",
                                         file=sys.stderr))
 
 

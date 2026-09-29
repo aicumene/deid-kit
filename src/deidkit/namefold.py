@@ -285,6 +285,35 @@ def _is_word_char(ch: str) -> bool:
     return ch.isalnum() or unicodedata.category(ch).startswith("M")
 
 
+_ESCAPE_LETTERS = frozenset("ntrfbv")
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _odd_backslashes_before(hay: str, i: int) -> bool:
+    """Is ``hay[i]`` a backslash that starts an escape (preceded by an even run of backslashes)?"""
+    n = 0
+    while i >= 0 and hay[i] == "\\":
+        n += 1
+        i -= 1
+    return n % 2 == 1
+
+
+def after_escape(hay: str, start: int) -> bool:
+    """Does the text before ``start`` end in a backslash escape (``\\n``, ``\\t``, ``\\u00a0``)?
+
+    MEASURED 28.09.2026: a coding agent's tool output arrived as JSON inside a text field, so a
+    letter's line breaks were the two characters ``\\`` and ``n``. "…Dear Ms Voss,\\n\\nBrightwater
+    Maritime Ltd asks…" put the letter ``n`` right before the company's name, the left boundary
+    read it as part of a word, and the name crossed in clear four times. An escape stands for
+    the whitespace it encodes and separates words the same way. An escaped backslash followed by
+    a letter (``\\\\n``) is a backslash and a letter, not a line break."""
+    if start >= 2 and hay[start - 1] in _ESCAPE_LETTERS and \
+            _odd_backslashes_before(hay, start - 2):
+        return True
+    return start >= 6 and hay[start - 5] in "uU" and all(c in _HEX for c in hay[start - 4:start]) \
+        and _odd_backslashes_before(hay, start - 6)
+
+
 def boundary_ok(hay: str, start: int, end: int, needle: str) -> bool:
     """True when hay[start:end] is a standalone occurrence of ``needle``.
 
@@ -293,9 +322,11 @@ def boundary_ok(hay: str, start: int, end: int, needle: str) -> bool:
     letter before it and the needle starts with a letter → rejected. "(Hallberg)," has
     punctuation on both sides → accepted. "Ltd." followed by a letter → accepted, because the
     needle's own last character is a full stop and demanding a boundary after it would reject
-    every real occurrence.
+    every real occurrence. A backslash escape before the needle (``\\n``) is a boundary: see
+    :func:`after_escape`.
     """
-    if needle and _is_word_char(needle[0]) and start > 0 and _is_word_char(hay[start - 1]):
+    if needle and _is_word_char(needle[0]) and start > 0 and _is_word_char(hay[start - 1]) \
+            and not after_escape(hay, start):
         return False
     if needle and _is_word_char(needle[-1]) and end < len(hay) and _is_word_char(hay[end]):
         return False

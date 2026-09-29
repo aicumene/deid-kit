@@ -91,6 +91,31 @@ def luhn_ok(value: str) -> bool:
     return total % 10 == 0
 
 
+def _blank_escapes(text: str) -> str:
+    """The text with each backslash escape (``\\n``, ``\\t``, ``\\u00a0``) replaced by spaces of the
+    same length, so that offsets hold and ``\\nlena.voss@…`` is not read as ``nlena.voss@…``."""
+    if "\\" not in text:
+        return text
+    out = list(text)
+    i = 0
+    while i < len(text) - 1:
+        if text[i] == "\\":
+            nxt = text[i + 1]
+            if nxt in "ntrfbv":
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if nxt in "uU" and i + 5 < len(text) and all(c in "0123456789abcdefABCDEF"
+                                                          for c in text[i + 2:i + 6]):
+                out[i:i + 6] = [" "] * 6
+                i += 6
+                continue
+            i += 2                      # an escaped character (\\\\, \\") is skipped whole
+            continue
+        i += 1
+    return "".join(out)
+
+
 def _email_is_personal(value: str) -> bool:
     return value.rpartition("@")[0].lower() not in _ROLE_LOCAL_PARTS
 
@@ -105,24 +130,28 @@ class RegexDetector:
 
     def detect(self, text: str, language: str) -> list[tuple[str, str]]:
         found: dict[tuple[str, str], tuple[str, str]] = {}
+        raw, text = text, _blank_escapes(text)
 
         def add(span: str, kind: str) -> None:
             if kind in self.kinds and span.strip() and not nf.TOKEN_IN_TEXT.search(span):
                 found.setdefault((nf.key(span), kind), (span, kind))
 
+        def at(m) -> str:
+            return raw[m.start():m.end()]
+
         for m in _EMAIL.finditer(text):
-            if _email_is_personal(m.group(0)):
-                add(m.group(0), "EMAIL")
+            if _email_is_personal(at(m)):
+                add(at(m), "EMAIL")
         for m in _IBAN.finditer(text):
-            iban = _longest_iban(m.group(0))
+            iban = _longest_iban(at(m))
             if iban:
                 add(iban, "IBAN")
         for m in _CARD.finditer(text):
-            if card_ok(m.group(0)):
-                add(m.group(0), "CARD")
+            if card_ok(at(m)):
+                add(at(m), "CARD")
         for m in _PHONE.finditer(text):
-            if 8 <= sum(c.isdigit() for c in m.group(0)) <= 15:
-                add(m.group(0), "PHONE")
+            if 8 <= sum(c.isdigit() for c in at(m)) <= 15:
+                add(at(m), "PHONE")
         return list(found.values())
 
 

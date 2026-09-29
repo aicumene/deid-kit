@@ -48,3 +48,8 @@ def test_a_token_is_never_reported():
 def test_kinds_narrow_the_report():
     det = RegexDetector(("EMAIL",))
     assert det.detect("a.b@c.example +44 20 7946 0958", "en") == [("a.b@c.example", "EMAIL")]
+
+
+def test_an_escape_does_not_stick_to_what_follows_it():
+    found = kinds('{"to":"Lena Voss\\nlena.voss@northfield.example\\t+44 20 7946 0958"}')
+    assert found == {"lena.voss@northfield.example": "EMAIL", "+44 20 7946 0958": "PHONE"}

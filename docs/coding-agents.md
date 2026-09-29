@@ -6,11 +6,12 @@ data (client documents, e-mails, test fixtures, logs, database exports), that da
 machine on every turn. This page describes how to put deid-kit between the agent and the model,
 so that the agent works on the real files while the model receives tokens.
 
-**Status.** The proxy for Claude Code (Anthropic's Messages API) is in the package:
-`deid-proxy`, with the extra `proxy`. The proxy for Codex, the hook scripts, the working-copy
-commands and the scanner are specified on this page but are not part of the package yet.
+**Status.** The proxy is in the package: `deid-proxy`, with the extra `proxy`. One process
+serves Claude Code (Anthropic's Messages API) and Codex (OpenAI's Responses API). The hook
+scripts, the working-copy commands and the scanner are specified on this page but are not part of
+the package yet.
 
-## Quick start: Claude Code
+## Quick start
 
 ```sh
 pip install -e '.[proxy]'                       # from a checkout of this repository
@@ -39,6 +40,22 @@ export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 claude
 ```
 
+For Codex, add a provider in `~/.codex/config.toml` (the full block is in the Codex section
+below):
+
+```toml
+model_provider = "deid"
+
+[model_providers.deid]
+name = "OpenAI through deid-kit"
+base_url = "http://127.0.0.1:8787/v1"
+requires_openai_auth = true                     # ChatGPT sign-in or an API key
+http_headers = { "x-deid-scope" = "client-a" }
+
+[features]
+enable_request_compression = false
+```
+
 - **Where things are kept.** The vault goes to `~/.deid/vault.sqlite` and the audit to
   `~/.deid/audit.jsonl`; both files are readable by their owner only.
 - **Recording.** `--record FILE` also writes what crossed, in tokens, so that you can check it.
@@ -49,15 +66,24 @@ claude
 - **Not applied yet.** Street addresses and initials, which the vault can tokenize, are not yet
   applied by the proxy.
 
-**Measured on 28 September 2026.** The test used Claude Code 2.1.263 signed in with a claude.ai
-subscription and a folder of invented names. Claude Code read a letter, wrote a summary file and
-answered.
-- **What crossed:** none of the names, e-mail addresses, the phone number or the IBAN, checked
-  word by word and through the vault. The model saw `PERSON_85844766`, `EMAIL_53250088`,
-  `IBAN_97199306`.
-- **What stayed on the machine:** the summary file and the answer, both with the real values.
-- **Across turns:** the second turn read 36,563 tokens from the prompt cache. The model's
-  reasoning blocks went back and forth without a rejection.
+**Measured on 28 September 2026.** Both agents worked on the same folder of invented names, a
+letter with two people, a company, two e-mail addresses, a phone number and an IBAN. Each agent
+read the letter, wrote a summary file and answered.
+
+| | Claude Code 2.1.263, claude.ai subscription | Codex 0.155 (in the ChatGPT app), ChatGPT sign-in |
+|---|---|---|
+| what crossed | none of the values | none of the values |
+| the summary file and the answer | real values | real values |
+| history | the second turn read 36,563 tokens from the prompt cache | the model's own items restored in every later request |
+
+How it was checked: every string sent to the model was decoded (JSON inside text included) and
+searched for each value as a plain substring. That check matters, because the first Codex run
+leaked. In Codex's code mode a command's output comes back as JSON inside a text part, so line
+breaks are the two characters `\` and `n`. The letter `n` stuck to the next word, the word
+boundary failed, and a company name and a first name that each followed a line break crossed in
+clear. The vault now treats a backslash escape as a boundary, as does the pattern detector, and
+a test holds the case. A search that respects word boundaries is blind to exactly this, so the
+check has to be a plain substring search.
 
 ## The idea
 
@@ -255,6 +281,13 @@ remote_plugin = false
   the proxy tokenizes them too. Newer models receive the base instructions and the tool list as
   `input` items (a developer message and an `additional_tools` item) instead of in
   `instructions`.
+- **Code mode.** Codex 0.155 with its default model gives the model one custom tool, `exec`,
+  whose input is a short script calling other tools:
+  `text(await tools.apply_patch("*** Begin Patch …"))`. The script gets real values only when
+  every tool it calls is local, and each value is escaped for the string literal it lands in.
+  A script that calls an MCP tool keeps the tokens.
+- **No content type.** The ChatGPT backend streams without a `content-type` header, so the proxy
+  decides streaming by the request's own `stream` flag.
 - **What to detokenize.** Codex builds its history and runs tools from the complete item in
   `response.output_item.done`; the deltas are only for display. The proxy therefore replaces
   tokens in each completed item (message text, the `arguments` of a `function_call`, the `input`
@@ -431,6 +464,8 @@ the vault did not recognise.
 - Tokens hide who. Dates, amounts, places and the shape of a document can still point to a
   case. The probe measures this.
 - Text only. Images, screenshots and PDFs are withheld (or refused), not tokenized.
+- A name written with `\uXXXX` escapes inside JSON (`Jos\u00e9`) does not match the name it
+  stands for, so it is not recognized yet.
 - A newly enrolled name changes how earlier turns read, which costs one prompt-cache miss.
 - The model reasons about tokens, so it cannot see the spelling, the length or the initials of a
   name.
