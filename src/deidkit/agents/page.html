@@ -174,8 +174,36 @@ async function boot() {
   $("scope").textContent = "scope " + s.scope;
   $("auth").textContent = s.auth; $("auth").className = "chip" + (s.auth.startsWith("personal") ? " warn" : " ok");
   $("status").textContent = s.status; renderFiles(s); setBusy(s.busy);
-  const es = new EventSource("/deid-agent/api/events?t=" + encodeURIComponent(token));
-  es.onmessage = (m) => onEvent(JSON.parse(m.data));
+  follow();
+}
+// Events come over fetch, not EventSource: EventSource cannot send a header, and the token must
+// not go in an address, where logs keep it.
+async function follow() {
+  let wait = 500;
+  for (;;) {
+    try {
+      const r = await api("events");
+      if (r.status === 401) { $("status").textContent = "not authorised"; $("status").className = "chip warn"; return; }
+      if (r.ok && r.body) {
+        wait = 500;
+        log.textContent = ""; tools.clear(); current = null;      // the host replays the whole session
+        const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += value;
+          for (let cut; (cut = buf.indexOf("\n\n")) >= 0; ) {
+            const data = buf.slice(0, cut).split("\n").filter(l => l.startsWith("data: ")).map(l => l.slice(6)).join("\n");
+            buf = buf.slice(cut + 2);
+            if (data) onEvent(JSON.parse(data));
+          }
+        }
+      }
+    } catch (e) { /* the connection dropped: connect again */ }
+    $("status").textContent = "reconnecting…";
+    await new Promise(res => setTimeout(res, wait)); wait = Math.min(wait * 2, 8000);
+  }
 }
 $("ask").onsubmit = async (e) => {
   e.preventDefault(); const text = $("task").value.trim(); if (!text) return;

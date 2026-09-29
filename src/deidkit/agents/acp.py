@@ -166,7 +166,8 @@ class AcpAgent:
 
 def agent_env(*, base_url: str, scope: str, api_key: str | None, extra: dict | None = None) -> dict:
     """The environment for a Claude agent behind the proxy: a minimal inherited base, the proxy
-    as its only endpoint, and the scope. Without ``api_key`` the agent falls back to the local
+    as its only endpoint, and the scope. ``api_key`` is what the agent sends as its key; behind a
+    proxy that holds the real one it is a stand-in. Without it the agent falls back to the local
     sign-in, which a product must not offer to its users (see the Agent SDK's terms)."""
     keep = ("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "SHELL", "TERM")
     env = {k: os.environ[k] for k in keep if k in os.environ}

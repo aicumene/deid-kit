@@ -13,8 +13,14 @@ One process on one loopback port holds three things:
 
 **The API needs a token.** The agent runs on the same machine and could otherwise call the API
 itself and approve its own edit. The token is made at start and handed to the page in the URL
-fragment (``#t=…``), which a browser never sends to a server, so it appears in no request, log
-or file the agent can read.
+fragment (``#t=…``), which a browser never sends to a server; the page sends it back in a header
+only, never in an address, so it appears in no request line, log or file the agent can read.
+
+**The agent never holds the organization's key.** The proxy keeps it and gives the agent a
+stand-in made for this run (``agent_key``), swapping one for the other on the way out. A program
+that starts ``deid-agent`` hands over the token and the key on stdin (``--secrets-stdin``): other
+processes of the same user, the agent's commands among them, can read a process's environment
+and arguments (``ps -E``), not what came through its stdin.
 
 A permission request that names a path outside the folder is refused without asking.
 """
@@ -53,6 +59,8 @@ class HostConfig:
     claude_executable: str | None = None
     port: int = 8790
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
+    #: What the agent sends as its key; the proxy swaps it for ``api_key``, which stays there.
+    agent_key: str = field(default_factory=lambda: "deid-agent-" + secrets.token_urlsafe(24))
 
 
 def snapshot(folder: Path) -> dict[str, str]:
@@ -92,6 +100,8 @@ class AgentHost:
         self.busy = False
         self.baseline = snapshot(cfg.folder)
         self.status = "starting"
+        self.key_refused_told = False
+        proxy.on_key_refused = self.key_refused
 
     # ── events ───────────────────────────────────────────────────────────────
     def emit(self, event: dict) -> None:
@@ -111,7 +121,7 @@ class AgentHost:
     async def start_agent(self) -> None:
         extra = {"CLAUDE_CODE_EXECUTABLE": self.cfg.claude_executable} if self.cfg.claude_executable else {}
         env = agent_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
-                        api_key=self.cfg.api_key, extra=extra)
+                        api_key=self.cfg.agent_key if self.cfg.api_key else None, extra=extra)
         self.agent = AcpAgent(self.cfg.agent_command, env=env, cwd=str(self.cfg.folder),
                               on_update=self.on_update, on_permission=self.on_permission)
         try:
@@ -168,8 +178,23 @@ class AgentHost:
             self.permissions.pop(rid, None)
             self.emit({"kind": "permission_done", "id": rid})
 
+    def key_refused(self) -> None:
+        """The provider refused the organization's key. The agent would retry for minutes behind
+        a silent page, so the person is told, and a running turn is stopped."""
+        if self.key_refused_told:
+            return
+        self.key_refused_told = True
+        if self.busy and self.agent and self.session_id:
+            asyncio.get_running_loop().create_task(self.agent.cancel(self.session_id))
+            text = "Anthropic refused the organization's key, so the turn was stopped."
+        else:
+            text = "Anthropic refuses the organization's key."
+        self.emit({"kind": "error", "text": text + " The key is wrong or revoked: replace it, "
+                                                   "then open the agent again."})
+
     async def run_prompt(self, text: str) -> None:
         self.busy = True
+        self.key_refused_told = False
         self.emit({"kind": "user", "text": text})
         try:
             result = await self.agent.prompt(self.session_id, text)
@@ -182,8 +207,8 @@ class AgentHost:
 
     # ── HTTP ─────────────────────────────────────────────────────────────────
     def _authorised(self, request: web.Request) -> bool:
-        given = request.headers.get("x-deid-agent-token") or request.query.get("t", "")
-        return secrets.compare_digest(given, self.cfg.token)
+        given = request.headers.get("x-deid-agent-token", "")          # a header, never the address
+        return secrets.compare_digest(given.encode(), self.cfg.token.encode())
 
     async def page(self, request: web.Request) -> web.Response:
         html = (Path(__file__).parent / "page.html").read_text(encoding="utf-8")

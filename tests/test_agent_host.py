@@ -43,6 +43,8 @@ async def rig(tmp_path):
 async def test_the_api_needs_the_token(rig):
     host, client, folder = rig
     assert (await client.get("/deid-agent/api/state")).status == 401
+    # never in the address, where access logs keep it
+    assert (await client.get(f"/deid-agent/api/state?t={host.cfg.token}")).status == 401
     ok = await client.get("/deid-agent/api/state", headers={"x-deid-agent-token": host.cfg.token})
     body = await ok.json()
     assert ok.status == 200 and body["status"] == "ready" and body["files"] == ["letter.md"]
@@ -73,3 +75,61 @@ async def test_a_turn_with_a_person_answering(rig):
     assert (await doc.json())["text"] == "Draft for the client.\n"
     outside = await client.get("/deid-agent/api/file?path=../x", headers=headers)
     assert outside.status == 404
+
+
+async def test_the_agent_holds_a_stand_in_not_the_key(tmp_path):
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1",
+                     agent_command=[sys.executable, str(FAKE)], api_key="sk-org-held-by-proxy")
+    host = AgentHost(cfg, Proxy(InMemoryTokenStore(), ProxyConfig(
+        default_scope="case-1", upstream_key=cfg.api_key, agent_key=cfg.agent_key)))
+    client = TestClient(TestServer(host.app()))
+    await client.start_server()
+    try:
+        await wait_for(lambda: host.status == "ready")
+        assert host.agent.env["ANTHROPIC_API_KEY"] == cfg.agent_key
+        assert "sk-org-held-by-proxy" not in "".join(host.agent.env.values())
+    finally:
+        await client.close()
+
+
+def test_secrets_come_as_one_json_line():
+    import io
+
+    from deidkit.agents.cli import read_secrets
+    assert read_secrets(io.StringIO('{"token": "t1", "api_key": null}\n')) == \
+        {"token": "t1", "api_key": None}
+    assert read_secrets(io.StringIO("")) == {}
+    with pytest.raises(SystemExit):
+        read_secrets(io.StringIO("token=t1\n"))
+
+
+async def test_a_refused_key_is_told_at_once(tmp_path):
+    from aiohttp import web
+
+    async def refuse(request):
+        return web.json_response({"type": "error", "error": {"type": "authentication_error",
+                                                             "message": "invalid x-api-key"}},
+                                 status=401)
+    provider = web.Application()
+    provider.router.add_post("/v1/messages/count_tokens", refuse)
+    upstream = TestServer(provider)
+    await upstream.start_server()
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1",
+                     agent_command=[sys.executable, str(FAKE)], api_key="sk-org-revoked")
+    host = AgentHost(cfg, Proxy(InMemoryTokenStore(), ProxyConfig(
+        default_scope="case-1", upstream=str(upstream.make_url("")).rstrip("/"),
+        upstream_key=cfg.api_key, agent_key=cfg.agent_key)))
+    client = TestClient(TestServer(host.app()))
+    await client.start_server()
+    try:
+        await wait_for(lambda: host.status == "ready")
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        for _ in range(2):
+            r = await client.post("/v1/messages/count_tokens", json=body,
+                                  headers={"x-api-key": cfg.agent_key})
+            assert r.status == 401
+        told = [e for e in host.events if e["kind"] == "error"]
+        assert len(told) == 1 and "refuses the organization's key" in told[0]["text"]
+    finally:
+        await client.close()
+        await upstream.close()

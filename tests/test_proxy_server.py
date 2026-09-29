@@ -68,6 +68,7 @@ class Model:
 
     async def count(self, request):
         self.received.append(await request.json())
+        self.headers.append(dict(request.headers))
         return web.json_response({"input_tokens": 42})
 
 
@@ -179,3 +180,42 @@ async def test_what_the_proxy_cannot_read_is_not_sent(rig):
     resp = await client.post("/v1/files", data=b"x")
     assert resp.status == 403
     assert model.received == []
+
+
+async def test_a_held_key_is_lent_only_to_the_agent(tmp_path):
+    model = Model()
+    upstream_app = web.Application()
+    upstream_app.router.add_post("/v1/messages/count_tokens", model.count)
+
+    async def hello(request):
+        model.headers.append(dict(request.headers))
+        return web.Response()
+    upstream_app.router.add_route("HEAD", "/api/hello", hello)
+    upstream = TestServer(upstream_app)
+    await upstream.start_server()
+    cfg = ProxyConfig(default_scope="case-1", upstream=str(upstream.make_url("")).rstrip("/"),
+                      upstream_key="sk-org-real", agent_key="stand-in-1")
+    client = TestClient(TestServer(Proxy(SQLiteTokenStore(tmp_path / "v.sqlite"), cfg).app()))
+    await client.start_server()
+    try:
+        body = first_request()
+        body.pop("stream")
+        for key in ("", "sk-org-real", "stand-in-2"):
+            r = await client.post("/v1/messages/count_tokens", json=body, headers={"x-api-key": key})
+            assert r.status == 401
+        assert model.received == []
+        r = await client.post("/v1/messages/count_tokens", json=body,
+                              headers={"x-api-key": "stand-in-1", "authorization": "Bearer personal"})
+        assert r.status == 200
+        sent = {k.lower(): v for k, v in model.headers[-1].items()}
+        assert sent["x-api-key"] == "sk-org-real" and "authorization" not in sent
+        r = await client.post("/v1/responses", json={"input": "x"}, headers={"x-api-key": "stand-in-1"})
+        assert r.status == 403
+        # a connectivity check without the stand-in goes out, but with no key at all
+        r = await client.head("/api/hello", headers={"authorization": "Bearer personal"})
+        assert r.status == 200
+        sent = {k.lower() for k in model.headers[-1]}
+        assert "x-api-key" not in sent and "authorization" not in sent
+    finally:
+        await client.close()
+        await upstream.close()

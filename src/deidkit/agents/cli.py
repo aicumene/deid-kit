@@ -4,15 +4,19 @@
 
     deid-agent --folder ~/matters/client-a --scope client-a --seeds ~/.deid/seeds/client-a.toml
 
-The page's address, with its token, is printed on start (or pass the token in DEID_AGENT_TOKEN
-when another program opens the page). The agent's credential comes from ANTHROPIC_API_KEY in
-this process's environment. ``--dev-login`` lets it use the machine's own Claude sign-in instead,
-for development only: a product must not offer a personal subscription sign-in to its users.
+The page's address, with its token, is printed on start. The organization's key comes from
+ANTHROPIC_API_KEY and stays in the proxy; the agent gets a stand-in. A program that starts
+deid-agent and opens the page itself passes ``--secrets-stdin`` and writes one JSON line,
+``{"token": "…", "api_key": "…"}``, instead: a process's environment and arguments can be read by
+other processes of the same user, its stdin cannot. ``--dev-login`` lets the agent use the
+machine's own Claude sign-in, for development only: a product must not offer a personal
+subscription sign-in to its users.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import shlex
@@ -32,6 +36,18 @@ from deidkit.sqlite_store import SQLiteTokenStore
 DEFAULT_AGENT = "npx -y @agentclientprotocol/claude-agent-acp"
 
 
+def read_secrets(stream) -> dict:
+    """The one JSON line a starting program writes: ``token`` and ``api_key`` (either may be null)."""
+    line = stream.readline()
+    try:
+        given = json.loads(line) if line.strip() else {}
+    except ValueError:
+        given = None
+    if not isinstance(given, dict):
+        sys.exit("deid-agent: --secrets-stdin expects one JSON line with token and api_key")
+    return given
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="deid-agent", description=__doc__.split("\n\n")[0])
     ap.add_argument("--folder", required=True, help="the folder the agent works in")
@@ -48,7 +64,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--claude-executable", default=shutil.which("claude"),
                     help="the claude binary the Claude adapter should run")
     ap.add_argument("--api-key-env", default="ANTHROPIC_API_KEY",
-                    help="environment variable holding the agent's API key")
+                    help="environment variable holding the organization's key")
+    ap.add_argument("--secrets-stdin", action="store_true",
+                    help='read the page token and the key as one JSON line on stdin '
+                         '({"token": ..., "api_key": ...}) instead of the environment')
     ap.add_argument("--dev-login", action="store_true",
                     help="allow the machine's own Claude sign-in when no API key is set")
     args = ap.parse_args(argv)
@@ -57,28 +76,32 @@ def main(argv: list[str] | None = None) -> None:
     folder = Path(args.folder).expanduser().resolve()
     if not folder.is_dir():
         sys.exit(f"deid-agent: no such folder: {folder}")
-    api_key = os.environ.get(args.api_key_env) or None
+    if args.secrets_stdin:
+        given = read_secrets(sys.stdin)
+        token, api_key = given.get("token") or "", given.get("api_key") or None
+    else:
+        token, api_key = os.environ.pop("DEID_AGENT_TOKEN", ""), os.environ.get(args.api_key_env) or None
     if not api_key and not args.dev_login:
-        sys.exit(f"deid-agent: set {args.api_key_env} (the organization's key), "
-                 "or pass --dev-login for development")
+        sys.exit(f"deid-agent: no organization key (set {args.api_key_env}, or pass it with "
+                 "--secrets-stdin), or pass --dev-login for development")
 
+    cfg = HostConfig(folder=folder, scope=args.scope, title=args.title or folder.name,
+                     agent_command=shlex.split(args.agent_command), api_key=api_key,
+                     dev_login=args.dev_login, claude_executable=args.claude_executable,
+                     port=args.port)
+    if token:
+        cfg.token = token
     files = seed_files(args.seeds, args.seeds_dir)
     store = SQLiteTokenStore(args.vault)
     proxy = Proxy(store, ProxyConfig(
         default_scope=args.scope, seeds=load_seed_files(files, args.scope),
         scope_paths=load_scope_paths(files, args.scope), detector=RegexDetector(),
         record=Path(args.record).expanduser() if args.record else None,
-        audit=Path(args.audit).expanduser()))
-    cfg = HostConfig(folder=folder, scope=args.scope, title=args.title or folder.name,
-                     agent_command=shlex.split(args.agent_command), api_key=api_key,
-                     dev_login=args.dev_login, claude_executable=args.claude_executable,
-                     port=args.port)
-    given = os.environ.pop("DEID_AGENT_TOKEN", "")
-    if given:
-        cfg.token = given
+        audit=Path(args.audit).expanduser(),
+        upstream_key=api_key, agent_key=cfg.agent_key if api_key else None))
     host = AgentHost(cfg, proxy)
     # A token handed over by the program that opens the page is not printed: output may go to a log.
-    url = f"http://127.0.0.1:{args.port}/" + ("" if given else f"#t={cfg.token}")
+    url = f"http://127.0.0.1:{args.port}/" + ("" if token else f"#t={cfg.token}")
     web.run_app(host.app(), host="127.0.0.1", port=args.port,
                 print=lambda _: print(f"deid-agent: {url}", flush=True))
 

@@ -18,7 +18,9 @@ token kinds, count, SHA-256 of what crossed — never content). With a record fi
 writes what crossed, in tokens, for checking.
 
 The agent's own credentials pass through untouched; the proxy stores none of them and writes no
-header to the record.
+header to the record. A program that runs the agent for its users can instead give the proxy the
+provider key (``upstream_key``) and the agent a stand-in (``agent_key``): the proxy swaps one for
+the other on the way out, so the agent never holds the key it works with.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +72,12 @@ class ProxyConfig:
     scope_paths: list[tuple[str, str]] = field(default_factory=list)
     #: Refuse a request whose scope comes from neither a header nor a listed folder.
     require_scope: bool = False
+    #: The provider key, held here and never handed to the agent (Anthropic only). The agent is
+    #: given ``agent_key`` instead, and a request goes out with the real key only when it carries
+    #: that stand-in: the agent can neither read the key nor leak it, and another program on the
+    #: machine cannot borrow it through the proxy.
+    upstream_key: str | None = None
+    agent_key: str | None = None
     extra: dict = field(default_factory=dict)
 
 
@@ -164,6 +173,9 @@ class Proxy:
         sink = JsonlAuditSink(config.audit) if config.audit else InMemoryAuditSink()
         self.gateway = PrivacyGateway(audit=sink, redact_fn=_never)
         self.session: ClientSession | None = None
+        #: Called when the provider refuses the held key (401), so the program running the agent
+        #: can tell its person at once: the agent itself retries for minutes before giving up.
+        self.on_key_refused = None
 
     def scope(self, request: web.Request, body: dict) -> str | None:
         """The request's scope: its header, else the listed folder the agent works in, else the
@@ -206,7 +218,30 @@ class Proxy:
     def _headers(self, request: web.Request) -> dict[str, str]:
         out = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}
         out["Accept-Encoding"] = "identity"
+        if self.cfg.upstream_key:
+            lend = self._from_agent(request)
+            out = {k: v for k, v in out.items() if k.lower() not in ("x-api-key", "authorization")}
+            if lend:
+                out["x-api-key"] = self.cfg.upstream_key
         return out
+
+    def _from_agent(self, request: web.Request) -> bool:
+        given = request.headers.get("x-api-key", "").encode()
+        return bool(self.cfg.agent_key) and secrets.compare_digest(given, self.cfg.agent_key.encode())
+
+    def _lend_key(self, request: web.Request) -> web.Response | None:
+        """With a held key: only the agent's stand-in opens it, and only toward Anthropic. A GET
+        or HEAD without the stand-in (the agent's connectivity check) goes out with no key."""
+        if not self._from_agent(request):
+            if request.method in ("GET", "HEAD"):
+                return None
+            log.warning("refused %s %s: not the agent's key", request.method, request.path)
+            return _error(401, "deid proxy: this proxy holds the organization's key and lends it "
+                               "only to its own agent")
+        if request.path.endswith("/responses") or \
+                not self._url(request).startswith(self.cfg.upstream.rstrip("/")):
+            return _error(403, "deid proxy: the organization's key is for Anthropic only")
+        return None
 
     def _openai_base(self, request: web.Request) -> str:
         chatgpt = "chatgpt-account-id" in {k.lower() for k in request.headers}
@@ -226,6 +261,8 @@ class Proxy:
             return web.json_response({"ok": True, "service": "deid-proxy"})
         if request.headers.get("upgrade", "").lower() == "websocket":
             return web.Response(status=426, text="deid proxy: HTTP only")
+        if self.cfg.upstream_key and (refused := self._lend_key(request)) is not None:
+            return refused
         if request.method == "POST" and request.path in ("/v1/messages", "/v1/messages/count_tokens"):
             return await self._messages(request)
         if request.method == "POST" and request.path in ("/v1/responses", "/responses"):
@@ -388,6 +425,10 @@ class Proxy:
 
         url = self.cfg.upstream.rstrip("/") + request.path_qs
         up = await self.session.post(url, data=sent.encode("utf-8"), headers=self._headers(request))
+        if self.cfg.upstream_key and up.status == 401:
+            log.warning("the provider refused the held key")
+            if self.on_key_refused:
+                self.on_key_refused()
         try:
             headers = {k: v for k, v in up.headers.items() if k.lower() not in _BACK_DROP}
             streamed = body.get("stream") is True or \
