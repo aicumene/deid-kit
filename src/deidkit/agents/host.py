@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -46,6 +47,10 @@ log = logging.getLogger("deidkit.agents.host")
 
 _SKIP_DIRS = {".git", ".claude", ".codex", "node_modules", "__pycache__", ".venv"}
 _MAX_FILE = 2 * 1024 * 1024
+#: Set in a settings file's ``env``, these send the agent's requests somewhere other than the
+#: proxy: another endpoint, another provider, or an HTTP proxy that sees them before they are
+#: de-identified.
+_REROUTE = re.compile(r"ANTHROPIC_\w*BASE_URL|CLAUDE_CODE_USE_\w+|HTTPS?_PROXY|ALL_PROXY", re.I)
 
 
 @dataclass
@@ -76,6 +81,28 @@ def snapshot(folder: Path) -> dict[str, str]:
             except OSError:
                 continue
     return out
+
+
+def settings_files(folder: Path) -> list[Path]:
+    """The settings files Claude Code may read for an agent in ``folder``: managed, the person's
+    own, and the project's (the folder's and its parents')."""
+    out = [Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+           Path("/etc/claude-code/managed-settings.json"), Path.home() / ".claude" / "settings.json"]
+    for d in (folder, *folder.parents):
+        out += [d / ".claude" / "settings.json", d / ".claude" / "settings.local.json"]
+    return list(dict.fromkeys(out))
+
+
+def rerouting_settings(folder: Path) -> list[str]:
+    """``"<file>: <VARIABLE>"`` for each setting that would send the agent around the proxy."""
+    found: list[str] = []
+    for path in settings_files(folder):
+        try:
+            env = json.loads(path.read_text(encoding="utf-8")).get("env") or {}
+            found += [f"{path}: {name}" for name in env if _REROUTE.fullmatch(name)]
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+    return found
 
 
 def inside(folder: Path, path: str) -> bool:
@@ -119,6 +146,18 @@ class AgentHost:
 
     # ── the agent ────────────────────────────────────────────────────────────
     async def start_agent(self) -> None:
+        if not self.cfg.api_key:
+            # The local sign-in does not work with a host-managed provider, so settings files keep
+            # their say over where the agent connects: refuse to start if one would reroute it.
+            rerouted = rerouting_settings(self.cfg.folder)
+            if rerouted:
+                self.status = "failed"
+                self.emit({"kind": "error", "text": "The agent was not started: a settings file "
+                                                    "would send its requests around the proxy ("
+                                                    + "; ".join(rerouted) + "). Remove the "
+                                                    "setting, or give the agent the organization's "
+                                                    "key."})
+                return
         extra = {"CLAUDE_CODE_EXECUTABLE": self.cfg.claude_executable} if self.cfg.claude_executable else {}
         env = agent_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
                         api_key=self.cfg.agent_key if self.cfg.api_key else None, extra=extra)

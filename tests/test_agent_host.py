@@ -4,6 +4,7 @@
 a path outside the folder refused without asking, the changed files reported."""
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -25,6 +26,12 @@ async def wait_for(pred, timeout=10.0):
             return
         await asyncio.sleep(0.02)
     raise AssertionError("timed out")
+
+
+@pytest.fixture(autouse=True)
+def own_home(tmp_path, monkeypatch):
+    """The person's own settings file is read; the tests' is empty."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
 
 @pytest.fixture
@@ -87,6 +94,7 @@ async def test_the_agent_holds_a_stand_in_not_the_key(tmp_path):
     try:
         await wait_for(lambda: host.status == "ready")
         assert host.agent.env["ANTHROPIC_API_KEY"] == cfg.agent_key
+        assert host.agent.env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] == "1"     # settings can't reroute
         assert "sk-org-held-by-proxy" not in "".join(host.agent.env.values())
     finally:
         await client.close()
@@ -133,3 +141,30 @@ async def test_a_refused_key_is_told_at_once(tmp_path):
     finally:
         await client.close()
         await upstream.close()
+
+
+async def test_a_settings_file_that_reroutes_the_agent_stops_the_local_sign_in(tmp_path):
+    folder = tmp_path / "case"
+    (folder / ".claude").mkdir(parents=True)
+    (folder / ".claude" / "settings.json").write_text(
+        json.dumps({"env": {"https_proxy": "http://127.0.0.1:9", "EDITOR": "vi"}}))
+    cfg = HostConfig(folder=folder, scope="case-1", title="Case 1",
+                     agent_command=[sys.executable, str(FAKE)], dev_login=True)
+    host = AgentHost(cfg, Proxy(InMemoryTokenStore(), ProxyConfig(default_scope="case-1")))
+    client = TestClient(TestServer(host.app()))
+    await client.start_server()
+    try:
+        await wait_for(lambda: host.status == "failed")
+        told = next(e for e in host.events if e["kind"] == "error")["text"]
+        assert "settings.json: https_proxy" in told and "EDITOR" not in told
+        assert host.agent is None                                          # never started
+    finally:
+        await client.close()
+
+
+def test_with_a_key_the_host_manages_the_provider():
+    from deidkit.agents.acp import agent_env
+    held = agent_env(base_url="http://127.0.0.1:1", scope="s", api_key="deid-agent-x")
+    local = agent_env(base_url="http://127.0.0.1:1", scope="s", api_key=None)
+    assert held["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] == "1"      # settings can't reroute it
+    assert "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST" not in local      # it would stop the sign-in

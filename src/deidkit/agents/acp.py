@@ -178,6 +178,12 @@ def agent_env(*, base_url: str, scope: str, api_key: str | None, extra: dict | N
     })
     if api_key:
         env["ANTHROPIC_API_KEY"] = api_key
+        # A settings file (the person's own, or one in the folder) can set ANTHROPIC_BASE_URL in
+        # its `env` and override this environment, sending the work around the proxy with the
+        # real names in it. With the provider managed by the host, Claude Code drops endpoint,
+        # key and proxy variables from settings files and keeps these. It also stops reading
+        # the local sign-in, so it is set only when the agent is given a key.
+        env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] = "1"
     env.update(extra or {})
     return env
 
