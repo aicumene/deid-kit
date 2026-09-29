@@ -385,13 +385,14 @@ class Proxy:
                         self._record({"dir": "in", "scope": scope, "body": obj})
                         obj["output"] = [await restore_item(i, engine, prep.mapping,
                                                             self.restore.restore_put,
-                                                            self.cfg.openai_local_tools)
+                                                            self.cfg.openai_local_tools,
+                                                            prep.spellings)
                                          for i in obj["output"]]
                         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
                 headers = {k: v for k, v in up.headers.items() if k.lower() not in _BACK_DROP}
                 return web.Response(status=up.status, body=data, headers=headers)
             restorer = ResponsesRestorer(engine, prep.mapping, self.restore.restore_put,
-                                         self.cfg.openai_local_tools)
+                                         self.cfg.openai_local_tools, prep.spellings)
             return await self._relay(request, up, restorer, scope)
         finally:
             up.release()
@@ -444,12 +445,12 @@ class Proxy:
                         self._record({"dir": "in", "scope": scope, "body": obj})
                         obj = await restore_json_response(obj, engine, prep.mapping,
                                                           self.restore.restore_put,
-                                                          self.cfg.local_tools)
+                                                          self.cfg.local_tools, prep.spellings)
                         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
                 return web.Response(status=up.status, body=data, headers=headers)
 
             restorer = StreamRestorer(engine, prep.mapping, self.restore.restore_put,
-                                      self.cfg.local_tools)
+                                      self.cfg.local_tools, prep.spellings)
             return await self._relay(request, up, restorer, scope)
         finally:
             up.release()

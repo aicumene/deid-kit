@@ -22,15 +22,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import re
 from collections import OrderedDict
 
 from deidkit import namefold as nf
 from deidkit import vault
 from deidkit.gateway import Redaction
+from deidkit.proxy.spelling import TOKEN as _TOKEN
+from deidkit.proxy.spelling import respell
 
 _CACHE_SIZE = 50_000
-_TOKEN = re.compile(r"(?<![0-9A-Za-z])[A-Z]+_\d+(?![0-9A-Za-z])")
 
 
 class VaultDidNotSettle(RuntimeError):
@@ -105,7 +105,12 @@ class ScopeEngine:
                 mapping[tok] = row.real_value
         return mapping
 
-    async def detokenize(self, text: str, mapping: dict[str, str]) -> str:
+    async def detokenize(self, text: str, mapping: dict[str, str],
+                         spellings: dict[str, str] | None = None, *, literal: bool = False) -> str:
+        """Tokens back to names. With ``spellings`` (a tool's arguments), a file or folder name
+        seen in the request comes back as it was written (:mod:`deidkit.proxy.spelling`)."""
+        if spellings:
+            text = respell(text, spellings, literal=literal)
         return await vault.detokenize(self.store, self.scope, text, mapping=mapping)
 
     async def residual(self, text: str) -> list[str]:

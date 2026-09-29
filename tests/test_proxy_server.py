@@ -219,3 +219,74 @@ async def test_a_held_key_is_lent_only_to_the_agent(tmp_path):
     finally:
         await client.close()
         await upstream.close()
+
+
+async def test_the_agent_opens_a_file_named_after_a_party(tmp_path):
+    """MEASURED 29.09.2026: a file whose name held the client's short name crossed with a token
+    in it, and the call to read it came back with the canonical name in its place."""
+    received = []
+
+    async def model(request):
+        body = await request.json()
+        received.append(body)
+        folder = re.search(r"/work/([A-Z]+_\d+)", body["system"][0]["text"]).group(1)
+        glued, spaced = body["messages"][2]["content"][0]["content"].splitlines()
+        calls = [("Read", {"file_path": f"/work/{folder}/letters/{glued}"}),
+                 ("Bash", {"command": f'cat "letters/{spaced}" | head -5'})]
+        resp = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await resp.prepare(request)
+        await resp.write(sse("message_start", {"type": "message_start", "message": {
+            "id": "msg_2", "type": "message", "role": "assistant", "content": [],
+            "model": body["model"], "usage": {"input_tokens": 1, "output_tokens": 0}}}))
+        for i, (name, args) in enumerate(calls):
+            raw = json.dumps(args)
+            await resp.write(sse("content_block_start", {"type": "content_block_start", "index": i,
+                                                         "content_block": {"type": "tool_use", "id": f"tu_{i + 1}",
+                                                                           "name": name, "input": {}}}))
+            for part in (raw[:15], raw[15:]):
+                await resp.write(sse("content_block_delta", {"type": "content_block_delta", "index": i,
+                                                             "delta": {"type": "input_json_delta",
+                                                                       "partial_json": part}}))
+            await resp.write(sse("content_block_stop", {"type": "content_block_stop", "index": i}))
+        await resp.write(sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+                                               "usage": {"output_tokens": 9}}))
+        await resp.write(sse("message_stop", {"type": "message_stop"}))
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_post("/v1/messages", model)
+    upstream = TestServer(app)
+    await upstream.start_server()
+    seeds = InMemorySeedSource()
+    seeds.add_entity("case-1", SeedEntity("company", "Harrowgate Freight Ltd"))
+    seeds.add_entity("case-1", SeedEntity("individual", "Ada Brenner", role="Director"))
+    cfg = ProxyConfig(default_scope="case-1", upstream=str(upstream.make_url("")).rstrip("/"),
+                      detector=RegexDetector(), seeds=seeds)
+    client = TestClient(TestServer(Proxy(SQLiteTokenStore(tmp_path / "v.sqlite"), cfg).app()))
+    await client.start_server()
+    body = {"model": "claude-test", "max_tokens": 100, "stream": True,
+            "system": [{"type": "text", "text": "Primary working directory: /work/Brenner\n"
+                                                "Matter: HARROWGATE FREIGHT LTD, claim by Ada Brenner"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Open the reply to Harrowgate."}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "tu_0", "name": "Bash",
+                                                   "input": {"command": "ls letters"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_0", "content":
+                                              "03-Reply-to-Harrowgate-Freight.md\n04 Brenner, Ada - note.md"}]}]}
+    try:
+        resp = await client.post("/v1/messages", json=body)
+        assert resp.status == 200
+        inputs: dict[int, str] = {}
+        async for raw in resp.content:
+            line = raw.decode().strip()
+            if line.startswith("data:"):
+                d = json.loads(line[5:])
+                if d.get("type") == "content_block_delta" and d["delta"].get("type") == "input_json_delta":
+                    inputs[d["index"]] = inputs.get(d["index"], "") + d["delta"]["partial_json"]
+        assert json.loads(inputs[0]) == {"file_path": "/work/Brenner/letters/03-Reply-to-Harrowgate-Freight.md"}
+        assert json.loads(inputs[1]) == {"command": 'cat "letters/04 Brenner, Ada - note.md" | head -5'}
+        assert "Harrowgate" not in json.dumps(received[0]) and "Brenner" not in json.dumps(received[0])
+    finally:
+        await client.close()
+        await upstream.close()

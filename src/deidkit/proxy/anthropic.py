@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 from deidkit import namefold as nf
 from deidkit.proxy.engine import ScopeEngine
+from deidkit.proxy.spelling import spellings as _spellings
 
 #: Tools that act on the user's machine: their arguments get the real values back.
 LOCAL_TOOLS = frozenset({
@@ -74,6 +75,8 @@ class Prepared:
     mapping: dict[str, str]
     withheld: list[str] = field(default_factory=list)
     restored: int = 0
+    #: File and folder names as they were written, for a tool call's arguments.
+    spellings: dict[str, str] = field(default_factory=dict)
 
 
 def _strings(obj, slots: list[_Slot]) -> None:
@@ -191,22 +194,25 @@ async def prepare_request(body: dict, engine: ScopeEngine, *, restore_get: Calla
 
     sent = json.dumps(body, ensure_ascii=False)
     mapping = await engine.mapping_for(reds, sent)
-    return Prepared(body=body, mapping=mapping, withheld=withheld, restored=len(restores))
+    return Prepared(body=body, mapping=mapping, withheld=withheld, restored=len(restores),
+                    spellings=_spellings(texts, reds))
 
 
-async def _detokenize_obj(obj, engine: ScopeEngine, mapping: dict[str, str]):
+async def _detokenize_obj(obj, engine: ScopeEngine, mapping: dict[str, str],
+                          spellings: dict[str, str] | None = None):
     if isinstance(obj, str):
-        return await engine.detokenize(obj, mapping)
+        return await engine.detokenize(obj, mapping, spellings)
     if isinstance(obj, list):
-        return [await _detokenize_obj(v, engine, mapping) for v in obj]
+        return [await _detokenize_obj(v, engine, mapping, spellings) for v in obj]
     if isinstance(obj, dict):
-        return {k: await _detokenize_obj(v, engine, mapping) for k, v in obj.items()}
+        return {k: await _detokenize_obj(v, engine, mapping, spellings) for k, v in obj.items()}
     return obj
 
 
 async def restore_json_response(data: dict, engine: ScopeEngine, mapping: dict[str, str],
                                 restore_put: Callable[[str, str], None],
-                                local_tools: frozenset[str] = LOCAL_TOOLS) -> dict:
+                                local_tools: frozenset[str] = LOCAL_TOOLS,
+                                spellings: dict[str, str] | None = None) -> dict:
     """A non-streamed answer, back in names."""
     for block in data.get("content") or []:
         t = block.get("type")
@@ -216,7 +222,7 @@ async def restore_json_response(data: dict, engine: ScopeEngine, mapping: dict[s
             restore_put(_key("t:", block["text"]), original)
         elif t == "tool_use" and block.get("name") in local_tools:
             original = block.get("input", {})
-            block["input"] = await _detokenize_obj(original, engine, mapping)
+            block["input"] = await _detokenize_obj(original, engine, mapping, spellings)
             restore_put(_key("u:", _canonical(block["input"])), json.dumps(original, ensure_ascii=False))
     return data
 
@@ -236,11 +242,13 @@ class StreamRestorer:
 
     def __init__(self, engine: ScopeEngine, mapping: dict[str, str],
                  restore_put: Callable[[str, str], None],
-                 local_tools: frozenset[str] = LOCAL_TOOLS) -> None:
+                 local_tools: frozenset[str] = LOCAL_TOOLS,
+                 spellings: dict[str, str] | None = None) -> None:
         self.engine = engine
         self.mapping = mapping
         self.restore_put = restore_put
         self.local_tools = local_tools
+        self.spellings = spellings or {}
         self.prefixes = {t.casefold()[:i] for t in mapping for i in range(1, len(t) + 1)}
         self.longest = max((len(t) for t in mapping), default=0)
         self.blocks: dict[int, _Block] = {}
@@ -309,7 +317,8 @@ class StreamRestorer:
                 if original is None:
                     new = raw                    # tokens only: safe, if not useful
                 else:
-                    restored = await _detokenize_obj(original, self.engine, self.mapping)
+                    restored = await _detokenize_obj(original, self.engine, self.mapping,
+                                                     self.spellings)
                     new = json.dumps(restored, ensure_ascii=False)
                     self.restore_put(_key("u:", _canonical(restored)),
                                      json.dumps(original, ensure_ascii=False))

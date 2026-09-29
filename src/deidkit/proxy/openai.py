@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from deidkit import namefold as nf
 from deidkit.proxy.anthropic import Refused, _Slot, _strings
 from deidkit.proxy.engine import ScopeEngine
+from deidkit.proxy.spelling import spellings as _spellings
 
 #: Tools that act on the user's machine: their arguments get the real values back.
 LOCAL_TOOLS = frozenset({"exec_command", "write_stdin", "shell", "local_shell", "apply_patch",
@@ -66,6 +67,8 @@ class PreparedResponses:
     headers: dict[str, str] = field(default_factory=dict)
     withheld: list[str] = field(default_factory=list)
     restored: int = 0
+    #: File and folder names as they were written, for a tool call's arguments.
+    spellings: dict[str, str] = field(default_factory=dict)
 
 
 def _note(part: dict, binary: str, withheld: list[str]) -> dict:
@@ -176,7 +179,8 @@ async def prepare_responses(body: dict, engine: ScopeEngine, *, headers: dict[st
         else:
             raise Refused(f"unknown input item type {t!r}")
 
-    reds = await engine.tokenize_all([s.holder[s.key] for s in slots])
+    texts = [s.holder[s.key] for s in slots]
+    reds = await engine.tokenize_all(texts)
     for slot, red in zip(slots, reds):
         slot.holder[slot.key] = red.text
     for item in body.get("input") or []:
@@ -189,16 +193,16 @@ async def prepare_responses(body: dict, engine: ScopeEngine, *, headers: dict[st
     sent = json.dumps(body, ensure_ascii=False) + json.dumps(headers, ensure_ascii=False)
     mapping = await engine.mapping_for(reds, sent)
     return PreparedResponses(body=body, mapping=mapping, headers=headers, withheld=withheld,
-                             restored=len(restores))
+                             restored=len(restores), spellings=_spellings(texts, reds))
 
 
-async def _detok(obj, engine: ScopeEngine, mapping):
+async def _detok(obj, engine: ScopeEngine, mapping, spellings=None):
     if isinstance(obj, str):
-        return await engine.detokenize(obj, mapping)
+        return await engine.detokenize(obj, mapping, spellings)
     if isinstance(obj, list):
-        return [await _detok(v, engine, mapping) for v in obj]
+        return [await _detok(v, engine, mapping, spellings) for v in obj]
     if isinstance(obj, dict):
-        return {k: await _detok(v, engine, mapping) for k, v in obj.items()}
+        return {k: await _detok(v, engine, mapping, spellings) for k, v in obj.items()}
     return obj
 
 
@@ -216,7 +220,8 @@ def literal_mapping(mapping: dict[str, str]) -> dict[str, str]:
 
 async def restore_item(item: dict, engine: ScopeEngine, mapping: dict[str, str],
                        restore_put: Callable[[str, str], None] | None,
-                       local_tools: frozenset[str] = LOCAL_TOOLS) -> dict:
+                       local_tools: frozenset[str] = LOCAL_TOOLS,
+                       spellings: dict[str, str] | None = None) -> dict:
     """A completed output item, back in names (and remembered as the model wrote it)."""
     item = copy.deepcopy(item)
     t = item.get("type")
@@ -230,9 +235,9 @@ async def restore_item(item: dict, engine: ScopeEngine, mapping: dict[str, str],
     elif t == "function_call" and item.get("name") in local_tools:
         original = item.get("arguments", "")
         try:
-            restored = _compact(await _detok(json.loads(original), engine, mapping))
+            restored = _compact(await _detok(json.loads(original), engine, mapping, spellings))
         except json.JSONDecodeError:
-            restored = await engine.detokenize(original, mapping)
+            restored = await engine.detokenize(original, mapping, spellings)
         item["arguments"] = restored
         if restore_put:
             restore_put(_key("f:", restored), original)
@@ -240,8 +245,9 @@ async def restore_item(item: dict, engine: ScopeEngine, mapping: dict[str, str],
             item.get("name") in local_tools or
             (item.get("name") == CODE_TOOL and script_is_local(item.get("input", ""), local_tools))):
         original = item.get("input", "")
-        values = literal_mapping(mapping) if item.get("name") == CODE_TOOL else mapping
-        item["input"] = await engine.detokenize(original, values)
+        code = item.get("name") == CODE_TOOL
+        values = literal_mapping(mapping) if code else mapping
+        item["input"] = await engine.detokenize(original, values, spellings, literal=code)
         if restore_put:
             restore_put(_key("c:", item["input"]), original)
     return item
@@ -259,11 +265,13 @@ class ResponsesRestorer:
 
     def __init__(self, engine: ScopeEngine, mapping: dict[str, str],
                  restore_put: Callable[[str, str], None],
-                 local_tools: frozenset[str] = LOCAL_TOOLS) -> None:
+                 local_tools: frozenset[str] = LOCAL_TOOLS,
+                 spellings: dict[str, str] | None = None) -> None:
         self.engine = engine
         self.mapping = mapping
         self.restore_put = restore_put
         self.local_tools = local_tools
+        self.spellings = spellings or {}
         self.prefixes = {t.casefold()[:i] for t in mapping for i in range(1, len(t) + 1)}
         self.longest = max((len(t) for t in mapping), default=0)
         self.streams: dict[tuple, _Stream] = {}
@@ -328,8 +336,9 @@ class ResponsesRestorer:
                                 {**delta, "type": delta_type, "delta": rest}))
             if isinstance(data.get(field_name), str) and (
                     t == "response.output_text.done" or s is not None):
-                data = {**data, field_name: await self.engine.detokenize(data[field_name],
-                                                                         self.mapping)}
+                data = {**data, field_name: await self.engine.detokenize(
+                    data[field_name], self.mapping,
+                    self.spellings if field_name == "input" else None)}
             return out + [(name, data)]
         if t == "response.content_part.done":
             part = data.get("part") or {}
@@ -340,13 +349,13 @@ class ResponsesRestorer:
             return [(name, data)]
         if t == "response.output_item.done":
             item = await restore_item(data.get("item") or {}, self.engine, self.mapping,
-                                      self.restore_put, self.local_tools)
+                                      self.restore_put, self.local_tools, self.spellings)
             return [(name, {**data, "item": item})]
         if t == "response.completed" and isinstance(data.get("response"), dict):
             resp = dict(data["response"])
             if isinstance(resp.get("output"), list):
                 resp["output"] = [await restore_item(i, self.engine, self.mapping, None,
-                                                     self.local_tools)
+                                                     self.local_tools, self.spellings)
                                   for i in resp["output"]]
             return [(name, {**data, "response": resp})]
         return [(name, data)]

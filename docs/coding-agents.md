@@ -118,6 +118,12 @@ check has to be a plain substring search.
   tokens replaced with the real values before the agent acts on it. Only the tokens that the
   same request sent are reversed (`vault.detokenize(..., mapping=...)`), so a token the model
   invents stays a token.
+- A token in prose comes back as the document's own spelling if the request used only one,
+  otherwise as the vault's canonical name. In the arguments of a local tool, a file or folder
+  name, a quoted path in a command, or a line copied from a file comes back exactly as it was
+  written: `03-Reply-to-Harrowgate-Freight.md` crosses as `03-Reply-to-ORG_1-Freight.md`, and a
+  call to read it opens the file on disk, not `03-Reply-to-Harrowgate Freight Ltd-Freight.md`
+  (`deidkit.proxy.spelling`).
 - Tokens are derived from a per-scope salt, so a person has the same token in every turn and
   every session. The model sees a consistent conversation, and the provider's prompt cache keeps
   working because the history is re-sent byte for byte.

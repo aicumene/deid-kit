@@ -3,6 +3,7 @@
 """The Responses API path (Codex): what leaves in tokens, what comes back in names."""
 
 import json
+import re
 
 import pytest
 
@@ -249,3 +250,57 @@ async def test_a_code_mode_script_gets_names_only_when_it_stays_on_the_machine()
     remote = {"type": "custom_tool_call", "name": "exec",
               "input": f'text(await tools.mcp__crm__lookup({{q:"{token}"}}));'}
     assert (await restore_item(remote, eng, mapping, None))["input"] == remote["input"]
+
+
+async def test_codex_names_a_file_the_way_it_is_on_disk():
+    """A command that names a file from a listing gets the name as it is on disk, quoted or not."""
+    received = []
+
+    async def backend(request):
+        body = await request.json()
+        received.append(body)
+        folder = re.search(r"/work/([A-Z]+_\d+)", json.dumps(body["input"][1])).group(1)
+        glued, spaced = body["input"][-1]["output"].splitlines()
+        args = json.dumps({"cmd": f'cat "/work/{folder}/letters/{spaced}" letters/{glued}'})
+        item = {"type": "function_call", "id": "f9", "call_id": "c9", "name": "exec_command", "arguments": args}
+        resp = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await resp.prepare(request)
+        for name, data in (ev("response.created", response={"id": "r9"}),
+                           ev("response.output_item.added", output_index=0, item={**item, "arguments": ""}),
+                           ev("response.function_call_arguments.delta", item_id="f9", output_index=0, delta=args),
+                           ev("response.output_item.done", output_index=0, item=item),
+                           ev("response.completed", response={"id": "r9", "output": [item]})):
+            await resp.write(f"event: {name}\ndata: {json.dumps(data)}\n\n".encode())
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_post("/codex/responses", backend)
+    upstream = TestServer(app)
+    await upstream.start_server()
+    cfg = ProxyConfig(default_scope="case-1", upstream_chatgpt=str(upstream.make_url("/codex")),
+                      detector=RegexDetector(), seeds=seeds())
+    client = TestClient(TestServer(Proxy(InMemoryTokenStore(), cfg).app()))
+    await client.start_server()
+    body = request()
+    body["input"] += [
+        {"type": "function_call", "id": "f8", "call_id": "c8", "name": "exec_command",
+         "arguments": json.dumps({"cmd": "ls letters"})},
+        {"type": "function_call_output", "call_id": "c8",
+         "output": "03-Reply-to-Harrowgate-Freight.md\n04 Brenner, Ada - note.md"}]
+    try:
+        r = await client.post("/v1/responses", json=body, headers=HEADERS)
+        assert r.status == 200
+        done = []
+        async for raw in r.content:
+            line = raw.decode().strip()
+            if line.startswith("data:"):
+                d = json.loads(line[5:])
+                if d["type"] == "response.output_item.done":
+                    done.append(json.loads(d["item"]["arguments"])["cmd"])
+        assert done == ['cat "/work/Brenner/letters/04 Brenner, Ada - note.md" '
+                        'letters/03-Reply-to-Harrowgate-Freight.md']
+        assert leaks(received[0]) == []
+    finally:
+        await client.close()
+        await upstream.close()
