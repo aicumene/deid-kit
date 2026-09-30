@@ -937,6 +937,48 @@ def surname_first(surface: str) -> list[str]:
     return out
 
 
+#: A definition: the short name a document gives a party, in brackets and quotes right after the
+#: party is named — ``TOBIAS WREN of … ("TW")``, ``(the "Purchaser")``, ``(hereinafter "KV")``,
+#: ``(nachfolgend „Vermieter“)``.
+_DEFINITION = re.compile(
+    r"\(\s*(?:(?:together|each|jointly|collectively)\s+)?"
+    r"(?:(?:hereinafter|hereafter|henceforth)\s+(?:(?:referred\s+to|called|known)\s+)?(?:as\s+)?)?"
+    r"(?:(?:nachfolgend|im\s+folgenden|im\s+weiteren)\s+(?:(?:kurz|auch)\s+)?)?"
+    r"(?:(?:the|a|an|der|die|das)\s+)?"
+    r"[\"“„«‘']([^\"”“„«»‘’'()\n]{1,40})[\"”“»’']\s*\)",
+    re.IGNORECASE,
+)
+# Words that join the parts of a name and have no initial in its abbreviation ("Bank of Cyprus").
+_JOINERS = frozenset({"of", "and", "the", "und", "von", "van", "der", "den", "de", "du", "la", "le", "y"})
+
+
+def defined_terms(text: str) -> list[tuple[str, int]]:
+    """The short names ``text`` defines, as (term, offset of the opening bracket)."""
+    return [(m.group(1).strip(), m.start()) for m in _DEFINITION.finditer(text or "")
+            if m.group(1).strip()]
+
+
+def defines_alias(term: str, name: str) -> bool:
+    """Whether a defined ``term`` is a short form of ``name``: its initials ("TW" for TOBIAS WREN,
+    "K.V." for KESTREL VENTURES LLP) or words of it ("Kestrel", "Mr Wren").
+
+    Anything else a document defines names a role or an object — "the Company", "the Sale
+    Shares", "the Transfer Notice" — says nothing about who the party is, and stays in clear."""
+    words = [p for p in name_parts(name) if p != "&" and not is_honorific(p)]
+    if not term or not words:
+        return False
+    compact = re.sub(r"[\s.&]", "", term)
+    if compact.isalpha() and compact.isupper() and 2 <= len(compact) <= 6:
+        significant = [w for w in words if key(w) not in _JOINERS and legal_form_index(w) is None]
+        return any(ws and compact == "".join(w[0] for w in ws).upper()
+                   for ws in (significant, words))
+    parts = [p for p in name_parts(term) if not is_honorific(p)]
+    if not parts or all(legal_form_index(p) is not None or key(p) in _JOINERS for p in parts):
+        return False
+    have, want = [key(w) for w in words], [key(p) for p in parts]
+    return any(have[i:i + len(want)] == want for i in range(len(have) - len(want) + 1))
+
+
 def person_fragments(name: str) -> list[tuple[str, str]]:
     """Distinctive single parts of a person name, as (surface, role).
 

@@ -75,6 +75,12 @@ enable_request_compression = false
   addresses, IBANs, payment cards and international phone numbers (`deidkit.patterns`). It runs
   no name recognition, because such a model reads identifiers in code as people. A person whose
   e-mail address appears is enrolled from the address as well.
+- **Short names a document defines.** A party named once and then called by a short form —
+  `TOBIAS WREN of … ("TW")`, `KESTREL VENTURES LLP ("Kestrel")` — has the short form enrolled as
+  its token when the definition is seen, and matched as written, case and all, from then on. Only
+  the party's initials or words of its name count: `(the "Company")` stays in clear.
+  `deid-agent` passes the folder's text documents through the vault before it starts the agent,
+  so a task that already uses the short form is covered too.
 - **Not applied yet.** Street addresses and initials, which the vault can tokenize, are not yet
   applied by the proxy.
 

@@ -47,6 +47,10 @@ log = logging.getLogger("deidkit.agents.host")
 
 _SKIP_DIRS = {".git", ".claude", ".codex", "node_modules", "__pycache__", ".venv"}
 _MAX_FILE = 2 * 1024 * 1024
+#: What :meth:`AgentHost.warm_vault` reads: the folder's text documents, not its binaries.
+_WARM_SUFFIXES = {".md", ".txt", ".csv", ".json", ".html", ".xml", ".eml"}
+_WARM_MAX_BYTES = 512 * 1024
+_WARM_MAX_FILES = 200
 #: Set in a settings file's ``env``, these send the agent's requests somewhere other than the
 #: proxy: another endpoint, another provider, or an HTTP proxy that sees them before they are
 #: de-identified.
@@ -145,7 +149,33 @@ class AgentHost:
                 "files": sorted(now)}
 
     # ── the agent ────────────────────────────────────────────────────────────
+    async def warm_vault(self) -> int:
+        """Pass the folder's text documents through the scope's vault before the first task.
+
+        A document defines the short names it uses for the parties (``TOBIAS WREN … ("TW")``),
+        and the vault learns one when it first sees the definition. The lawyer's own task may use
+        the short name before the agent has read the document — MEASURED 30.09.2026: a task
+        written with a party's short name crossed with it in clear in the task's first request.
+        Nothing leaves the machine here; the documents are only tokenised. Returns how many were
+        read."""
+        texts: list[str] = []
+        for root, dirs, files in os.walk(self.cfg.folder):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            for name in sorted(files):
+                p = Path(root) / name
+                if p.suffix.lower() in _WARM_SUFFIXES and p.stat().st_size <= _WARM_MAX_BYTES:
+                    texts.append(p.read_text("utf-8", errors="replace"))
+                if len(texts) >= _WARM_MAX_FILES:
+                    break
+        if texts:
+            await self.proxy.engine(self.cfg.scope).tokenize_all(texts)
+        return len(texts)
+
     async def start_agent(self) -> None:
+        try:
+            log.info("vault warmed from %d document(s)", await self.warm_vault())
+        except Exception:                            # noqa: BLE001 — the agent still starts
+            log.exception("the vault could not be warmed from the folder's documents")
         if not self.cfg.api_key:
             # The local sign-in does not work with a host-managed provider, so settings files keep
             # their say over where the agent connects: refuse to start if one would reroute it.

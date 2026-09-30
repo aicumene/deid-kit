@@ -172,6 +172,7 @@ class _Index:
         "alias_keys",
         "aliases",
         "by_token",
+        "defined",
         "inverted",
         "keys",
         "legacy_keys",
@@ -210,6 +211,9 @@ class _Index:
                 if len(k) >= _MIN_KEY_LEN and k not in self.keys:
                     self.keys[k] = r.token
                     self.legacy_keys.add(k)
+        # Short names the documents define for a party ("TW"), matched as written, case and all —
+        # never through the fold (see _learn_definitions).
+        self.defined: dict[str, str] = {}
         for a in aliases:
             row = self.by_token.get(a.token)
             # An alias whose TOKEN ROW does not exist mints a token that can be neither
@@ -218,6 +222,9 @@ class _Index:
             # redaction. The old guard's first conjunct was False in exactly that case, which
             # admitted the key. There is no FK behind this, so the guard is the guarantee.
             if row is None or row.status != "active":
+                continue
+            if a.source == "defined":
+                self.defined[a.surface] = a.token
                 continue
             self.keys[a.normalized] = a.token
             self.legacy_keys.discard(a.normalized)
@@ -228,7 +235,8 @@ class _Index:
         # The variants that put a person's surname first ("Brenner, Ada"): matched after the names
         # written given name first, so that a list of such names is not read across (_apply_index).
         self.inverted: set[str] = set()
-        held = [(r.real_value, r.token) for r in rows] + [(a.surface, a.token) for a in aliases]
+        held = [(r.real_value, r.token) for r in rows] + \
+            [(a.surface, a.token) for a in aliases if a.source != "defined"]
         for surface, token in held:
             row = self.by_token.get(token)
             if row is None or row.status != "active" or row.kind not in ("PERSON", "ORG", "ENTITY"):
@@ -458,6 +466,26 @@ def _add_alias(store: TokenStore, idx: _Index, scope_id: ScopeId,
     idx.alias_keys.add(stored)
     idx.keys[k] = token
     idx.legacy_keys.discard(k)
+    return True
+
+
+def _add_defined_alias(store: TokenStore, idx: _Index, scope_id: ScopeId,
+                       surface: str, token: str) -> bool:
+    """Enrol a short name a document defines for a party ("TW"). It is matched as written, case
+    and all (``_Index.defined``), so its row is keyed by the exact form rather than the fold — as
+    a retracted alias is — and no two-letter fold ever becomes a key. A surface that is already a
+    key, or already defined for another party, is left as it is."""
+    surface = surface.strip()
+    if not surface or nf.TOKEN_IN_TEXT.search(surface) or surface in idx.defined \
+            or _normalize(surface) in idx.keys:
+        return False
+    stored = f"={surface}"[:500]
+    if stored in idx.alias_keys:
+        return False
+    row = store.add_alias(scope_id, token=token, surface=surface, normalized=stored, source="defined")
+    idx.aliases.append(row)
+    idx.alias_keys.add(stored)
+    idx.defined[surface] = token
     return True
 
 
@@ -1258,6 +1286,43 @@ def _recall_domains(store: TokenStore, idx: _Index, scope_id: ScopeId,
 # The crossing
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: How far before a definition to look for the party it defines: the line it is on, at most this.
+_DEFINITION_REACH = 240
+
+
+def _learn_definitions(store: TokenStore, idx: _Index, scope_id: ScopeId, text: str) -> bool:
+    """Enrol the short names ``text`` defines for a party it has just named.
+
+    A document names a party once and then uses a short form: ``(2) TOBIAS WREN of the address set
+    out in Schedule 1 ("TW")``, and "TW" from there on. MEASURED 29.09.2026 on a matter agent: the
+    name crossed as a token and its two-letter short form crossed in clear, 40 to 53 times per
+    task — a two-letter surface is no key (``_MIN_KEY_LEN``), and it must not be one: folded, a
+    short name such as "AB" fires on the German "ab".
+
+    So a term in brackets and quotes is enrolled for the party named last before it on the same
+    line — only when it is that party's initials or words of its name (``namefold.defines_alias``)
+    — and matched as written from then on, in every later text of the scope. "the Company" or
+    "the Transfer Notice" says nothing about who the party is and stays in clear."""
+    added = False
+    for term, at in nf.defined_terms(text):
+        if term in idx.defined:
+            continue
+        start = max(text.rfind("\n", 0, at) + 1, at - _DEFINITION_REACH)
+        before, _ = _apply_index(text[start:at], idx.match_keys(), idx)
+        named = [t for t in nf.TOKEN_IN_TEXT.findall(before) if t in idx.by_token]
+        if not named:
+            continue
+        token = idx.canonical(named[-1])
+        row = idx.by_token.get(token)
+        if row is None or row.status != "active" or row.kind not in ("PERSON", "ORG", "ENTITY"):
+            continue
+        names = {row.real_value, *(a.surface for a in idx.aliases
+                                   if a.token == token and a.source != "defined")}
+        if any(nf.defines_alias(term, name) for name in names):
+            added |= _add_defined_alias(store, idx, scope_id, term, token)
+    return added
+
+
 def _apply_index(text: str, keys: dict[str, str],
                  idx: "_Index | None" = None) -> tuple[str, dict[str, list[str]]]:
     """Replace every enrolled surface in ``text`` with its token, in ONE pass.
@@ -1276,7 +1341,8 @@ def _apply_index(text: str, keys: dict[str, str],
     the merge now fires and keeps the MORE SPECIFIC of the two: a shared-fragment token
     ("the surname shared by …") must never swallow the token of the person it is shared with.
     """
-    if not text.strip() or not keys:
+    defined = idx.defined if idx is not None else {}
+    if not text.strip() or not (keys or defined):
         return text, {}
     hay, folded = nf.fold_haystack(text)
     taken = bytearray(len(hay))
@@ -1297,6 +1363,17 @@ def _apply_index(text: str, keys: dict[str, str],
                 continue
             taken[start:end] = b"\x01" * (end - start)
             hits.append((start, end, keys[k]))
+    # Short names the documents define for a party ("TW"), after every name: found through the
+    # fold, kept only where the text has them exactly as defined, so "tw" or "Tw" stay words.
+    for surface in sorted(defined, key=len, reverse=True):
+        for start, end in nf.find_all(hay, _normalize(surface)):
+            if any(taken[start:end]):
+                continue
+            rs, re_ = folded.raw_span(start, end)
+            if text[rs:re_] != surface:
+                continue
+            taken[start:end] = b"\x01" * (end - start)
+            hits.append((start, end, defined[surface]))
     if not hits:
         return text, {}
     def _one_referent(a: str, b: str) -> bool:
@@ -1395,6 +1472,10 @@ async def tokenize(
     # label is an enrolled company. Neither costs anything on text that has no such pair.
     if _recall_identifiers(store, idx, scope_id, text) | \
             _recall_domains(store, idx, scope_id, text):
+        await store.commit()
+        idx = await _index_of(store, scope_id, salt)
+    # The short names this text defines for the parties it names ("TW"), before it is replaced.
+    if _learn_definitions(store, idx, scope_id, text):
         await store.commit()
         idx = await _index_of(store, scope_id, salt)
 
