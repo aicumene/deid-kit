@@ -39,9 +39,11 @@ _DE_NUMBER = r"\d{1,4}(?:\s?[a-zA-Z](?![\wäöüß]))?(?:[-–/]\d{1,4}(?:[a-zA-
 _DE_UNIT = ""
 
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    # "Musterweg 12, 2. OG links", "Seeufer 4", "Hauptstr. 5a"
+    # "Musterweg 12, 2. OG links", "Seeufer 4", "Hauptstr. 5a" — and in a file name, where the
+    # number is joined by a dash or an underscore: "01-Mietvertrag-Musterweg-12-Kuendigung.md"
+    # crossed whole on 30.09.2026 while the same street with a space became a token.
     ("de_street", re.compile(
-        r"(?<![\wÄÖÜäöüß])[A-ZÄÖÜ][\wÄÖÜäöüß\-]*" + _DE_SUFFIX + r"\s+" + _DE_NUMBER + _DE_UNIT,
+        r"(?<![\wÄÖÜäöüß])[A-ZÄÖÜ][\wÄÖÜäöüß\-]*" + _DE_SUFFIX + r"(?:\s+|[-_])" + _DE_NUMBER + _DE_UNIT,
         re.UNICODE)),
     # "Große Bleichen 12", "Am Alten Hafen 3", "An der Alster 72"
     ("de_street_words", re.compile(

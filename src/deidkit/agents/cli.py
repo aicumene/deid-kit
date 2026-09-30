@@ -31,9 +31,25 @@ from deidkit.patterns import RegexDetector
 from deidkit.proxy.cli import seed_files
 from deidkit.proxy.server import Proxy, ProxyConfig
 from deidkit.seedfile import load_scope_paths, load_seed_files
+from deidkit.seeds import SeedEntity
 from deidkit.sqlite_store import SQLiteTokenStore
 
 DEFAULT_AGENT = "npx -y @agentclientprotocol/claude-agent-acp"
+#: Account names that say nothing about who works on the machine.
+_GENERIC_ACCOUNTS = {"user", "users", "admin", "administrator", "root", "home", "guest", "default",
+                     "public", "shared", "owner", "office"}
+
+
+def account_name(home: Path | None = None) -> str | None:
+    """The operating-system account the agent runs under, as its home folder names it — enrolled
+    as a known name of the scope, so absolute paths cross as ``/Users/ACCOUNT_…/…``.
+
+    MEASURED 30.09.2026: in one task of a matter agent the account name crossed 103 times, the
+    home path 61 — the agent's instructions name its working directory and its memory folder, and
+    every absolute path a tool prints begins with them. A generic name ("admin") identifies
+    nobody and is left alone."""
+    name = (home or Path.home()).name
+    return name if len(name) >= 3 and name.casefold() not in _GENERIC_ACCOUNTS else None
 
 
 def read_secrets(stream) -> dict:
@@ -93,8 +109,12 @@ def main(argv: list[str] | None = None) -> None:
         cfg.token = token
     files = seed_files(args.seeds, args.seeds_dir)
     store = SQLiteTokenStore(args.vault)
+    seeds = load_seed_files(files, args.scope)
+    account = account_name()
+    if account:
+        seeds.add_entity(args.scope, SeedEntity("account", account))
     proxy = Proxy(store, ProxyConfig(
-        default_scope=args.scope, seeds=load_seed_files(files, args.scope),
+        default_scope=args.scope, seeds=seeds,
         scope_paths=load_scope_paths(files, args.scope), detector=RegexDetector(),
         record=Path(args.record).expanduser() if args.record else None,
         audit=Path(args.audit).expanduser(),

@@ -81,8 +81,18 @@ enable_request_compression = false
   the party's initials or words of its name count: `(the "Company")` stays in clear.
   `deid-agent` passes the folder's text documents through the vault before it starts the agent,
   so a task that already uses the short form is covered too.
-- **Not applied yet.** Street addresses and initials, which the vault can tokenize, are not yet
-  applied by the proxy.
+- **Street addresses.** The street and house number (also joined by a dash, as in a file name
+  `01-Lease-Musterweg-12.md`), a flat and a postal code cross as `ADDRESS_…`, one token per
+  address in every request; the city and the country stay (`deidkit.address`).
+- **The machine's account.** `deid-agent` enrols the account its home folder is named after, so
+  the working directory and every absolute path cross as `/Users/ACCOUNT_…/…` and come back as
+  on disk. A generic name such as `admin` is left alone.
+- **Other folders.** `deid-agent` refuses, without asking, an action that names a path outside the
+  matter folder — among its locations, or in the command it would run (`~/…`, `../…`,
+  `$HOME/…`, `/tmp/…`). Another matter's names are not in this scope's vault and would cross in
+  clear. Devices such as `/dev/null` and the system's own programs are allowed.
+- **Not applied yet.** Initials of a known person that no document defines, which the vault can
+  tokenize (`deidkit.address.tokenize_initials`), are not yet applied by the proxy.
 
 **Measured on 28 September 2026.** Both agents worked on the same folder of invented names, a
 letter with two people, a company, two e-mail addresses, a phone number and an IBAN. Each agent

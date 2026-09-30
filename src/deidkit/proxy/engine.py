@@ -14,6 +14,10 @@ A request to a model carries the whole conversation, re-sent on every turn. Thre
   enrolment changes the size, and with it every key, which re-tokenises the history once.
 * **One mapping per request.** ``vault.merge_mappings`` over all pieces, plus every token that
   appears in what is sent: de-tokenisation reverses exactly the tokens this request sent.
+* **Street addresses cross as tokens** (:mod:`deidkit.address`): the street and number, the flat and
+  the postal code become ``ADDRESS_…``, derived from the scope's salt, so one address is one token in
+  every request; the city stays. MEASURED 30.09.2026 on a matter agent: every name of a tenancy
+  matter crossed as a token and the tenant's home did not — "Musterweg 12", "22303 Hamburg".
 
 The vault is not safe for concurrent use; the engine serialises all work on a scope.
 """
@@ -21,9 +25,11 @@ The vault is not safe for concurrent use; the engine serialises all work on a sc
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 from collections import OrderedDict
 
+from deidkit import address
 from deidkit import namefold as nf
 from deidkit import vault
 from deidkit.gateway import Redaction
@@ -49,13 +55,44 @@ class ScopeEngine:
         self._cache: OrderedDict[tuple[str, tuple[int, int]], Redaction] = OrderedDict()
         self._lock = asyncio.Lock()
         self._ready = False
+        self._salt: bytes | None = None
+        # Street address (folded) → its token, for the engine's lifetime: the derivation gives an
+        # address the same token anyway; this keeps one address one token if two ever collide.
+        self._addresses: dict[str, str] = {}
 
     async def _prepare(self) -> None:
         if not self._ready:
-            await vault.ensure_salt(self.store, self.scope)
+            self._salt = await vault.ensure_salt(self.store, self.scope)
             await vault.seed_from_scope(self.store, self.scope, self.seeds)
             await self.store.commit()
             self._ready = True
+
+    def _with_addresses(self, red: Redaction) -> Redaction:
+        """``red`` with its street addresses replaced by their tokens, and the surfaces recorded
+        in the order the text has them, so the return leg and the spellings see them as they see
+        a name."""
+        if not self._salt:
+            return red
+        salt = self._salt
+
+        def derive(surface: str, taken: set[str]) -> str:
+            return vault._derive_token(salt, "ADDRESS", surface, taken)
+
+        found = address.tokenize_addresses(red.text, derive=derive,
+                                           taken=set(self._addresses.values()), known=self._addresses)
+        if not found.found:
+            return red
+        surfaces = {t: list(v) for t, v in (red.surfaces or {}).items()}
+        mapping, canonical = dict(red.mapping), dict(red.canonical)
+        for _, surface in found.found:
+            tok = self._addresses[" ".join(surface.split()).casefold()]
+            surfaces.setdefault(tok, []).append(surface)
+            mapping.setdefault(tok, surface)
+            canonical.setdefault(tok, surface)
+        return dataclasses.replace(
+            red, text=found.text, mapping=mapping, surfaces=surfaces, canonical=canonical,
+            entity_types=sorted({*red.entity_types, "ADDRESS"}),
+            redacted_count=red.redacted_count + len(found.found))
 
     async def _version(self) -> tuple[int, int]:
         return (len(await self.store.load_tokens(self.scope)),
@@ -71,6 +108,7 @@ class ScopeEngine:
             return hit
         red = await vault.tokenize(self.store, self.scope, text, detector=self.detector,
                                    language=self.language, seed=False, glossary=self.glossary)
+        red = self._with_addresses(red)
         self._cache[(digest, await self._version())] = red
         while len(self._cache) > _CACHE_SIZE:
             self._cache.popitem(last=False)

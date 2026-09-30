@@ -22,7 +22,8 @@ that starts ``deid-agent`` hands over the token and the key on stdin (``--secret
 processes of the same user, the agent's commands among them, can read a process's environment
 and arguments (``ps -E``), not what came through its stdin.
 
-A permission request that names a path outside the folder is refused without asking.
+A permission request that names a path outside the folder — among its locations, or in the command
+it would run — is refused without asking.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,6 +119,48 @@ def inside(folder: Path, path: str) -> bool:
             os.path.realpath(target) == os.path.realpath(folder)
     except (OSError, ValueError):
         return False
+
+
+#: What a command may name outside the matter folder: devices and the system's own programs.
+_DEVICES = {"/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty"}
+_PROGRAM_DIRS = ("/usr/", "/bin/", "/sbin/", "/opt/homebrew/", "/System/", "/Library/Developer/")
+_REDIRECT = re.compile(r"^\d*[<>]+&?")
+_OPTION_VALUE = re.compile(r"^(?:--?[\w-]+|\w+)=")
+
+
+def outside_paths(command: str, folder: Path) -> list[str]:
+    """The paths a shell command names outside ``folder``.
+
+    A permission request for a command carries no locations, so the check on them never saw one:
+    MEASURED 29.09.2026, a matter agent asked to run ``grep -rni … ~/matters/`` — the
+    other matters and their files of known names — and only the person's "No" stopped it. A word
+    counts as a path when it starts with ``/``, ``~`` or ``$HOME``, or climbs with ``..``, and it
+    (or the folder it would be in) exists on this machine, so a pattern such as ``"/api/v1"`` is
+    not taken for one."""
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        words = command.split()
+    home = os.path.expanduser("~")
+    found: list[str] = []
+    for word in words:
+        for part in re.split(r"[;&|()]+", word):
+            p = _OPTION_VALUE.sub("", _REDIRECT.sub("", part))
+            p = p.replace("${HOME}", home).replace("$HOME", home)
+            if not p or not (p.startswith(("/", "~")) or p == ".." or p.startswith("../")
+                             or "/../" in p):
+                continue
+            target = Path(os.path.expanduser(p))
+            target = target if target.is_absolute() else folder / target
+            probe = target if target.exists() else target.parent
+            if not probe.exists() or str(probe) == os.sep:
+                continue
+            real = os.path.realpath(target)
+            if str(target) in _DEVICES or real in _DEVICES or real.startswith(_PROGRAM_DIRS):
+                continue
+            if not inside(folder, str(target)):
+                found.append(p)
+    return found
 
 
 class AgentHost:
@@ -227,6 +271,12 @@ class AgentHost:
         options = params.get("options") or []
         paths = [loc.get("path", "") for loc in call.get("locations") or [] if loc.get("path")]
         outside = [p for p in paths if not inside(self.cfg.folder, p)]
+        raw = call.get("rawInput") if isinstance(call.get("rawInput"), dict) else {}
+        command = raw.get("command") if isinstance(raw.get("command"), str) else None
+        if command is None and call.get("kind") == "execute":
+            command = call.get("title") or ""
+        if command:
+            outside += outside_paths(command, self.cfg.folder)
         if outside:
             reject = next((o for o in options if o.get("kind", "").startswith("reject")), None)
             self.emit({"kind": "notice", "text": "Refused without asking: the action names a "
