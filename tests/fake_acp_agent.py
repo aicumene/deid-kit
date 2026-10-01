@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026 Alexandra Bernadotte
 """A scripted ACP agent for tests: answers, asks to write a file inside its folder and to touch
-a path outside it, and writes the file when allowed."""
+a path outside it, and writes the file when allowed. It offers two models as a config option and
+names the one it works on in its answer."""
 
 import json
 import os
@@ -9,6 +10,14 @@ import sys
 
 pending = {}
 next_id = 1000
+MODELS = [{"value": "default", "name": "Default", "description": "The agent's own default"},
+          {"value": "fast", "name": "Fast", "description": "Quicker, lighter"}]
+model = "default"
+
+
+def config_options():
+    return [{"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": model, "options": MODELS}]
 
 
 def send(msg):
@@ -47,9 +56,15 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentInfo": {"name": "fake"}}})
     elif method == "session/new":
         cwd = params["cwd"]
-        send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "s1"}})
+        send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "s1", "configOptions": config_options()}})
+    elif method == "session/set_config_option":
+        if params.get("configId") == "model" and params.get("value") in {m["value"] for m in MODELS}:
+            model = params["value"]
+            send({"jsonrpc": "2.0", "id": rid, "result": {"configOptions": config_options()}})
+        else:
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "invalid value"}})
     elif method == "session/prompt":
-        update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Working on it. "}})
+        update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"Working on it ({model}). "}})
         target = os.path.join(cwd, "draft.md")
         update("s1", {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Write draft.md",
                       "kind": "edit", "status": "pending", "locations": [{"path": target}]})

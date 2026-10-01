@@ -55,6 +55,7 @@ class AcpAgent:
         self._reader: asyncio.Task | None = None
         self._stderr: asyncio.Task | None = None
         self.agent_info: dict = {}
+        self.session_setup: dict = {}                # the agent's answer to session/new
 
     async def start(self) -> dict:
         self.proc = await asyncio.create_subprocess_exec(
@@ -73,7 +74,20 @@ class AcpAgent:
 
     async def new_session(self, cwd: str) -> str:
         result = await self.request("session/new", {"cwd": cwd, "mcpServers": []})
+        self.session_setup = result or {}
         return result["sessionId"]
+
+    async def set_config_option(self, session_id: str, config_id: str, value: str) -> list[dict]:
+        """Change one of the session's settings (``session/set_config_option``) — the model among
+        them — and return all of them as the agent now has them."""
+        result = await self.request("session/set_config_option",
+                                    {"sessionId": session_id, "configId": config_id, "value": value})
+        return (result or {}).get("configOptions") or []
+
+    async def set_model(self, session_id: str, model_id: str) -> None:
+        """The older way to pick the model (``session/set_model``), for agents that offer a
+        ``models`` block instead of config options."""
+        await self.request("session/set_model", {"sessionId": session_id, "modelId": model_id})
 
     async def prompt(self, session_id: str, text: str) -> dict:
         return await self.request("session/prompt", {

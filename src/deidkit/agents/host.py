@@ -24,6 +24,10 @@ and arguments (``ps -E``), not what came through its stdin.
 
 A permission request that names a path outside the folder — among its locations, or in the command
 it would run — is refused without asking.
+
+**The model** is the agent's own choice list (:func:`model_choice`): the page shows it and switches
+between tasks, through the agent (``session/set_config_option``). Every model the agent offers goes
+through the same proxy.
 """
 
 from __future__ import annotations
@@ -72,6 +76,36 @@ class HostConfig:
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     #: What the agent sends as its key; the proxy swaps it for ``api_key``, which stays there.
     agent_key: str = field(default_factory=lambda: "deid-agent-" + secrets.token_urlsafe(24))
+
+
+def model_choice(setup: dict) -> dict | None:
+    """The models a session lets the person pick from, in either shape ACP has used: a ``select``
+    config option of the model category (``configOptions``, current), or the older ``models`` block
+    (``availableModels`` + ``currentModelId``, set with ``session/set_model``). ``None`` when the
+    agent offers no choice.
+
+    Returns ``{"via": "config" | "models", "id": <config option id>, "current": <value>,
+    "options": [{"value", "name", "description"}, …]}``; grouped options are flattened."""
+    for option in setup.get("configOptions") or []:
+        if option.get("id") != "model" and option.get("category") != "model":
+            continue
+        if option.get("type", "select") != "select":
+            continue
+        options = []
+        for entry in option.get("options") or []:
+            for item in entry.get("options") if isinstance(entry.get("options"), list) else [entry]:
+                if item.get("value"):
+                    options.append({"value": item["value"], "name": item.get("name") or item["value"],
+                                    "description": item.get("description") or ""})
+        return {"via": "config", "id": option.get("id"), "current": option.get("currentValue"),
+                "options": options}
+    models = setup.get("models") or {}
+    if models.get("availableModels"):
+        return {"via": "models", "id": None, "current": models.get("currentModelId"),
+                "options": [{"value": m["modelId"], "name": m.get("name") or m["modelId"],
+                             "description": m.get("description") or ""}
+                            for m in models["availableModels"] if m.get("modelId")]}
+    return None
 
 
 def snapshot(folder: Path) -> dict[str, str]:
@@ -175,6 +209,7 @@ class AgentHost:
         self.busy = False
         self.baseline = snapshot(cfg.folder)
         self.status = "starting"
+        self.models: dict | None = None
         self.key_refused_told = False
         proxy.on_key_refused = self.key_refused
 
@@ -240,6 +275,9 @@ class AgentHost:
         try:
             info = await self.agent.start()
             self.session_id = await self.agent.new_session(str(self.cfg.folder))
+            self.models = model_choice(self.agent.session_setup)
+            if self.models:
+                self.emit({"kind": "models", **self.models})
             self.status = "ready"
             self.emit({"kind": "status", "status": "ready",
                        "agent": (info.get("agentInfo") or {}).get("name", "agent")})
@@ -265,6 +303,11 @@ class AgentHost:
             self.emit({"kind": "plan", "entries": [
                 {"content": e.get("content", ""), "status": e.get("status", "")}
                 for e in u.get("entries") or []]})
+        elif kind == "config_option_update":
+            choice = model_choice({"configOptions": u.get("configOptions")})
+            if choice and choice != self.models:
+                self.models = choice
+                self.emit({"kind": "models", **choice})
 
     async def on_permission(self, params: dict) -> dict:
         call = params.get("toolCall") or {}
@@ -342,7 +385,8 @@ class AgentHost:
             auth = "organization key" if self.cfg.api_key else "personal sign-in (development)"
             return web.json_response({"title": self.cfg.title, "folder": str(self.cfg.folder),
                                       "scope": self.cfg.scope, "status": self.status,
-                                      "busy": self.busy, "auth": auth, **self.changes()})
+                                      "busy": self.busy, "auth": auth, "models": self.models,
+                                      **self.changes()})
         if name == "events" and request.method == "GET":
             return await self._events(request)
         if name == "prompt" and request.method == "POST":
@@ -362,6 +406,8 @@ class AgentHost:
             fut.set_result({"outcome": "selected", "optionId": option} if option
                            else {"outcome": "cancelled"})
             return web.json_response({"ok": True})
+        if name == "model" and request.method == "POST":
+            return await self._set_model(((await request.json()).get("value") or "").strip())
         if name == "cancel" and request.method == "POST":
             if self.agent and self.session_id:
                 await self.agent.cancel(self.session_id)
@@ -374,6 +420,29 @@ class AgentHost:
             data = target.read_bytes()[:_MAX_FILE]
             return web.json_response({"path": rel, "text": data.decode("utf-8", "replace")})
         return web.json_response({"error": "not found"}, status=404)
+
+    async def _set_model(self, value: str) -> web.Response:
+        """Switch the agent's model between tasks. The agent's own answer is what the page shows:
+        the choice it reports back, not the one asked for."""
+        if not (self.models and self.agent and self.session_id):
+            return web.json_response({"error": "the agent offers no choice of model"}, status=409)
+        if self.busy:
+            return web.json_response({"error": "the agent is working: change the model between "
+                                               "tasks"}, status=409)
+        if value not in {o["value"] for o in self.models["options"]} | {self.models.get("current")}:
+            return web.json_response({"error": "the agent offers no such model"}, status=400)
+        try:
+            if self.models["via"] == "config":
+                options = await self.agent.set_config_option(self.session_id, self.models["id"], value)
+                choice = model_choice({"configOptions": options}) or {**self.models, "current": value}
+            else:
+                await self.agent.set_model(self.session_id, value)
+                choice = {**self.models, "current": value}
+        except Exception as exc:                     # noqa: BLE001 — the agent said no
+            return web.json_response({"error": f"the model was not changed: {exc}"}, status=502)
+        self.models = choice
+        self.emit({"kind": "models", **choice})
+        return web.json_response({"ok": True, "models": choice})
 
     async def _events(self, request: web.Request) -> web.StreamResponse:
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream",
@@ -416,4 +485,4 @@ class AgentHost:
         return app
 
 
-__all__ = ["AgentHost", "HostConfig", "inside", "snapshot"]
+__all__ = ["AgentHost", "HostConfig", "inside", "model_choice", "snapshot"]

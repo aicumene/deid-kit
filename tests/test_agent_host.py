@@ -13,7 +13,7 @@ import pytest
 pytest.importorskip("aiohttp")
 from aiohttp.test_utils import TestClient, TestServer       # noqa: E402
 
-from deidkit.agents.host import AgentHost, HostConfig       # noqa: E402
+from deidkit.agents.host import AgentHost, HostConfig, model_choice  # noqa: E402
 from deidkit.proxy.server import Proxy, ProxyConfig         # noqa: E402
 from deidkit.store import InMemoryTokenStore                # noqa: E402
 
@@ -168,3 +168,58 @@ def test_with_a_key_the_host_manages_the_provider():
     local = agent_env(base_url="http://127.0.0.1:1", scope="s", api_key=None)
     assert held["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"] == "1"      # settings can't reroute it
     assert "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST" not in local      # it would stop the sign-in
+
+
+# ── the model ────────────────────────────────────────────────────────────────────────────────
+
+async def test_the_page_offers_the_agents_models_and_switches_between_tasks(rig):
+    host, client, folder = rig
+    headers = {"x-deid-agent-token": host.cfg.token}
+    state = await (await client.get("/deid-agent/api/state", headers=headers)).json()
+    assert state["models"]["current"] == "default"
+    assert [o["value"] for o in state["models"]["options"]] == ["default", "fast"]
+
+    r = await client.post("/deid-agent/api/model", json={"value": "fast"}, headers=headers)
+    assert r.status == 200 and (await r.json())["models"]["current"] == "fast"
+    assert [e["current"] for e in host.events if e["kind"] == "models"] == ["default", "fast"]
+
+    # the next task runs on it: the agent names the model it works on
+    await client.post("/deid-agent/api/prompt", json={"text": "Draft a reply"}, headers=headers)
+    await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))
+    assert "Working on it (fast)." in "".join(e["text"] for e in host.events if e["kind"] == "message")
+
+    # not in the middle of a task, and not a model the agent does not offer
+    busy = await client.post("/deid-agent/api/model", json={"value": "default"}, headers=headers)
+    assert busy.status == 409
+    ask = next(e for e in host.events if e["kind"] == "permission")
+    await client.post("/deid-agent/api/permission", json={"id": ask["id"], "optionId": "reject"},
+                      headers=headers)
+    await wait_for(lambda: not host.busy)
+    unknown = await client.post("/deid-agent/api/model", json={"value": "huge"}, headers=headers)
+    assert unknown.status == 400 and host.models["current"] == "fast"
+    assert (await client.post("/deid-agent/api/model", json={"value": "default"})).status == 401
+
+
+async def test_a_model_the_agent_changes_itself_reaches_the_page(rig):
+    host, client, folder = rig
+    await host.on_update({"update": {"sessionUpdate": "config_option_update", "configOptions": [
+        {"id": "model", "category": "model", "type": "select", "currentValue": "fast",
+         "options": [{"value": "default", "name": "Default"}, {"value": "fast", "name": "Fast"}]}]}})
+    assert host.models["current"] == "fast" and host.events[-1]["kind"] == "models"
+
+
+def test_the_model_choice_reads_both_shapes_acp_has_used():
+    grouped = {"configOptions": [
+        {"id": "mode", "type": "select", "currentValue": "ask", "options": [{"value": "ask"}]},
+        {"id": "model", "category": "model", "type": "select", "currentValue": "b", "options": [
+            {"value": "a", "name": "A"},
+            {"group": "more", "name": "More", "options": [{"value": "b", "name": "B", "description": "d"}]}]}]}
+    assert model_choice(grouped) == {"via": "config", "id": "model", "current": "b", "options": [
+        {"value": "a", "name": "A", "description": ""}, {"value": "b", "name": "B", "description": "d"}]}
+    older = {"models": {"currentModelId": "x", "availableModels": [{"modelId": "x", "name": "X"},
+                                                                  {"modelId": "y"}]}}
+    assert model_choice(older) == {"via": "models", "id": None, "current": "x", "options": [
+        {"value": "x", "name": "X", "description": ""}, {"value": "y", "name": "y", "description": ""}]}
+    assert model_choice({"configOptions": [{"id": "mode", "type": "select", "options": []}]}) is None
+    assert model_choice({}) is None
+

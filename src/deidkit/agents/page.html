@@ -26,6 +26,9 @@ header h1 { font-size: 16px; margin: 0; font-weight: 600; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--soft); color: var(--muted); white-space: nowrap; }
 .chip.warn { background: var(--warn-bg); color: var(--warn-ink); }
 .chip.ok { color: var(--ok); }
+select#model { font: inherit; font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--soft); color: var(--ink); max-width: 260px; }
+select#model:disabled { opacity: .6; }
+select#model:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .spacer { flex: 1; }
 main { display: grid; grid-template-columns: 250px 1fr; height: calc(100% - 53px); }
 aside { border-right: 1px solid var(--line); background: var(--panel); overflow: auto; padding: 10px 0; }
@@ -69,6 +72,7 @@ textarea { flex: 1; resize: vertical; min-height: 44px; max-height: 200px; font:
   <h1 id="title">Matter agent</h1>
   <span class="chip" id="scope"></span>
   <span class="chip" id="auth"></span>
+  <select id="model" aria-label="Model" title="The model the agent works on — changes between tasks" hidden></select>
   <span class="spacer"></span>
   <span class="chip" id="status">connecting…</span>
 </header>
@@ -95,12 +99,30 @@ const token = new URLSearchParams(location.hash.slice(1)).get("t") || "";
 const api = (name, opts = {}) => fetch("/deid-agent/api/" + name, { ...opts, headers: { "content-type": "application/json", "x-deid-agent-token": token, ...(opts.headers || {}) } });
 const $ = (id) => document.getElementById(id);
 const log = $("log");
-let current = null, changed = new Set(), added = new Set();
+let current = null, changed = new Set(), added = new Set(), models = null, busy = false;
 const tools = new Map();
 
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function scroll() { log.scrollTop = log.scrollHeight; }
-function setBusy(b) { $("send").disabled = b; $("status").textContent = b ? "working…" : "ready"; }
+function setBusy(b) { busy = b; $("send").disabled = b; $("model").disabled = b; $("status").textContent = b ? "working…" : "ready"; }
+function modelName(value) { const o = models && models.options.find(x => x.value === value); return o ? o.name : value; }
+// The models the agent offers; the one it reports as current is selected. Returns the previous one.
+function renderModels(m) {
+  const sel = $("model"), before = models && models.current;
+  if (!m || !m.options || !m.options.length) { sel.hidden = true; models = null; return before; }
+  models = m; sel.textContent = "";
+  const list = m.current && !m.options.some(o => o.value === m.current) ? [...m.options, { value: m.current, name: m.current }] : m.options;
+  for (const o of list) { const opt = el("option", null, o.name); opt.value = o.value; if (o.description) opt.title = o.description; sel.append(opt); }
+  sel.value = m.current || ""; sel.hidden = false; sel.disabled = busy;
+  return before;
+}
+$("model").onchange = async (e) => {
+  const sel = e.target, prev = models && models.current;
+  sel.disabled = true;
+  const r = await api("model", { method: "POST", body: JSON.stringify({ value: sel.value }) });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); log.append(el("div", "error", d.error || "The model was not changed.")); sel.value = prev || ""; scroll(); }
+  sel.disabled = busy;
+};
 
 function renderFiles(state) {
   changed = new Set(state.changed || []); added = new Set(state.added || []);
@@ -163,6 +185,10 @@ function onEvent(ev) {
   else if (ev.kind === "notice") { log.append(el("div", "notice", ev.text)); }
   else if (ev.kind === "error") { log.append(el("div", "error", ev.text)); setBusy(false); }
   else if (ev.kind === "status") { $("status").textContent = ev.status; }
+  else if (ev.kind === "models") {
+    const before = renderModels(ev);
+    if (before && before !== ev.current) log.append(el("div", "files-note", "Model: " + modelName(ev.current) + " — for the next task."));
+  }
   scroll();
 }
 
@@ -173,7 +199,7 @@ async function boot() {
   $("title").textContent = s.title; document.title = s.title;
   $("scope").textContent = "scope " + s.scope;
   $("auth").textContent = s.auth; $("auth").className = "chip" + (s.auth.startsWith("personal") ? " warn" : " ok");
-  $("status").textContent = s.status; renderFiles(s); setBusy(s.busy);
+  $("status").textContent = s.status; renderFiles(s); setBusy(s.busy); renderModels(s.models);
   follow();
 }
 // Events come over fetch, not EventSource: EventSource cannot send a header, and the token must
@@ -186,7 +212,7 @@ async function follow() {
       if (r.status === 401) { $("status").textContent = "not authorised"; $("status").className = "chip warn"; return; }
       if (r.ok && r.body) {
         wait = 500;
-        log.textContent = ""; tools.clear(); current = null;      // the host replays the whole session
+        log.textContent = ""; tools.clear(); current = null; models = null;   // the host replays the whole session
         const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
         let buf = "";
         for (;;) {
