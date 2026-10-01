@@ -34,7 +34,11 @@ from deidkit.seedfile import load_scope_paths, load_seed_files
 from deidkit.seeds import SeedEntity
 from deidkit.sqlite_store import SQLiteTokenStore
 
-DEFAULT_AGENT = "npx -y @agentclientprotocol/claude-agent-acp"
+#: The Claude adapter at a fixed version. Unpinned, `npx -y` fetches each new release at the
+#: agent's start: on 1 October 2026 a new release brought a new Agent SDK with its 216 MB
+#: `claude`, and the agent took two minutes to start — with behaviour nobody had checked.
+#: Raise the version on purpose, after a run against it.
+DEFAULT_AGENT = "npx -y @agentclientprotocol/claude-agent-acp@0.85.0"
 #: Account names that say nothing about who works on the machine.
 _GENERIC_ACCOUNTS = {"user", "users", "admin", "administrator", "root", "home", "guest", "default",
                      "public", "shared", "owner", "office"}
