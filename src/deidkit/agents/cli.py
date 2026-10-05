@@ -83,6 +83,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--agent-command", default=DEFAULT_AGENT, help="the ACP agent to start")
     ap.add_argument("--claude-executable", default=shutil.which("claude"),
                     help="the claude binary the Claude adapter should run")
+    ap.add_argument("--upstream", default="https://api.anthropic.com",
+                    help="where the agent's model requests go: Anthropic, or a server of the "
+                         "organization's own that speaks the Messages API (/v1/messages)")
     ap.add_argument("--api-key-env", default="ANTHROPIC_API_KEY",
                     help="environment variable holding the organization's key")
     ap.add_argument("--secrets-stdin", action="store_true",
@@ -118,7 +121,7 @@ def main(argv: list[str] | None = None) -> None:
     if account:
         seeds.add_entity(args.scope, SeedEntity("account", account))
     proxy = Proxy(store, ProxyConfig(
-        default_scope=args.scope, seeds=seeds,
+        default_scope=args.scope, seeds=seeds, upstream=args.upstream.rstrip("/"),
         scope_paths=load_scope_paths(files, args.scope), detector=RegexDetector(),
         record=Path(args.record).expanduser() if args.record else None,
         audit=Path(args.audit).expanduser(),

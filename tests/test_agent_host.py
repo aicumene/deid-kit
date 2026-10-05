@@ -111,6 +111,30 @@ def test_secrets_come_as_one_json_line():
         read_secrets(io.StringIO("token=t1\n"))
 
 
+def test_model_requests_can_go_to_the_organizations_own_server(tmp_path, monkeypatch):
+    """--upstream reaches the proxy: the agent's requests can go to an open model the organization
+    runs itself, still through the proxy, instead of Anthropic. Without it, Anthropic as before."""
+    from deidkit.agents import cli
+
+    seen = []
+    real_proxy = cli.Proxy
+
+    def capture(store, cfg):
+        seen.append(cfg)
+        return real_proxy(store, cfg)
+
+    monkeypatch.setattr(cli, "Proxy", capture)
+    monkeypatch.setattr(cli.web, "run_app", lambda *a, **k: None)
+    folder = tmp_path / "matter"
+    folder.mkdir()
+    base = ["--folder", str(folder), "--scope", "case-1", "--dev-login",
+            "--vault", str(tmp_path / "vault.sqlite"), "--audit", str(tmp_path / "audit.jsonl")]
+    cli.main(base)
+    cli.main(base + ["--upstream", "http://10.0.0.7:8092/"])
+    assert seen[0].upstream == "https://api.anthropic.com"
+    assert seen[1].upstream == "http://10.0.0.7:8092"
+
+
 async def test_a_refused_key_is_told_at_once(tmp_path):
     from aiohttp import web
 
