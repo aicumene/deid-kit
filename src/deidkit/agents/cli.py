@@ -79,6 +79,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="token store; not the one a running deid-proxy uses")
     ap.add_argument("--audit", default="~/.deid/agent/audit.jsonl")
     ap.add_argument("--record", help="write what crossed (tokens only) to this JSONL file")
+    ap.add_argument("--usage-log", default="~/.deid/agent/usage.jsonl",
+                    help="one JSON line per task: scope, model, seconds, tokens ('' for none)")
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--agent-command", default=DEFAULT_AGENT, help="the ACP agent to start")
     ap.add_argument("--claude-executable", default=shutil.which("claude"),
@@ -111,7 +113,8 @@ def main(argv: list[str] | None = None) -> None:
     cfg = HostConfig(folder=folder, scope=args.scope, title=args.title or folder.name,
                      agent_command=shlex.split(args.agent_command), api_key=api_key,
                      dev_login=args.dev_login, claude_executable=args.claude_executable,
-                     port=args.port)
+                     port=args.port,
+                     usage_log=Path(args.usage_log).expanduser() if args.usage_log else None)
     if token:
         cfg.token = token
     files = seed_files(args.seeds, args.seeds_dir)

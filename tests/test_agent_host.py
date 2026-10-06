@@ -247,3 +247,45 @@ def test_the_model_choice_reads_both_shapes_acp_has_used():
     assert model_choice({"configOptions": [{"id": "mode", "type": "select", "options": []}]}) is None
     assert model_choice({}) is None
 
+
+
+async def test_what_a_task_cost_reaches_the_page_and_the_usage_log(tmp_path):
+    folder = tmp_path / "Client A Ltd"                       # a folder name may be a client's
+    folder.mkdir()
+    usage_log = tmp_path / "logs" / "usage.jsonl"
+    cfg = HostConfig(folder=folder, scope="case-1", title="Case 1",
+                     agent_command=[sys.executable, str(FAKE)], dev_login=True, usage_log=usage_log)
+    host = AgentHost(cfg, Proxy(InMemoryTokenStore(), ProxyConfig(default_scope="case-1")))
+    client = TestClient(TestServer(host.app()))
+    await client.start_server()
+    try:
+        await wait_for(lambda: host.status == "ready")
+        headers = {"x-deid-agent-token": host.cfg.token}
+        await client.post("/deid-agent/api/prompt", json={"text": "Draft"}, headers=headers)
+        await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))
+        ask = next(e for e in host.events if e["kind"] == "permission")    # the path outside: refused unasked
+        await client.post("/deid-agent/api/permission", json={"id": ask["id"], "optionId": "allow"},
+                          headers=headers)
+        await wait_for(lambda: any(e["kind"] == "turn_end" for e in host.events))
+        state = await (await client.get("/deid-agent/api/state", headers=headers)).json()
+    finally:
+        await client.close()
+    window = next(e for e in host.events if e["kind"] == "usage")
+    assert (window["used"], window["size"]) == (14200, 32768) and state["context"] == {"used": 14200, "size": 32768}
+    end = next(e for e in host.events if e["kind"] == "turn_end")
+    assert end["usage"] == {"inputTokens": 3000, "cachedReadTokens": 11000, "cachedWriteTokens": 0,
+                            "outputTokens": 420, "totalTokens": 14420}      # counts only
+    assert isinstance(end["seconds"], float)
+    assert state["usage"] == {"tasks": 1, **end["usage"]}
+    line = json.loads(usage_log.read_text())
+    assert (line["scope"], line["model"], line["stopReason"], line["usage"]) == \
+        ("case-1", "default", "end_turn", end["usage"])
+    assert "Client A" not in usage_log.read_text() and oct(usage_log.stat().st_mode & 0o777) == "0o600"
+
+
+def test_turn_usage_reads_both_places_agents_put_it():
+    from deidkit.agents.host import turn_usage
+    assert turn_usage({"stopReason": "end_turn"}) == {}
+    assert turn_usage({"usage": {"inputTokens": 5, "outputTokens": True, "totalTokens": -1}}) == {"inputTokens": 5}
+    assert turn_usage({"_meta": {"usage": {"outputTokens": 7}}}) == {"outputTokens": 7}
+    assert turn_usage({"usage": "lots"}) == {}

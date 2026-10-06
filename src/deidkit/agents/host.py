@@ -28,6 +28,14 @@ it would run — is refused without asking.
 **The model** is the agent's own choice list (:func:`model_choice`): the page shows it and switches
 between tasks, through the agent (``session/set_config_option``). Every model the agent offers goes
 through the same proxy.
+
+**What a task cost** is taken as ACP carries it: the agent's ``usage_update`` (the tokens now in its
+window, and the window's size) is shown as it comes, and the turn's tokens on the answer to
+``session/prompt`` (``usage``, ACP's End-Turn Token Usage draft; ``_meta.usage`` too) are shown
+when the task ends, with the seconds the host measured. Each task adds one line to the usage log
+(``usage_log``): when, the scope, the model, how it ended, the seconds and the tokens — what a firm
+can bill a matter against. The line names the scope, never the folder, whose name may be a
+client's.
 """
 
 from __future__ import annotations
@@ -76,6 +84,34 @@ class HostConfig:
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     #: What the agent sends as its key; the proxy swaps it for ``api_key``, which stays there.
     agent_key: str = field(default_factory=lambda: "deid-agent-" + secrets.token_urlsafe(24))
+    #: One JSON line per task: what it cost (:func:`turn_usage`). None: kept nowhere.
+    usage_log: Path | None = None
+
+
+#: The token counts of ACP's draft ``PromptResponse.usage``; anything else in it is left out.
+USAGE_FIELDS = ("inputTokens", "cachedReadTokens", "cachedWriteTokens", "outputTokens",
+                "thoughtTokens", "totalTokens")
+
+
+def turn_usage(result: dict) -> dict:
+    """The token counts of a finished turn, as the agent gave them on its answer to
+    ``session/prompt``: ``usage`` (ACP's End-Turn Token Usage draft), or ``_meta.usage`` where an
+    agent puts it while the draft is one. Counts only; {} when there are none."""
+    result = result if isinstance(result, dict) else {}
+    meta = result.get("_meta") if isinstance(result.get("_meta"), dict) else {}
+    given = result.get("usage") if isinstance(result.get("usage"), dict) else meta.get("usage")
+    if not isinstance(given, dict):
+        return {}
+    return {k: given[k] for k in USAGE_FIELDS
+            if isinstance(given.get(k), int) and not isinstance(given.get(k), bool) and given[k] >= 0}
+
+
+def _append_line(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Created owner-only from the first byte, not narrowed afterwards: no moment when it is not.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 def model_choice(setup: dict) -> dict | None:
@@ -211,6 +247,8 @@ class AgentHost:
         self.status = "starting"
         self.models: dict | None = None
         self.key_refused_told = False
+        self.context: dict | None = None             # the agent's last usage_update
+        self.usage: dict = {"tasks": 0}              # the session's tokens, summed per field
         proxy.on_key_refused = self.key_refused
 
     # ── events ───────────────────────────────────────────────────────────────
@@ -303,6 +341,14 @@ class AgentHost:
             self.emit({"kind": "plan", "entries": [
                 {"content": e.get("content", ""), "status": e.get("status", "")}
                 for e in u.get("entries") or []]})
+        elif kind == "usage_update":
+            used, size = u.get("used"), u.get("size")
+            if isinstance(used, int) and isinstance(size, int):
+                self.context = {"used": used, "size": size}
+                cost = u.get("cost")
+                if isinstance(cost, dict) and "amount" in cost and "currency" in cost:
+                    self.context["cost"] = {"amount": cost["amount"], "currency": cost["currency"]}
+                self.emit({"kind": "usage", **self.context})
         elif kind == "config_option_update":
             choice = model_choice({"configOptions": u.get("configOptions")})
             if choice and choice != self.models:
@@ -358,14 +404,34 @@ class AgentHost:
         self.busy = True
         self.key_refused_told = False
         self.emit({"kind": "user", "text": text})
+        started = time.monotonic()
         try:
             result = await self.agent.prompt(self.session_id, text)
-            self.emit({"kind": "turn_end", "stopReason": result.get("stopReason")})
+            usage = turn_usage(result)
+            seconds = round(time.monotonic() - started, 1)
+            self.emit({"kind": "turn_end", "stopReason": result.get("stopReason"),
+                       "usage": usage, "seconds": seconds})
+            self.count(result.get("stopReason"), usage, seconds)
         except Exception as exc:                     # noqa: BLE001
             self.emit({"kind": "error", "text": f"The turn failed: {exc}"})
         finally:
             self.busy = False
             self.emit({"kind": "files", **self.changes()})
+
+    def count(self, stop_reason, usage: dict, seconds: float) -> None:
+        """Add a finished task to the session's totals and to the usage log."""
+        self.usage["tasks"] += 1
+        for k, v in usage.items():
+            self.usage[k] = self.usage.get(k, 0) + v
+        if self.cfg.usage_log is None:
+            return
+        line = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "scope": self.cfg.scope,
+                "model": (self.models or {}).get("current"), "stopReason": stop_reason,
+                "seconds": seconds, "usage": usage}
+        try:
+            _append_line(self.cfg.usage_log, line)
+        except OSError:
+            log.exception("the usage log could not be written")
 
     # ── HTTP ─────────────────────────────────────────────────────────────────
     def _authorised(self, request: web.Request) -> bool:
@@ -386,6 +452,7 @@ class AgentHost:
             return web.json_response({"title": self.cfg.title, "folder": str(self.cfg.folder),
                                       "scope": self.cfg.scope, "status": self.status,
                                       "busy": self.busy, "auth": auth, "models": self.models,
+                                      "usage": self.usage, "context": self.context,
                                       **self.changes()})
         if name == "events" and request.method == "GET":
             return await self._events(request)
@@ -485,4 +552,4 @@ class AgentHost:
         return app
 
 
-__all__ = ["AgentHost", "HostConfig", "inside", "model_choice", "snapshot"]
+__all__ = ["AgentHost", "HostConfig", "inside", "model_choice", "snapshot", "turn_usage"]

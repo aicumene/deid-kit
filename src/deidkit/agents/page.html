@@ -74,6 +74,7 @@ textarea { flex: 1; resize: vertical; min-height: 44px; max-height: 200px; font:
   <span class="chip" id="auth"></span>
   <select id="model" aria-label="Model" title="The model the agent works on — changes between tasks" hidden></select>
   <span class="spacer"></span>
+  <span class="chip" id="context" title="Tokens in the agent's window now, and the window's size" hidden></span>
   <span class="chip" id="status">connecting…</span>
 </header>
 <main>
@@ -105,6 +106,25 @@ const tools = new Map();
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function scroll() { log.scrollTop = log.scrollHeight; }
 function setBusy(b) { busy = b; $("send").disabled = b; $("model").disabled = b; $("status").textContent = b ? "working…" : "ready"; }
+function k(n) { return n >= 1000 ? (n / 1000).toFixed(1) + "K" : String(n); }
+// What the agent's window holds now (ACP usage_update).
+function renderContext(c) {
+  const chip = $("context");
+  if (!c || !c.size) { chip.hidden = true; return; }
+  chip.textContent = `window ${k(c.used)} / ${k(c.size)}`; chip.hidden = false;
+  chip.className = "chip" + (c.used > 0.8 * c.size ? " warn" : "");
+}
+// What a finished task cost: the agent's token counts (ACP's draft turn usage) and the time.
+function costLine(ev) {
+  const u = ev.usage || {}, read = (u.inputTokens || 0) + (u.cachedReadTokens || 0) + (u.cachedWriteTokens || 0);
+  const parts = [];
+  if (Object.keys(u).length) {
+    parts.push(`${k(read)} tokens read` + (u.cachedReadTokens ? ` (${k(u.cachedReadTokens)} from the cache)` : ""));
+    if (u.outputTokens != null) parts.push(`${k(u.outputTokens)} written`);
+  }
+  if (ev.seconds != null) parts.push(`${ev.seconds} s`);
+  return parts.length ? "This task: " + parts.join(" · ") : null;
+}
 function modelName(value) { const o = models && models.options.find(x => x.value === value); return o ? o.name : value; }
 // The models the agent offers; the one it reports as current is selected. Returns the previous one.
 function renderModels(m) {
@@ -176,7 +196,8 @@ function onEvent(ev) {
   else if (ev.kind === "permission_done") {
     const card = $("perm-" + ev.id); if (card) { card.querySelectorAll("button").forEach(x => x.disabled = true); card.append(el("div", "done", "answered")); }
   }
-  else if (ev.kind === "turn_end") { setBusy(false); }
+  else if (ev.kind === "turn_end") { setBusy(false); const line = costLine(ev); if (line) log.append(el("div", "files-note", line)); }
+  else if (ev.kind === "usage") { renderContext(ev); }
   else if (ev.kind === "files") {
     renderFiles(ev);
     const n = (ev.changed || []).length + (ev.added || []).length;
@@ -199,7 +220,7 @@ async function boot() {
   $("title").textContent = s.title; document.title = s.title;
   $("scope").textContent = "scope " + s.scope;
   $("auth").textContent = s.auth; $("auth").className = "chip" + (s.auth.startsWith("personal") ? " warn" : " ok");
-  $("status").textContent = s.status; renderFiles(s); setBusy(s.busy); renderModels(s.models);
+  $("status").textContent = s.status; renderFiles(s); setBusy(s.busy); renderModels(s.models); renderContext(s.context);
   follow();
 }
 // Events come over fetch, not EventSource: EventSource cannot send a header, and the token must

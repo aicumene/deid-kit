@@ -2,7 +2,8 @@
 # Copyright 2026 Alexandra Bernadotte
 """A scripted ACP agent for tests: answers, asks to write a file inside its folder and to touch
 a path outside it, and writes the file when allowed. It offers two models as a config option and
-names the one it works on in its answer."""
+names the one it works on in its answer. It reports its window (usage_update) and what the turn
+cost (usage on its answer), as ACP has them."""
 
 import json
 import os
@@ -76,6 +77,9 @@ for line in sys.stdin:
         second = permission("s1", "t2", "Edit a system file", "/etc/hosts")
         update("s1", {"sessionUpdate": "agent_message_chunk",
                       "content": {"type": "text", "text": f"first: {first}; second: {second}."}})
-        send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        update("s1", {"sessionUpdate": "usage_update", "used": 14200, "size": 32768})
+        send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn", "usage": {
+            "inputTokens": 3000, "cachedReadTokens": 11000, "cachedWriteTokens": 0,
+            "outputTokens": 420, "totalTokens": 14420, "costCents": "n/a"}}})
     elif rid is not None:
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "not supported"}})

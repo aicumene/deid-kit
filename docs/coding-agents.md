@@ -91,6 +91,14 @@ enable_request_compression = false
   matter folder — among its locations, or in the command it would run (`~/…`, `../…`,
   `$HOME/…`, `/tmp/…`). Another matter's names are not in this scope's vault and would cross in
   clear. Devices such as `/dev/null` and the system's own programs are allowed.
+- **What a task cost.** `deid-agent` shows the agent's window as the agent reports it (ACP's
+  `usage_update`: tokens in the window now, and its size) and, when a task ends, its tokens as the
+  agent gives them on the answer to the task (ACP's draft `usage`: read, from the cache, written)
+  with the seconds it took. Each task adds a line to `~/.deid/agent/usage.jsonl` (`--usage-log`,
+  `''` for none): when, the scope, the model, how it ended, the seconds and the tokens — what a
+  matter can be billed against. The line names the scope, never the folder, whose name may be a
+  client's; the file is readable by its owner only. An agent that reports nothing gets the
+  seconds alone.
 - **Not applied yet.** Initials of a known person that no document defines, which the vault can
   tokenize (`deidkit.address.tokenize_initials`), are not yet applied by the proxy.
 
