@@ -115,6 +115,8 @@ def main(argv: list[str] | None = None) -> None:
                          "(Messages API), with no key")
     ap.add_argument("--agent-unavailable", action="append", default=[], metavar="NAME=REASON",
                     help="the page lists that agent but cannot start it on this machine, and says why")
+    ap.add_argument("--style", metavar="CSS",
+                    help="a stylesheet the page loads after its own: the look of the program that opens it")
     ap.add_argument("--claude-executable", default=shutil.which("claude"),
                     help="the claude binary the Claude adapter should run")
     ap.add_argument("--upstream", default="https://api.anthropic.com",
@@ -147,7 +149,8 @@ def main(argv: list[str] | None = None) -> None:
                      dev_login=args.dev_login, claude_executable=args.claude_executable,
                      port=args.port,
                      usage_log=Path(args.usage_log).expanduser() if args.usage_log else None,
-                     agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable))
+                     agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable),
+                     style=Path(args.style).expanduser() if args.style else None)
     if cfg.agents and all(a.unavailable for a in cfg.agents):
         sys.exit("deid-agent: no agent can start here: "
                  + "; ".join(f"{a.name}: {a.unavailable}" for a in cfg.agents))

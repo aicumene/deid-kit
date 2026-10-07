@@ -102,6 +102,9 @@ class HostConfig:
     #: The agents the page switches between, the first that can start working first. Empty: the
     #: one ``agent_command`` starts, and the page offers no choice.
     agents: list[AgentChoice] = field(default_factory=list)
+    #: A stylesheet the page loads after its own (``--style``): the look of the program that opens
+    #: the page, which can then match its own windows. Not a secret, so served without the token.
+    style: Path | None = None
 
 
 #: The token counts of ACP's draft ``PromptResponse.usage``; anything else in it is left out.
@@ -486,8 +489,19 @@ class AgentHost:
 
     async def page(self, request: web.Request) -> web.Response:
         html = (Path(__file__).parent / "page.html").read_text(encoding="utf-8")
+        if self.cfg.style:
+            html = html.replace("</head>", '<link rel="stylesheet" href="/deid-agent/style.css">\n</head>', 1)
         return web.Response(text=html, content_type="text/html",
                             headers={"Cache-Control": "no-store"})
+
+    async def stylesheet(self, request: web.Request) -> web.Response:
+        if not self.cfg.style:
+            return web.json_response({"error": "not found"}, status=404)
+        try:
+            css = self.cfg.style.read_text(encoding="utf-8")
+        except OSError:
+            return web.json_response({"error": "not found"}, status=404)
+        return web.Response(text=css, content_type="text/css", headers={"Cache-Control": "no-store"})
 
     async def api(self, request: web.Request) -> web.StreamResponse:
         if not self._authorised(request):
@@ -610,6 +624,7 @@ class AgentHost:
     def app(self) -> web.Application:
         app = web.Application(client_max_size=64 * 1024 * 1024)
         app.router.add_get("/", self.page)
+        app.router.add_get("/deid-agent/style.css", self.stylesheet)
         app.router.add_route("*", "/deid-agent/api/{name}", self.api)
         app.router.add_route("*", "/{tail:.*}", self.proxy.handle)      # the agent's endpoint
 

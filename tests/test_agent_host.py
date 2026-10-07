@@ -419,3 +419,25 @@ def test_the_agents_come_from_the_command_line_in_their_order(tmp_path, monkeypa
         cli.main(base + ["--agent-upstream", "Nobody=http://x"])
     with pytest.raises(SystemExit):                                    # nothing here could start
         cli.main(base + ["--agent-unavailable", "Claude Code=not here"])
+
+
+async def test_the_page_takes_the_look_of_the_program_that_opens_it(tmp_path):
+    css = tmp_path / "look.css"
+    css.write_text(":root { --accent: #8a6a3c; }\n")
+    folder = tmp_path / "matter"
+    folder.mkdir()
+    plain = HostConfig(folder=folder, scope="case-1", title="Case 1",
+                       agent_command=[sys.executable, str(FAKE)], dev_login=True)
+    styled = HostConfig(folder=folder, scope="case-1", title="Case 1",
+                        agent_command=[sys.executable, str(FAKE)], dev_login=True, style=css)
+    for cfg, linked in ((plain, False), (styled, True)):
+        host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+        try:
+            page = await (await client.get("/")).text()
+            assert ('href="/deid-agent/style.css"' in page) is linked
+            sheet = await client.get("/deid-agent/style.css")             # no token: it is not a secret
+            assert sheet.status == (200 if linked else 404)
+            if linked:
+                assert sheet.content_type == "text/css" and "--accent: #8a6a3c" in await sheet.text()
+        finally:
+            await client.close()
