@@ -26,9 +26,9 @@ header h1 { font-size: 16px; margin: 0; font-weight: 600; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--soft); color: var(--muted); white-space: nowrap; }
 .chip.warn { background: var(--warn-bg); color: var(--warn-ink); }
 .chip.ok { color: var(--ok); }
-select#model { font: inherit; font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--soft); color: var(--ink); max-width: 260px; }
-select#model:disabled { opacity: .6; }
-select#model:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+select#agent, select#model { font: inherit; font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--soft); color: var(--ink); max-width: 260px; }
+select#agent:disabled, select#model:disabled { opacity: .6; }
+select#agent:focus-visible, select#model:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .spacer { flex: 1; }
 main { display: grid; grid-template-columns: 250px 1fr; height: calc(100% - 53px); }
 aside { border-right: 1px solid var(--line); background: var(--panel); overflow: auto; padding: 10px 0; }
@@ -72,6 +72,7 @@ textarea { flex: 1; resize: vertical; min-height: 44px; max-height: 200px; font:
   <h1 id="title">Matter agent</h1>
   <span class="chip" id="scope"></span>
   <span class="chip" id="auth"></span>
+  <select id="agent" aria-label="Agent" title="Who does the work — changes between tasks" hidden></select>
   <select id="model" aria-label="Model" title="The model the agent works on — changes between tasks" hidden></select>
   <span class="spacer"></span>
   <span class="chip" id="context" title="Tokens in the agent's window now, and the window's size" hidden></span>
@@ -100,12 +101,12 @@ const token = new URLSearchParams(location.hash.slice(1)).get("t") || "";
 const api = (name, opts = {}) => fetch("/deid-agent/api/" + name, { ...opts, headers: { "content-type": "application/json", "x-deid-agent-token": token, ...(opts.headers || {}) } });
 const $ = (id) => document.getElementById(id);
 const log = $("log");
-let current = null, changed = new Set(), added = new Set(), models = null, busy = false;
+let current = null, changed = new Set(), added = new Set(), models = null, agents = null, busy = false;
 const tools = new Map();
 
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function scroll() { log.scrollTop = log.scrollHeight; }
-function setBusy(b) { busy = b; $("send").disabled = b; $("model").disabled = b; $("status").textContent = b ? "working…" : "ready"; }
+function setBusy(b) { busy = b; $("send").disabled = b; $("model").disabled = b; $("agent").disabled = b; $("status").textContent = b ? "working…" : "ready"; }
 function k(n) { return n >= 1000 ? (n / 1000).toFixed(1) + "K" : String(n); }
 // What the agent's window holds now (ACP usage_update).
 function renderContext(c) {
@@ -136,6 +137,29 @@ function renderModels(m) {
   sel.value = m.current || ""; sel.hidden = false; sel.disabled = busy;
   return before;
 }
+// The agents the page can switch between; one that cannot start here is listed, not offered, and
+// says why. Returns the previous one.
+function renderAgents(a) {
+  const sel = $("agent"), before = agents && agents.current;
+  if (!a || !a.options || a.options.length < 2) { sel.hidden = true; agents = null; return before; }
+  agents = a; sel.textContent = "";
+  const why = [];
+  for (const o of a.options) {
+    const opt = el("option", null, o.unavailable ? o.name + " (unavailable)" : o.name); opt.value = o.value;
+    if (o.unavailable) { opt.disabled = true; opt.title = o.unavailable; why.push(o.name + ": " + o.unavailable); }
+    sel.append(opt);
+  }
+  sel.title = ["Who does the work — changes between tasks", ...why].join("\n");
+  sel.value = a.current || ""; sel.hidden = false; sel.disabled = busy;
+  return before;
+}
+$("agent").onchange = async (e) => {
+  const sel = e.target, prev = agents && agents.current;
+  sel.disabled = true;
+  const r = await api("agent", { method: "POST", body: JSON.stringify({ value: sel.value }) });
+  if (!r.ok) { const d = await r.json().catch(() => ({})); log.append(el("div", "error", d.error || "The agent was not changed.")); sel.value = prev || ""; scroll(); }
+  sel.disabled = busy;
+};
 $("model").onchange = async (e) => {
   const sel = e.target, prev = models && models.current;
   sel.disabled = true;
@@ -208,7 +232,11 @@ function onEvent(ev) {
   else if (ev.kind === "status") { $("status").textContent = ev.status; }
   else if (ev.kind === "models") {
     const before = renderModels(ev);
-    if (before && before !== ev.current) log.append(el("div", "files-note", "Model: " + modelName(ev.current) + " — for the next task."));
+    if (before && before !== ev.current && ev.current) log.append(el("div", "files-note", "Model: " + modelName(ev.current) + " — for the next task."));
+  }
+  else if (ev.kind === "agents") {
+    const before = renderAgents(ev);
+    if (before && before !== ev.current) log.append(el("div", "files-note", "Agent: " + ev.current + " — for the next task. It starts a new session and does not see the earlier tasks."));
   }
   scroll();
 }
@@ -220,7 +248,7 @@ async function boot() {
   $("title").textContent = s.title; document.title = s.title;
   $("scope").textContent = "scope " + s.scope;
   $("auth").textContent = s.auth; $("auth").className = "chip" + (s.auth.startsWith("personal") ? " warn" : " ok");
-  $("status").textContent = s.status; renderFiles(s); setBusy(s.busy); renderModels(s.models); renderContext(s.context);
+  $("status").textContent = s.status; renderFiles(s); setBusy(s.busy); renderAgents(s.agents); renderModels(s.models); renderContext(s.context);
   follow();
 }
 // Events come over fetch, not EventSource: EventSource cannot send a header, and the token must
@@ -233,7 +261,7 @@ async function follow() {
       if (r.status === 401) { $("status").textContent = "not authorised"; $("status").className = "chip warn"; return; }
       if (r.ok && r.body) {
         wait = 500;
-        log.textContent = ""; tools.clear(); current = null; models = null;   // the host replays the whole session
+        log.textContent = ""; tools.clear(); current = null; models = null; agents = null;   // the host replays the whole session
         const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
         let buf = "";
         for (;;) {

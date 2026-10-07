@@ -26,7 +26,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from deidkit.agents.host import AgentHost, HostConfig
+from deidkit.agents.host import AgentChoice, AgentHost, HostConfig
 from deidkit.patterns import RegexDetector
 from deidkit.proxy.cli import seed_files
 from deidkit.proxy.server import Proxy, ProxyConfig
@@ -68,6 +68,30 @@ def read_secrets(stream) -> dict:
     return given
 
 
+def agent_choices(agents: list[str], upstreams: list[str], unavailable: list[str]) -> list[AgentChoice]:
+    """The agents of ``--agent NAME=COMMAND``, in their order, with ``--agent-upstream NAME=URL`` and
+    ``--agent-unavailable NAME=REASON``; a name only in the last is listed after them."""
+    def pairs(specs: list[str], option: str) -> list[tuple[str, str]]:
+        out = []
+        for spec in specs:
+            name, sep, value = spec.partition("=")
+            if not sep or not name.strip() or not value.strip():
+                sys.exit(f"deid-agent: {option} expects NAME=VALUE, not {spec!r}")
+            out.append((name.strip(), value.strip()))
+        return out
+
+    choices: dict[str, AgentChoice] = {}
+    for name, command in pairs(agents, "--agent"):
+        choices[name] = AgentChoice(name=name, command=shlex.split(command))
+    for name, url in pairs(upstreams, "--agent-upstream"):
+        if name not in choices:
+            sys.exit(f"deid-agent: --agent-upstream names no agent: {name}")
+        choices[name].upstream = url.rstrip("/")
+    for name, reason in pairs(unavailable, "--agent-unavailable"):
+        choices.setdefault(name, AgentChoice(name=name)).unavailable = reason
+    return list(choices.values())
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="deid-agent", description=__doc__.split("\n\n")[0])
     ap.add_argument("--folder", required=True, help="the folder the agent works in")
@@ -83,6 +107,14 @@ def main(argv: list[str] | None = None) -> None:
                     help="one JSON line per task: scope, model, seconds, tokens ('' for none)")
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--agent-command", default=DEFAULT_AGENT, help="the ACP agent to start")
+    ap.add_argument("--agent", action="append", default=[], metavar="NAME=COMMAND",
+                    help="an agent the page switches to, between tasks (repeat for each; the first "
+                         "that can start works first); instead of --agent-command")
+    ap.add_argument("--agent-upstream", action="append", default=[], metavar="NAME=URL",
+                    help="that agent's model requests go to this server of the organization's own "
+                         "(Messages API), with no key")
+    ap.add_argument("--agent-unavailable", action="append", default=[], metavar="NAME=REASON",
+                    help="the page lists that agent but cannot start it on this machine, and says why")
     ap.add_argument("--claude-executable", default=shutil.which("claude"),
                     help="the claude binary the Claude adapter should run")
     ap.add_argument("--upstream", default="https://api.anthropic.com",
@@ -114,7 +146,11 @@ def main(argv: list[str] | None = None) -> None:
                      agent_command=shlex.split(args.agent_command), api_key=api_key,
                      dev_login=args.dev_login, claude_executable=args.claude_executable,
                      port=args.port,
-                     usage_log=Path(args.usage_log).expanduser() if args.usage_log else None)
+                     usage_log=Path(args.usage_log).expanduser() if args.usage_log else None,
+                     agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable))
+    if cfg.agents and all(a.unavailable for a in cfg.agents):
+        sys.exit("deid-agent: no agent can start here: "
+                 + "; ".join(f"{a.name}: {a.unavailable}" for a in cfg.agents))
     if token:
         cfg.token = token
     files = seed_files(args.seeds, args.seeds_dir)

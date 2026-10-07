@@ -72,6 +72,19 @@ _REROUTE = re.compile(r"ANTHROPIC_\w*BASE_URL|CLAUDE_CODE_USE_\w+|HTTPS?_PROXY|A
 
 
 @dataclass
+class AgentChoice:
+    """An agent the person can pick on the page (``--agent``): its name there and the command that
+    starts it (ACP over stdio). ``upstream`` — a server of the organization's own that answers its
+    model requests (the Messages API), instead of where the proxy sends them; no key goes there,
+    since the organization's key is for Anthropic. ``unavailable`` — why it cannot start on this
+    machine: the page lists it and does not offer it."""
+    name: str
+    command: list[str] = field(default_factory=list)
+    upstream: str | None = None
+    unavailable: str | None = None
+
+
+@dataclass
 class HostConfig:
     folder: Path
     scope: str
@@ -86,6 +99,9 @@ class HostConfig:
     agent_key: str = field(default_factory=lambda: "deid-agent-" + secrets.token_urlsafe(24))
     #: One JSON line per task: what it cost (:func:`turn_usage`). None: kept nowhere.
     usage_log: Path | None = None
+    #: The agents the page switches between, the first that can start working first. Empty: the
+    #: one ``agent_command`` starts, and the page offers no choice.
+    agents: list[AgentChoice] = field(default_factory=list)
 
 
 #: The token counts of ACP's draft ``PromptResponse.usage``; anything else in it is left out.
@@ -249,6 +265,9 @@ class AgentHost:
         self.key_refused_told = False
         self.context: dict | None = None             # the agent's last usage_update
         self.usage: dict = {"tasks": 0}              # the session's tokens, summed per field
+        self.agents = cfg.agents or [AgentChoice(name="", command=cfg.agent_command)]
+        self.current = next((a for a in self.agents if not a.unavailable), self.agents[0])
+        self.upstream = proxy.cfg.upstream           # for an agent without a server of its own
         proxy.on_key_refused = self.key_refused
 
     # ── events ───────────────────────────────────────────────────────────────
@@ -293,6 +312,26 @@ class AgentHost:
             log.info("vault warmed from %d document(s)", await self.warm_vault())
         except Exception:                            # noqa: BLE001 — the agent still starts
             log.exception("the vault could not be warmed from the folder's documents")
+        if len(self.agents) > 1:
+            self.emit({"kind": "agents", **self.agent_choice()})
+        await self.launch(self.current)
+
+    def agent_choice(self) -> dict | None:
+        """The agents the page offers, ``None`` when there is one: ``{"current": <name>, "options":
+        [{"value", "name", "unavailable"?}, …]}``."""
+        if len(self.agents) < 2:
+            return None
+        return {"current": self.current.name,
+                "options": [{"value": a.name, "name": a.name,
+                             **({"unavailable": a.unavailable} if a.unavailable else {})}
+                            for a in self.agents]}
+
+    async def launch(self, choice: AgentChoice) -> None:
+        """Start ``choice`` and open its session over the folder."""
+        if choice.unavailable:
+            self.status = "failed"
+            self.emit({"kind": "error", "text": f"{choice.name} cannot start here: {choice.unavailable}"})
+            return
         if not self.cfg.api_key:
             # The local sign-in does not work with a host-managed provider, so settings files keep
             # their say over where the agent connects: refuse to start if one would reroute it.
@@ -305,10 +344,16 @@ class AgentHost:
                                                     "setting, or give the agent the organization's "
                                                     "key."})
                 return
+        # Where its model requests go, and whether the organization's key goes with them: not to
+        # a server of the organization's own, which needs none — the key is for Anthropic.
+        own_server = choice.upstream is not None
+        self.proxy.cfg.upstream = (choice.upstream or self.upstream).rstrip("/")
+        self.proxy.cfg.upstream_key = None if own_server else self.cfg.api_key
+        lend = bool(self.cfg.api_key) and not own_server
         extra = {"CLAUDE_CODE_EXECUTABLE": self.cfg.claude_executable} if self.cfg.claude_executable else {}
         env = agent_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
-                        api_key=self.cfg.agent_key if self.cfg.api_key else None, extra=extra)
-        self.agent = AcpAgent(self.cfg.agent_command, env=env, cwd=str(self.cfg.folder),
+                        api_key=self.cfg.agent_key if lend else None, extra=extra)
+        self.agent = AcpAgent(choice.command, env=env, cwd=str(self.cfg.folder),
                               on_update=self.on_update, on_permission=self.on_permission)
         try:
             info = await self.agent.start()
@@ -426,6 +471,7 @@ class AgentHost:
         if self.cfg.usage_log is None:
             return
         line = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "scope": self.cfg.scope,
+                **({"agent": self.current.name} if len(self.agents) > 1 else {}),
                 "model": (self.models or {}).get("current"), "stopReason": stop_reason,
                 "seconds": seconds, "usage": usage}
         try:
@@ -452,6 +498,7 @@ class AgentHost:
             return web.json_response({"title": self.cfg.title, "folder": str(self.cfg.folder),
                                       "scope": self.cfg.scope, "status": self.status,
                                       "busy": self.busy, "auth": auth, "models": self.models,
+                                      "agents": self.agent_choice(),
                                       "usage": self.usage, "context": self.context,
                                       **self.changes()})
         if name == "events" and request.method == "GET":
@@ -475,6 +522,8 @@ class AgentHost:
             return web.json_response({"ok": True})
         if name == "model" and request.method == "POST":
             return await self._set_model(((await request.json()).get("value") or "").strip())
+        if name == "agent" and request.method == "POST":
+            return await self._set_agent(((await request.json()).get("value") or "").strip())
         if name == "cancel" and request.method == "POST":
             if self.agent and self.session_id:
                 await self.agent.cancel(self.session_id)
@@ -510,6 +559,32 @@ class AgentHost:
         self.models = choice
         self.emit({"kind": "models", **choice})
         return web.json_response({"ok": True, "models": choice})
+
+    async def _set_agent(self, value: str) -> web.Response:
+        """Switch to another agent between tasks: the one working stops, the other starts over the
+        same folder in a new session — it does not see the earlier tasks; the page keeps them."""
+        choice = next((a for a in self.agents if a.name == value), None)
+        if len(self.agents) < 2 or choice is None:
+            return web.json_response({"error": "there is no such agent"}, status=400)
+        if choice.unavailable:
+            return web.json_response({"error": f"{choice.name} cannot start here: {choice.unavailable}"},
+                                     status=409)
+        if self.busy:
+            return web.json_response({"error": "the agent is working: switch between tasks"}, status=409)
+        if self.status == "starting":
+            return web.json_response({"error": "the agent is starting"}, status=409)
+        if choice is self.current and self.status == "ready":
+            return web.json_response({"ok": True, "agents": self.agent_choice()})
+        old, self.agent, self.session_id = self.agent, None, None
+        self.models, self.context = None, None
+        self.current, self.status = choice, "starting"
+        self.emit({"kind": "agents", **self.agent_choice()})
+        self.emit({"kind": "models", "options": []})          # the stopped agent's models go
+        self.emit({"kind": "status", "status": "starting"})
+        if old:
+            await old.stop()
+        asyncio.get_running_loop().create_task(self.launch(choice))
+        return web.json_response({"ok": True, "agents": self.agent_choice()}, status=202)
 
     async def _events(self, request: web.Request) -> web.StreamResponse:
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream",
@@ -552,4 +627,4 @@ class AgentHost:
         return app
 
 
-__all__ = ["AgentHost", "HostConfig", "inside", "model_choice", "snapshot", "turn_usage"]
+__all__ = ["AgentChoice", "AgentHost", "HostConfig", "inside", "model_choice", "snapshot", "turn_usage"]

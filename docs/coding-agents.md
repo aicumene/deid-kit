@@ -99,6 +99,13 @@ enable_request_compression = false
   matter can be billed against. The line names the scope, never the folder, whose name may be a
   client's; the file is readable by its owner only. An agent that reports nothing gets the
   seconds alone.
+- **More than one agent.** `--agent NAME=COMMAND`, repeated, lists the agents the page offers,
+  instead of `--agent-command`; the first that can start works first. The person switches between
+  tasks, and the agent picked starts over the same folder in a new session: it does not see the
+  earlier tasks, which stay on the page. `--agent-upstream NAME=URL` sends that agent's model
+  requests to a server of the organization's own (the Messages API) and gives it no key, since the
+  organization's key is for Anthropic. `--agent-unavailable NAME=REASON` lists an agent that cannot
+  start on this machine, and why, without offering it. The usage line names the agent.
 - **Not applied yet.** Initials of a known person that no document defines, which the vault can
   tokenize (`deidkit.address.tokenize_initials`), are not yet applied by the proxy.
 

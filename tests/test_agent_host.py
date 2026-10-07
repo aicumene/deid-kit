@@ -13,7 +13,7 @@ import pytest
 pytest.importorskip("aiohttp")
 from aiohttp.test_utils import TestClient, TestServer       # noqa: E402
 
-from deidkit.agents.host import AgentHost, HostConfig, model_choice  # noqa: E402
+from deidkit.agents.host import AgentChoice, AgentHost, HostConfig, model_choice  # noqa: E402
 from deidkit.proxy.server import Proxy, ProxyConfig         # noqa: E402
 from deidkit.store import InMemoryTokenStore                # noqa: E402
 
@@ -289,3 +289,133 @@ def test_turn_usage_reads_both_places_agents_put_it():
     assert turn_usage({"usage": {"inputTokens": 5, "outputTokens": True, "totalTokens": -1}}) == {"inputTokens": 5}
     assert turn_usage({"_meta": {"usage": {"outputTokens": 7}}}) == {"outputTokens": 7}
     assert turn_usage({"usage": "lots"}) == {}
+
+
+def two_agents(*, upstream=None, unavailable=None):
+    return [AgentChoice("Claude Code", [sys.executable, str(FAKE), "Claude Code"], unavailable=unavailable),
+            AgentChoice("MatterAgent", [sys.executable, str(FAKE), "MatterAgent"], upstream=upstream)]
+
+
+async def started(cfg, proxy_cfg):
+    host = AgentHost(cfg, Proxy(InMemoryTokenStore(), proxy_cfg))
+    client = TestClient(TestServer(host.app()))
+    await client.start_server()
+    await wait_for(lambda: host.status in ("ready", "failed"))
+    return host, client
+
+
+async def test_the_page_switches_agents_between_tasks(tmp_path):
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], dev_login=True,
+                     agents=two_agents())
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        state = await (await client.get("/deid-agent/api/state", headers=headers)).json()
+        assert state["agents"] == {"current": "Claude Code", "options": [
+            {"value": "Claude Code", "name": "Claude Code"}, {"value": "MatterAgent", "name": "MatterAgent"}]}
+        first = host.agent
+
+        r = await client.post("/deid-agent/api/agent", json={"value": "MatterAgent"}, headers=headers)
+        assert r.status == 202
+        await wait_for(lambda: host.status == "ready" and host.agent is not first)
+        assert first.proc.returncode is not None                       # the other one stopped
+        assert host.current.name == "MatterAgent" and host.models["current"] == "default"
+        kinds = [e["kind"] for e in host.events]
+        assert kinds.count("agents") == 2 and {"kind": "models", "options": []} in \
+            [{k: v for k, v in e.items() if k != "at"} for e in host.events]
+
+        # the next task goes to it, in its own session
+        await client.post("/deid-agent/api/prompt", json={"text": "Draft a reply"}, headers=headers)
+        await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))
+        assert "[MatterAgent] Working on it" in "".join(e["text"] for e in host.events if e["kind"] == "message")
+        busy = await client.post("/deid-agent/api/agent", json={"value": "Claude Code"}, headers=headers)
+        assert busy.status == 409 and host.current.name == "MatterAgent"
+        ask = next(e for e in host.events if e["kind"] == "permission")
+        await client.post("/deid-agent/api/permission", json={"id": ask["id"], "optionId": "reject"},
+                          headers=headers)
+        await wait_for(lambda: not host.busy)
+
+        unknown = await client.post("/deid-agent/api/agent", json={"value": "Codex"}, headers=headers)
+        assert unknown.status == 400
+        assert (await client.post("/deid-agent/api/agent", json={"value": "Claude Code"})).status == 401
+    finally:
+        await client.close()
+
+
+async def test_an_agent_with_its_own_server_gets_no_key_and_its_requests_go_there(tmp_path):
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[],
+                     api_key="sk-org-held-by-proxy", agents=two_agents(upstream="http://10.0.0.7:8092"))
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1", upstream_key=cfg.api_key,
+                                                  agent_key=cfg.agent_key))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        assert host.proxy.cfg.upstream == "https://api.anthropic.com"
+        assert host.proxy.cfg.upstream_key == cfg.api_key and host.agent.env["ANTHROPIC_API_KEY"] == cfg.agent_key
+
+        await client.post("/deid-agent/api/agent", json={"value": "MatterAgent"}, headers=headers)
+        await wait_for(lambda: host.status == "ready" and host.current.name == "MatterAgent")
+        assert host.proxy.cfg.upstream == "http://10.0.0.7:8092"
+        assert host.proxy.cfg.upstream_key is None                     # the key is for Anthropic
+        assert "ANTHROPIC_API_KEY" not in host.agent.env
+
+        await client.post("/deid-agent/api/agent", json={"value": "Claude Code"}, headers=headers)
+        await wait_for(lambda: host.status == "ready" and host.current.name == "Claude Code")
+        assert host.proxy.cfg.upstream == "https://api.anthropic.com"
+        assert host.proxy.cfg.upstream_key == cfg.api_key and host.agent.env["ANTHROPIC_API_KEY"] == cfg.agent_key
+    finally:
+        await client.close()
+
+
+async def test_an_agent_that_cannot_start_here_is_listed_with_why_and_not_offered(tmp_path):
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], dev_login=True,
+                     agents=two_agents(unavailable="Claude Code is not on this Mac"))
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        assert host.status == "ready" and host.current.name == "MatterAgent"   # the first that can
+        state = await (await client.get("/deid-agent/api/state", headers=headers)).json()
+        assert state["agents"]["options"][0] == {"value": "Claude Code", "name": "Claude Code",
+                                                 "unavailable": "Claude Code is not on this Mac"}
+        r = await client.post("/deid-agent/api/agent", json={"value": "Claude Code"}, headers=headers)
+        assert r.status == 409 and "not on this Mac" in (await r.json())["error"]
+        assert host.current.name == "MatterAgent"
+    finally:
+        await client.close()
+
+
+async def test_one_agent_offers_no_choice(rig):
+    host, client, folder = rig
+    state = await (await client.get("/deid-agent/api/state",
+                                    headers={"x-deid-agent-token": host.cfg.token})).json()
+    assert state["agents"] is None
+    r = await client.post("/deid-agent/api/agent", json={"value": "fake"},
+                          headers={"x-deid-agent-token": host.cfg.token})
+    assert r.status == 400
+
+
+def test_the_agents_come_from_the_command_line_in_their_order(tmp_path, monkeypatch):
+    from deidkit.agents import cli
+
+    seen = []
+    monkeypatch.setattr(cli, "AgentHost", lambda cfg, proxy: seen.append(cfg) or AgentHost(cfg, proxy))
+    monkeypatch.setattr(cli.web, "run_app", lambda *a, **k: None)
+    folder = tmp_path / "matter"
+    folder.mkdir()
+    base = ["--folder", str(folder), "--scope", "case-1", "--dev-login",
+            "--vault", str(tmp_path / "vault.sqlite"), "--audit", str(tmp_path / "audit.jsonl")]
+    cli.main(base + ["--agent", "Claude Code='/Applications/Bernio Chat Test.app/x/claude-acp'",
+                     "--agent", "MatterAgent=/x/matteragent --server llama --model m",
+                     "--agent-upstream", "MatterAgent=http://10.0.0.7:8092/",
+                     "--agent-unavailable", "Claude Code=Claude Code is not on this Mac"])
+    agents = seen[0].agents
+    assert [a.name for a in agents] == ["Claude Code", "MatterAgent"]
+    assert agents[0].command == ["/Applications/Bernio Chat Test.app/x/claude-acp"]
+    assert agents[0].unavailable == "Claude Code is not on this Mac" and agents[0].upstream is None
+    assert agents[1].command == ["/x/matteragent", "--server", "llama", "--model", "m"]
+    assert agents[1].upstream == "http://10.0.0.7:8092" and agents[1].unavailable is None
+    cli.main(base)
+    assert seen[1].agents == []                                        # --agent-command alone, as before
+    with pytest.raises(SystemExit):
+        cli.main(base + ["--agent-upstream", "Nobody=http://x"])
+    with pytest.raises(SystemExit):                                    # nothing here could start
+        cli.main(base + ["--agent-unavailable", "Claude Code=not here"])
