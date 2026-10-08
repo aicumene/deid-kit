@@ -140,6 +140,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="a stylesheet the page loads after its own: the look of the program that opens it")
     ap.add_argument("--claude-executable", default=shutil.which("claude"),
                     help="the claude binary the Claude adapter should run")
+    ap.add_argument("--codex-executable", default=shutil.which("codex"),
+                    help="the person's own codex binary, for an agent that is Codex (codex-acp)")
     ap.add_argument("--upstream", default="https://api.anthropic.com",
                     help="where the agent's model requests go: Anthropic, or a server of the "
                          "organization's own that speaks the Messages API (/v1/messages)")
@@ -168,6 +170,7 @@ def main(argv: list[str] | None = None) -> None:
     cfg = HostConfig(folder=folder, scope=args.scope, title=args.title or folder.name,
                      agent_command=shlex.split(args.agent_command), api_key=api_key,
                      dev_login=args.dev_login, claude_executable=args.claude_executable,
+                     codex_executable=args.codex_executable,
                      port=args.port,
                      usage_log=Path(args.usage_log).expanduser() if args.usage_log else None,
                      agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable,

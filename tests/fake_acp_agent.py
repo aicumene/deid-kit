@@ -70,6 +70,9 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "invalid value"}})
     elif method == "session/prompt":
         said = (f"[{NAME}] " if NAME else "") + (f"[meta {json.dumps(meta, sort_keys=True)}] " if meta else "")
+        if os.environ.get("MODEL_PROVIDER"):
+            said += (f"[provider {os.environ['MODEL_PROVIDER']} {os.environ.get('CODEX_CONFIG', '')} "
+                     f"{os.environ.get('CODEX_PATH', '-')} {os.environ.get('ANTHROPIC_API_KEY', '-')}] ")
         update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"{said}Working on it ({model}). "}})
         target = os.path.join(cwd, "draft.md")
         update("s1", {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Write draft.md",

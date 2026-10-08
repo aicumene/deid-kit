@@ -4,7 +4,7 @@
 
 import pytest
 
-from deidkit.agents.pricing import RequestUsage, price, task_cost
+from deidkit.agents.pricing import RequestUsage, price, request_usage, task_cost
 
 
 def test_a_cold_session_pays_the_write_and_gains_nothing_yet():
@@ -57,3 +57,22 @@ def test_writes_without_a_split_count_as_the_default_lifetime():
     u = RequestUsage.from_anthropic({"input_tokens": 3, "cache_creation_input_tokens": 100,
                                      "cache_read_input_tokens": 40, "output_tokens": 7}, "claude-sonnet-5-5")
     assert (u.input, u.write_5m, u.write_1h, u.read, u.output) == (3, 100, 0, 40, 7)
+
+
+def test_a_codex_answer_counts_its_cached_input_apart_and_has_no_price():
+    # The Responses API counts the cached part inside input_tokens; OpenAI writes its cache for free.
+    usage = {"input_tokens": 12000, "input_tokens_details": {"cached_tokens": 9000},
+             "output_tokens": 400, "output_tokens_details": {"reasoning_tokens": 150}, "api": "responses"}
+    r = request_usage(usage, "gpt-5.5-codex")
+    assert (r.input, r.read, r.write_5m, r.write_1h, r.output) == (3000, 9000, 0, 0, 400)
+    cost = task_cost([r])
+    assert (cost["input"], cost["cache_read"], cost["output"]) == (3000, 9000, 400)
+    assert cost["usd"] is None and cost["saved_usd"] is None          # tokens only: no price for it
+    # an answer of Claude stays read as the Messages API's
+    claude = request_usage({"input_tokens": 5, "cache_read_input_tokens": 70, "output_tokens": 9,
+                            "output_tokens_details": {}}, "claude-opus-5-5")
+    assert (claude.input, claude.read, claude.output) == (5, 70, 9)
+    # a cached count larger than the input is not believed past the input
+    assert request_usage({"input_tokens": 10, "input_tokens_details": {"cached_tokens": 50},
+                          "api": "responses"}, "m").read == 10
+

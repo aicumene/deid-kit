@@ -181,7 +181,9 @@ class Backend:
                 ("response.output_text.delta", {"item_id": "m", "output_index": 0, "content_index": 0, "delta": text}),
                 ("response.output_item.done", {"output_index": 0, "item": {"type": "message", "id": "m",
                     "role": "assistant", "content": [{"type": "output_text", "text": text}]}}),
-                ("response.completed", {"response": {"id": "r", "output": []}})]):
+                ("response.completed", {"response": {"id": "r", "output": [], "model": "gpt-test",
+                    "usage": {"input_tokens": 1200, "input_tokens_details": {"cached_tokens": 1000},
+                              "output_tokens": 30}}})]):
             await resp.write(f"event: {t}\ndata: {json.dumps({'type': t, 'sequence_number': i, **extra})}\n\n".encode())
         await resp.write_eof()
         return resp
@@ -199,7 +201,10 @@ async def test_codex_through_the_proxy(tmp_path):
     await upstream.start_server()
     cfg = ProxyConfig(default_scope="case-1", upstream_chatgpt=str(upstream.make_url("/codex")),
                       detector=RegexDetector(), seeds=seeds(), record=tmp_path / "record.jsonl")
-    client = TestClient(TestServer(Proxy(InMemoryTokenStore(), cfg).app()))
+    proxy = Proxy(InMemoryTokenStore(), cfg)
+    used = []
+    proxy.on_usage = lambda model_id, usage: used.append((model_id, dict(usage)))
+    client = TestClient(TestServer(proxy.app()))
     await client.start_server()
     try:
         r = await client.get("/v1/models?client_version=1", headers={"chatgpt-account-id": "acc"})
@@ -220,6 +225,9 @@ async def test_codex_through_the_proxy(tmp_path):
         assert "Brenner" not in backend.headers[0]["x-codex-turn-metadata"]
         assert backend.headers[0]["Authorization"] == "Bearer t"
         assert "Brenner" not in (tmp_path / "record.jsonl").read_text()
+        # what the answer used reaches the counter, marked as the Responses API's
+        assert used == [("gpt-test", {"input_tokens": 1200, "input_tokens_details": {"cached_tokens": 1000},
+                                      "output_tokens": 30, "api": "responses"})]
     finally:
         await client.close()
         await upstream.close()

@@ -10,7 +10,7 @@ cost the input price, and the output the same. A cold session pays the write pre
 the next request that reads what it wrote.
 
 Prices: Anthropic's first-party list prices, $ per million tokens, as of 25 September 2026. A model
-not in the table is counted in tokens only. On a personal sign-in nothing is billed per token: the
+not in the table — Codex's among them — is counted in tokens only. On a personal sign-in nothing is billed per token: the
 figures say what the same work costs on the organization's key.
 """
 
@@ -70,6 +70,26 @@ class RequestUsage:
         return cls(model=model or "", input=n(usage.get("input_tokens")), write_5m=short, write_1h=long,
                    read=n(usage.get("cache_read_input_tokens")), output=n(usage.get("output_tokens")))
 
+    @classmethod
+    def from_openai(cls, usage: dict, model: str) -> RequestUsage:
+        """From the Responses API's `usage` (Codex). Its `input_tokens` include the cached ones,
+        which `input_tokens_details.cached_tokens` counts; OpenAI writes its cache without charge."""
+        def n(value) -> int:
+            return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+        details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+        total = n(usage.get("input_tokens"))
+        cached = min(n(details.get("cached_tokens")), total)
+        return cls(model=model or "", input=total - cached, read=cached, output=n(usage.get("output_tokens")))
+
+
+def request_usage(usage: dict, model: str) -> RequestUsage:
+    """An answer's usage as the proxy reported it: the Responses API's (Codex; marked ``api:
+    responses``) or the Messages API's."""
+    if usage.get("api") == "responses":
+        return RequestUsage.from_openai(usage, model)
+    return RequestUsage.from_anthropic(usage, model)
+
 
 def task_cost(requests: list[RequestUsage]) -> dict:
     """The task's tokens and, when every model is priced, its cost with the cache and without it:
@@ -91,4 +111,4 @@ def task_cost(requests: list[RequestUsage]) -> dict:
     return out
 
 
-__all__ = ["PRICES", "RequestUsage", "WRITE_1H", "WRITE_5M", "price", "task_cost"]
+__all__ = ["PRICES", "RequestUsage", "WRITE_1H", "WRITE_5M", "price", "request_usage", "task_cost"]

@@ -317,11 +317,16 @@ class Proxy:
         except Exception:                                   # noqa: BLE001
             log.exception("the answer's usage could not be counted")
 
+    def _report_responses_usage(self, model: str, usage: dict | None) -> None:
+        """A Codex answer's usage (Responses API), marked as such: its counts read differently."""
+        if usage and any(k in usage for k in ("input_tokens", "output_tokens")):
+            self._report_usage(model, {**usage, "api": "responses"})
+
     async def _relay(self, request: web.Request, up, restorer, scope: str,
                      usage: dict | None = None) -> web.StreamResponse:
         """Stream the upstream's events back through ``restorer``; with ``usage``, collect the
         answer's model and usage on the way (Messages API: ``message_start``, then ``message_delta``,
-        which carries the final counts)."""
+        which carries the final counts; Responses API: ``response.completed``)."""
         headers = {k: v for k, v in up.headers.items() if k.lower() not in _BACK_DROP}
         resp = web.StreamResponse(status=up.status, headers=headers)
         await resp.prepare(request)
@@ -342,6 +347,10 @@ class Proxy:
                         usage.update(obj["message"].get("usage") or {})
                     elif obj.get("type") == "message_delta" and isinstance(obj.get("usage"), dict):
                         usage.update({k: v for k, v in obj["usage"].items() if v is not None})
+                    elif obj.get("type") in ("response.completed", "response.incomplete") \
+                            and isinstance(obj.get("response"), dict):
+                        usage["model"] = obj["response"].get("model") or usage.get("model", "")
+                        usage.update(obj["response"].get("usage") or {})
                 for out_name, out_data in await restorer.event(name, obj):
                     await resp.write(sse.encode(out_name, out_data))
         except (ConnectionResetError, ClientConnectionResetError):
@@ -403,6 +412,8 @@ class Proxy:
                     except ValueError:
                         obj = None
                     if isinstance(obj, dict) and isinstance(obj.get("output"), list):
+                        self._report_responses_usage(str(obj.get("model") or body.get("model") or ""),
+                                                     obj.get("usage"))
                         self._record({"dir": "in", "scope": scope, "body": obj})
                         obj["output"] = [await restore_item(i, engine, prep.mapping,
                                                             self.restore.restore_put,
@@ -414,7 +425,10 @@ class Proxy:
                 return web.Response(status=up.status, body=data, headers=headers)
             restorer = ResponsesRestorer(engine, prep.mapping, self.restore.restore_put,
                                          self.cfg.openai_local_tools, prep.spellings)
-            return await self._relay(request, up, restorer, scope)
+            collected: dict = {}
+            resp = await self._relay(request, up, restorer, scope, collected)
+            self._report_responses_usage(str(collected.pop("model", "") or body.get("model") or ""), collected)
+            return resp
         finally:
             up.release()
 

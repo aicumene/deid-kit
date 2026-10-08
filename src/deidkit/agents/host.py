@@ -54,8 +54,8 @@ from pathlib import Path
 
 from aiohttp import web
 
-from deidkit.agents.acp import AcpAgent, agent_env
-from deidkit.agents.pricing import RequestUsage, task_cost
+from deidkit.agents.acp import AcpAgent, agent_env, codex_env
+from deidkit.agents.pricing import RequestUsage, request_usage, task_cost
 from deidkit.proxy.server import Proxy
 
 log = logging.getLogger("deidkit.agents.host")
@@ -86,6 +86,12 @@ class AgentChoice:
     #: The session's `_meta` for this agent (``--agent-meta``): its own options.
     meta: dict | None = None
 
+    @property
+    def codex(self) -> bool:
+        """Codex through its ACP adapter (``codex-acp``): it finds the proxy through its own
+        settings (:func:`~deidkit.agents.acp.codex_env`), not Claude's."""
+        return any("codex-acp" in part for part in self.command)
+
 
 @dataclass
 class HostConfig:
@@ -96,6 +102,8 @@ class HostConfig:
     api_key: str | None = None
     dev_login: bool = False
     claude_executable: str | None = None
+    #: The person's own Codex, for an agent that is Codex (``codex-acp``); none — the adapter's.
+    codex_executable: str | None = None
     port: int = 8790
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     #: What the agent sends as its key; the proxy swaps it for ``api_key``, which stays there.
@@ -342,7 +350,7 @@ class AgentHost:
             self.status = "failed"
             self.emit({"kind": "error", "text": f"{choice.name} cannot start here: {choice.unavailable}"})
             return
-        if not self.cfg.api_key:
+        if not self.cfg.api_key and not choice.codex:
             # The local sign-in does not work with a host-managed provider, so settings files keep
             # their say over where the agent connects: refuse to start if one would reroute it.
             rerouted = rerouting_settings(self.cfg.folder)
@@ -359,8 +367,13 @@ class AgentHost:
         own_server = choice.upstream is not None
         self.proxy.cfg.upstream = (choice.upstream or self.upstream).rstrip("/")
         self.proxy.cfg.upstream_key = None if own_server else self.cfg.api_key
-        lend = bool(self.cfg.api_key) and not own_server
-        extra = {"CLAUDE_CODE_EXECUTABLE": self.cfg.claude_executable} if self.cfg.claude_executable else {}
+        # The organization's key is Anthropic's: Codex goes with the person's own sign-in.
+        lend = bool(self.cfg.api_key) and not own_server and not choice.codex
+        if choice.codex:
+            extra = codex_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
+                              codex_path=self.cfg.codex_executable)
+        else:
+            extra = {"CLAUDE_CODE_EXECUTABLE": self.cfg.claude_executable} if self.cfg.claude_executable else {}
         env = agent_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
                         api_key=self.cfg.agent_key if lend else None, extra=extra)
         self.agent = AcpAgent(choice.command, env=env, cwd=str(self.cfg.folder),
@@ -457,7 +470,7 @@ class AgentHost:
 
     def answer_usage(self, model: str, usage: dict) -> None:
         """An answer of the model crossed the proxy: count it into the task under way."""
-        self.requests.append(RequestUsage.from_anthropic(usage, model))
+        self.requests.append(request_usage(usage, model))
 
     async def run_prompt(self, text: str) -> None:
         self.busy = True

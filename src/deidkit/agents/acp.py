@@ -207,4 +207,27 @@ def agent_env(*, base_url: str, scope: str, api_key: str | None, extra: dict | N
     return env
 
 
-__all__ = ["AcpAgent", "AcpError", "PROTOCOL_VERSION", "agent_env"]
+def codex_env(*, base_url: str, scope: str, codex_path: str | None = None) -> dict:
+    """What Codex behind the proxy needs, through its ACP adapter (``codex-acp``): a model provider
+    that is the proxy, signed in as the person signed Codex in (ChatGPT or an API key). The adapter
+    merges ``CODEX_CONFIG`` into each session's config and opens the session on ``MODEL_PROVIDER``;
+    ``CODEX_PATH`` is the person's own Codex, when given. The person's ``~/.codex/config.toml``
+    stays as it is: their Codex elsewhere does not go through a proxy that may not be running."""
+    config = {
+        "model_providers": {"deid": {
+            "name": "OpenAI through deid-agent",
+            "base_url": base_url.rstrip("/") + "/v1",
+            "requires_openai_auth": True,
+            "wire_api": "responses",
+            "http_headers": {"x-deid-scope": scope},
+        }},
+        # the proxy reads the requests it rewrites: none compressed
+        "features": {"enable_request_compression": False},
+    }
+    env = {"MODEL_PROVIDER": "deid", "CODEX_CONFIG": json.dumps(config)}
+    if codex_path:
+        env["CODEX_PATH"] = codex_path
+    return env
+
+
+__all__ = ["AcpAgent", "AcpError", "PROTOCOL_VERSION", "agent_env", "codex_env"]

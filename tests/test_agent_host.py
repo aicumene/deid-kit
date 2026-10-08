@@ -508,3 +508,41 @@ def test_session_options_come_from_the_command_line(tmp_path, monkeypatch):
     assert seen[1].session_meta == {"claudeCode": {"options": {"strictMcpConfig": True}}}
     with pytest.raises(SystemExit):
         cli.main(base + ["--session-meta", "[1, 2]"])
+
+
+async def test_codex_goes_through_the_proxy_with_its_own_sign_in(tmp_path):
+    agents = [AgentChoice("Codex", [sys.executable, str(FAKE), "codex-acp"])]
+    assert agents[0].codex and not two_agents()[0].codex
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], api_key="sk-org",
+                     codex_executable="/opt/codex/bin/codex", agents=agents)
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        await client.post("/deid-agent/api/prompt", json={"text": "Draft a reply"}, headers=headers)
+        await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))
+        said = "".join(e["text"] for e in host.events if e["kind"] == "message")
+        provider = said.split("[provider ", 1)[1].split("] ", 1)[0]
+        name, config, path, key = provider.split(" ", 1)[0], *provider.split(" ", 1)[1].rsplit(" ", 2)
+        assert name == "deid" and path == "/opt/codex/bin/codex"
+        assert key == "-"                     # the organization's key is Anthropic's: Codex is not lent it
+        deid = json.loads(config)["model_providers"]["deid"]
+        assert deid["base_url"] == f"http://127.0.0.1:{cfg.port}/v1" and deid["requires_openai_auth"] is True
+        assert deid["http_headers"] == {"x-deid-scope": "case-1"} and deid["wire_api"] == "responses"
+        assert json.loads(config)["features"] == {"enable_request_compression": False}
+    finally:
+        await client.close()
+
+
+def test_the_persons_codex_comes_from_the_command_line(tmp_path, monkeypatch):
+    from deidkit.agents import cli
+
+    seen = []
+    monkeypatch.setattr(cli, "AgentHost", lambda cfg, proxy: seen.append(cfg) or AgentHost(cfg, proxy))
+    monkeypatch.setattr(cli.web, "run_app", lambda *a, **k: None)
+    folder = tmp_path / "matter"
+    folder.mkdir()
+    cli.main(["--folder", str(folder), "--scope", "case-1", "--dev-login", "--vault", str(tmp_path / "v.sqlite"),
+              "--audit", str(tmp_path / "a.jsonl"), "--agent", "Codex=/x/codex-acp",
+              "--codex-executable", "/Applications/Some.app/codex"])
+    assert seen[0].codex_executable == "/Applications/Some.app/codex" and seen[0].agents[0].codex
+
