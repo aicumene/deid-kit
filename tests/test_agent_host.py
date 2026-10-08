@@ -441,3 +441,70 @@ async def test_the_page_takes_the_look_of_the_program_that_opens_it(tmp_path):
                 assert sheet.content_type == "text/css" and "--accent: #8a6a3c" in await sheet.text()
         finally:
             await client.close()
+
+
+async def test_a_task_says_what_it_cost_with_the_cache_and_without_it(tmp_path):
+    usage_log = tmp_path / "usage.jsonl"
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[sys.executable, str(FAKE)],
+                     dev_login=True, usage_log=usage_log)
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        await client.post("/deid-agent/api/prompt", json={"text": "Draft a reply"}, headers=headers)
+        await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))
+        # two answers of the model cross the proxy during the task: a cold write, then a read
+        host.proxy.on_usage("claude-opus-5-5", {"input_tokens": 2, "cache_creation_input_tokens": 30294,
+                                                "cache_creation": {"ephemeral_1h_input_tokens": 30294}, "output_tokens": 194})
+        host.proxy.on_usage("claude-opus-5-5", {"input_tokens": 5, "cache_read_input_tokens": 30294, "output_tokens": 60})
+        ask = next(e for e in host.events if e["kind"] == "permission")
+        await client.post("/deid-agent/api/permission", json={"id": ask["id"], "optionId": "reject"}, headers=headers)
+        await wait_for(lambda: any(e["kind"] == "turn_end" for e in host.events))
+        cost = next(e for e in host.events if e["kind"] == "turn_end")["cost"]
+        assert cost["requests"] == 2 and cost["cache_write_1h"] == 30294 and cost["cache_read"] == 30294
+        assert cost["usd"] == pytest.approx((2 * 4 + 30294 * 8 + 194 * 20 + 5 * 4 + 30294 * 0.2 + 60 * 20) / 1e6, abs=1e-4)
+        assert cost["usd_without_cache"] == pytest.approx(((2 + 30294 + 5 + 30294) * 4 + (194 + 60) * 20) / 1e6, abs=1e-4)
+        assert json.loads(usage_log.read_text().splitlines()[-1])["cost"] == cost
+        # the next task counts its own answers only
+        await client.post("/deid-agent/api/prompt", json={"text": "Again"}, headers=headers)
+        await wait_for(lambda: sum(e["kind"] == "permission" for e in host.events) == 2)
+        ask = [e for e in host.events if e["kind"] == "permission"][-1]
+        await client.post("/deid-agent/api/permission", json={"id": ask["id"], "optionId": "reject"}, headers=headers)
+        await wait_for(lambda: sum(e["kind"] == "turn_end" for e in host.events) == 2)
+        assert "cost" not in [e for e in host.events if e["kind"] == "turn_end"][-1]
+    finally:
+        await client.close()
+
+
+async def test_an_agent_gets_its_own_session_options(tmp_path):
+    meta = {"claudeCode": {"options": {"tools": ["Read", "Write", "Edit", "Bash"], "strictMcpConfig": True}}}
+    agents = two_agents()
+    agents[0].meta = meta
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], dev_login=True, agents=agents)
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        await client.post("/deid-agent/api/prompt", json={"text": "Draft a reply"}, headers=headers)
+        await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))
+        said = "".join(e["text"] for e in host.events if e["kind"] == "message")
+        assert f"[meta {json.dumps(meta, sort_keys=True)}]" in said
+    finally:
+        await client.close()
+
+
+def test_session_options_come_from_the_command_line(tmp_path, monkeypatch):
+    from deidkit.agents import cli
+
+    seen = []
+    monkeypatch.setattr(cli, "AgentHost", lambda cfg, proxy: seen.append(cfg) or AgentHost(cfg, proxy))
+    monkeypatch.setattr(cli.web, "run_app", lambda *a, **k: None)
+    folder = tmp_path / "matter"
+    folder.mkdir()
+    base = ["--folder", str(folder), "--scope", "case-1", "--dev-login",
+            "--vault", str(tmp_path / "vault.sqlite"), "--audit", str(tmp_path / "audit.jsonl")]
+    cli.main(base + ["--agent", "Claude Code=/x/claude-acp", "--agent", "MatterAgent=/x/matteragent",
+                     "--agent-meta", 'Claude Code={"claudeCode": {"options": {"tools": ["Read"]}}}'])
+    assert seen[0].agents[0].meta == {"claudeCode": {"options": {"tools": ["Read"]}}} and seen[0].agents[1].meta is None
+    cli.main(base + ["--session-meta", '{"claudeCode": {"options": {"strictMcpConfig": true}}}'])
+    assert seen[1].session_meta == {"claudeCode": {"options": {"strictMcpConfig": True}}}
+    with pytest.raises(SystemExit):
+        cli.main(base + ["--session-meta", "[1, 2]"])

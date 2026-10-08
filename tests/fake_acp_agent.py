@@ -52,6 +52,7 @@ def permission(session, cid, title, path):
 
 
 cwd = None
+meta = None
 for line in sys.stdin:
     msg = json.loads(line)
     method, params, rid = msg.get("method"), msg.get("params") or {}, msg.get("id")
@@ -59,6 +60,7 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentInfo": {"name": NAME or "fake"}}})
     elif method == "session/new":
         cwd = params["cwd"]
+        meta = params.get("_meta")
         send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "s1", "configOptions": config_options()}})
     elif method == "session/set_config_option":
         if params.get("configId") == "model" and params.get("value") in {m["value"] for m in MODELS}:
@@ -67,7 +69,7 @@ for line in sys.stdin:
         else:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "invalid value"}})
     elif method == "session/prompt":
-        said = f"[{NAME}] " if NAME else ""
+        said = (f"[{NAME}] " if NAME else "") + (f"[meta {json.dumps(meta, sort_keys=True)}] " if meta else "")
         update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"{said}Working on it ({model}). "}})
         target = os.path.join(cwd, "draft.md")
         update("s1", {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Write draft.md",

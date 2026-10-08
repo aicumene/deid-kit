@@ -303,3 +303,53 @@ async def test_the_agent_opens_a_file_named_after_a_party(tmp_path):
     finally:
         await client.close()
         await upstream.close()
+
+
+async def test_each_answer_tells_what_it_used_and_counting_tells_nothing(tmp_path):
+    """The proxy hands the model's usage of every answer to whoever runs the agent — streamed (from
+    message_start, completed by message_delta) or whole — and nothing for count_tokens."""
+    model = Model()
+
+    async def whole(request):
+        body = await request.json()
+        return web.json_response({"id": "msg_2", "type": "message", "role": "assistant", "model": body["model"],
+                                  "content": [{"type": "text", "text": "Done."}], "stop_reason": "end_turn",
+                                  "usage": {"input_tokens": 7, "cache_read_input_tokens": 900, "output_tokens": 3}})
+
+    async def answer(request):
+        return await (whole(request) if request.query.get("whole") else model.messages(request))
+
+    app = web.Application()
+    app.router.add_post("/v1/messages", answer)
+    app.router.add_post("/v1/messages/count_tokens", model.count)
+    upstream = TestServer(app)
+    await upstream.start_server()
+    seeds = InMemorySeedSource()
+    seeds.add_entity("case-1", SeedEntity("individual", "Ada Brenner", role="Director"))
+    proxy = Proxy(SQLiteTokenStore(tmp_path / "v.sqlite"), ProxyConfig(
+        default_scope="case-1", upstream=str(upstream.make_url("")).rstrip("/"), seeds=seeds,
+        audit=tmp_path / "audit.jsonl", detector=RegexDetector()))
+    used = []
+    proxy.on_usage = lambda model_id, usage: used.append((model_id, dict(usage)))
+    client = TestClient(TestServer(proxy.app()))
+    await client.start_server()
+    try:
+        await read_stream(await client.post("/v1/messages", json=first_request()))
+        assert len(used) == 1 and used[0][0] == "claude-test"
+        assert used[0][1]["input_tokens"] == 1 and used[0][1]["output_tokens"] == 20       # the delta's final count
+        counting = first_request()
+        counting.pop("stream")
+        await client.post("/v1/messages/count_tokens", json=counting)
+        assert len(used) == 1
+        whole_request = first_request()
+        whole_request.pop("stream")
+        await (await client.post("/v1/messages?whole=1", json=whole_request)).read()
+        assert used[1] == ("claude-test", {"input_tokens": 7, "cache_read_input_tokens": 900, "output_tokens": 3})
+        # an accountant that breaks does not break the answer
+        proxy.on_usage = lambda *_: 1 / 0
+        resp = await client.post("/v1/messages", json=first_request())
+        text, _, _ = await read_stream(resp)
+        assert resp.status == 200 and "Ada Brenner" in text
+    finally:
+        await client.close()
+        await upstream.close()

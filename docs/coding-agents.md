@@ -99,6 +99,21 @@ enable_request_compression = false
   matter can be billed against. The line names the scope, never the folder, whose name may be a
   client's; the file is readable by its owner only. An agent that reports nothing gets the
   seconds alone.
+- **What the cache did.** The proxy reads the usage of every answer it relays — the model, the input
+  the cache did not cover, the cache writes by lifetime and the cache reads, the output — and
+  `deid-agent` adds them up per task: the task's cost at Anthropic's list prices
+  (`deidkit.agents.pricing`, as of 25 September 2026), with the cache and as it would be without it.
+  A write costs 1.25× the input price for 5 minutes and 2× for an hour; a read costs 0.1× on most
+  models, 0.05× on Claude Opus 5.5 and 0.025× on Claude Fable 5.1. MEASURED 07.10.2026: Claude Code
+  writes its tools and instructions (about 30K tokens) to the 1-hour cache when a session starts, so
+  the first question costs about twice what it would without the cache, and every later one in the
+  hour reads it at a twentieth of the price on Claude Opus 5.5. The page and the usage log show both
+  figures; on a personal sign-in nothing is billed per token, and they say what the same work costs on
+  the organization's key.
+- **An agent's own options.** `--agent-meta NAME=JSON` (or `--session-meta JSON` for a single agent)
+  is sent as the session's `_meta`; the Claude adapter reads `claudeCode.options`, e.g.
+  `{"tools": ["Read", "Write", "Edit", "Bash"], "strictMcpConfig": true}`: only the tools a matter
+  needs, and no MCP servers of the person's own (claude.ai connectors included).
 - **More than one agent.** `--agent NAME=COMMAND`, repeated, lists the agents the page offers,
   instead of `--agent-command`; the first that can start works first. The person switches between
   tasks, and the agent picked starts over the same folder in a new session: it does not see the

@@ -115,11 +115,26 @@ function renderContext(c) {
   chip.textContent = `window ${k(c.used)} / ${k(c.size)}`; chip.hidden = false;
   chip.className = "chip" + (c.used > 0.8 * c.size ? " warn" : "");
 }
-// What a finished task cost: the agent's token counts (ACP's draft turn usage) and the time.
+const usd = (x) => (Math.abs(x) >= 1 ? `$${x.toFixed(2)}` : `$${x.toFixed(3)}`);
+// What the prompt cache did for a task: saved money, or — on a cold session — cost a write that later
+// questions read cheaply.
+function cacheNote(c) {
+  if (c.saved_usd > 0) return `, the cache saved ${usd(c.saved_usd)} (${Math.round(100 * c.saved_usd / c.usd_without_cache)}%)`;
+  if (c.saved_usd < 0) return `, ${usd(-c.saved_usd)} of it to write the cache, which the next questions read cheaply`;
+  return "";
+}
+// What a finished task cost: what the proxy counted on the model's answers — tokens, the cache, the
+// price at Anthropic's list prices with the cache and without it — else the agent's own counts.
 function costLine(ev) {
-  const u = ev.usage || {}, read = (u.inputTokens || 0) + (u.cachedReadTokens || 0) + (u.cachedWriteTokens || 0);
+  const c = ev.cost, u = ev.usage || {};
   const parts = [];
-  if (Object.keys(u).length) {
+  if (c) {
+    const read = c.input + c.cache_write_5m + c.cache_write_1h + c.cache_read;
+    parts.push(`${k(read)} tokens read` + (c.cache_read ? ` (${k(c.cache_read)} from the cache)` : ""));
+    parts.push(`${k(c.output)} written`);
+    if (c.usd != null) parts.push(`≈ ${usd(c.usd)} at API prices${cacheNote(c)}`);
+  } else if (Object.keys(u).length) {
+    const read = (u.inputTokens || 0) + (u.cachedReadTokens || 0) + (u.cachedWriteTokens || 0);
     parts.push(`${k(read)} tokens read` + (u.cachedReadTokens ? ` (${k(u.cachedReadTokens)} from the cache)` : ""));
     if (u.outputTokens != null) parts.push(`${k(u.outputTokens)} written`);
   }

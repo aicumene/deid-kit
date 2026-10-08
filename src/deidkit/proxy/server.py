@@ -176,6 +176,9 @@ class Proxy:
         #: Called when the provider refuses the held key (401), so the program running the agent
         #: can tell its person at once: the agent itself retries for minutes before giving up.
         self.on_key_refused = None
+        #: Called after each answer of the Messages API with the model and the answer's `usage`, so
+        #: the program running the agent can count what a task cost (``count_tokens`` is no answer).
+        self.on_usage = None
 
     def scope(self, request: web.Request, body: dict) -> str | None:
         """The request's scope: its header, else the listed folder the agent works in, else the
@@ -305,8 +308,20 @@ class Proxy:
             target=target, pre_redacted=Redaction(text=sent, entity_types=kinds,
                                                   redacted_count=len(mapping)))
 
-    async def _relay(self, request: web.Request, up, restorer, scope: str) -> web.StreamResponse:
-        """Stream the upstream's events back through ``restorer``."""
+    def _report_usage(self, model: str, usage: dict | None) -> None:
+        """An answer's usage to ``on_usage``. Counting must never break an answer."""
+        if not usage or not self.on_usage:
+            return
+        try:
+            self.on_usage(model, usage)
+        except Exception:                                   # noqa: BLE001
+            log.exception("the answer's usage could not be counted")
+
+    async def _relay(self, request: web.Request, up, restorer, scope: str,
+                     usage: dict | None = None) -> web.StreamResponse:
+        """Stream the upstream's events back through ``restorer``; with ``usage``, collect the
+        answer's model and usage on the way (Messages API: ``message_start``, then ``message_delta``,
+        which carries the final counts)."""
         headers = {k: v for k, v in up.headers.items() if k.lower() not in _BACK_DROP}
         resp = web.StreamResponse(status=up.status, headers=headers)
         await resp.prepare(request)
@@ -321,6 +336,12 @@ class Proxy:
                 except ValueError:
                     await resp.write(sse.encode(name, data))
                     continue
+                if usage is not None and isinstance(obj, dict):
+                    if obj.get("type") == "message_start" and isinstance(obj.get("message"), dict):
+                        usage["model"] = obj["message"].get("model") or usage.get("model", "")
+                        usage.update(obj["message"].get("usage") or {})
+                    elif obj.get("type") == "message_delta" and isinstance(obj.get("usage"), dict):
+                        usage.update({k: v for k, v in obj["usage"].items() if v is not None})
                 for out_name, out_data in await restorer.event(name, obj):
                     await resp.write(sse.encode(out_name, out_data))
         except (ConnectionResetError, ClientConnectionResetError):
@@ -442,6 +463,7 @@ class Proxy:
                     except ValueError:
                         obj = None
                     if isinstance(obj, dict) and obj.get("type") == "message":
+                        self._report_usage(str(obj.get("model") or body.get("model") or ""), obj.get("usage"))
                         self._record({"dir": "in", "scope": scope, "body": obj})
                         obj = await restore_json_response(obj, engine, prep.mapping,
                                                           self.restore.restore_put,
@@ -451,7 +473,11 @@ class Proxy:
 
             restorer = StreamRestorer(engine, prep.mapping, self.restore.restore_put,
                                       self.cfg.local_tools, prep.spellings)
-            return await self._relay(request, up, restorer, scope)
+            collected: dict | None = None if counting else {}
+            resp = await self._relay(request, up, restorer, scope, collected)
+            if collected:
+                self._report_usage(str(collected.pop("model", "") or body.get("model") or ""), collected)
+            return resp
         finally:
             up.release()
 

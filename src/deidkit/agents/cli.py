@@ -68,9 +68,21 @@ def read_secrets(stream) -> dict:
     return given
 
 
-def agent_choices(agents: list[str], upstreams: list[str], unavailable: list[str]) -> list[AgentChoice]:
-    """The agents of ``--agent NAME=COMMAND``, in their order, with ``--agent-upstream NAME=URL`` and
-    ``--agent-unavailable NAME=REASON``; a name only in the last is listed after them."""
+def json_object(text: str, option: str) -> dict:
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        sys.exit(f"deid-agent: {option} expects a JSON object, not {text!r}")
+    return value
+
+
+def agent_choices(agents: list[str], upstreams: list[str], unavailable: list[str],
+                  metas: list[str] | None = None) -> list[AgentChoice]:
+    """The agents of ``--agent NAME=COMMAND``, in their order, with ``--agent-upstream NAME=URL``,
+    ``--agent-unavailable NAME=REASON`` and ``--agent-meta NAME=JSON``; a name only in
+    ``--agent-unavailable`` is listed after them."""
     def pairs(specs: list[str], option: str) -> list[tuple[str, str]]:
         out = []
         for spec in specs:
@@ -89,6 +101,10 @@ def agent_choices(agents: list[str], upstreams: list[str], unavailable: list[str
         choices[name].upstream = url.rstrip("/")
     for name, reason in pairs(unavailable, "--agent-unavailable"):
         choices.setdefault(name, AgentChoice(name=name)).unavailable = reason
+    for name, meta in pairs(metas or [], "--agent-meta"):
+        if name not in choices:
+            sys.exit(f"deid-agent: --agent-meta names no agent: {name}")
+        choices[name].meta = json_object(meta, "--agent-meta")
     return list(choices.values())
 
 
@@ -115,6 +131,11 @@ def main(argv: list[str] | None = None) -> None:
                          "(Messages API), with no key")
     ap.add_argument("--agent-unavailable", action="append", default=[], metavar="NAME=REASON",
                     help="the page lists that agent but cannot start it on this machine, and says why")
+    ap.add_argument("--agent-meta", action="append", default=[], metavar="NAME=JSON",
+                    help="that agent's own session options, sent as the session's _meta (the Claude "
+                         "adapter reads claudeCode.options: which tools Claude Code offers the model)")
+    ap.add_argument("--session-meta", metavar="JSON",
+                    help="the session's _meta for an agent that names none of its own")
     ap.add_argument("--style", metavar="CSS",
                     help="a stylesheet the page loads after its own: the look of the program that opens it")
     ap.add_argument("--claude-executable", default=shutil.which("claude"),
@@ -149,7 +170,9 @@ def main(argv: list[str] | None = None) -> None:
                      dev_login=args.dev_login, claude_executable=args.claude_executable,
                      port=args.port,
                      usage_log=Path(args.usage_log).expanduser() if args.usage_log else None,
-                     agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable),
+                     agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable,
+                                          args.agent_meta),
+                     session_meta=json_object(args.session_meta, "--session-meta") if args.session_meta else None,
                      style=Path(args.style).expanduser() if args.style else None)
     if cfg.agents and all(a.unavailable for a in cfg.agents):
         sys.exit("deid-agent: no agent can start here: "

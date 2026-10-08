@@ -72,8 +72,13 @@ class AcpAgent:
         })
         return self.agent_info
 
-    async def new_session(self, cwd: str) -> str:
-        result = await self.request("session/new", {"cwd": cwd, "mcpServers": []})
+    async def new_session(self, cwd: str, meta: dict | None = None) -> str:
+        """A session over `cwd`; `meta` goes as the request's `_meta` (an agent's own options — the
+        Claude adapter reads `claudeCode.options`, e.g. which tools Claude Code offers the model)."""
+        params: dict = {"cwd": cwd, "mcpServers": []}
+        if meta:
+            params["_meta"] = meta
+        result = await self.request("session/new", params)
         self.session_setup = result or {}
         return result["sessionId"]
 

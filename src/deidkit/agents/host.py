@@ -55,6 +55,7 @@ from pathlib import Path
 from aiohttp import web
 
 from deidkit.agents.acp import AcpAgent, agent_env
+from deidkit.agents.pricing import RequestUsage, task_cost
 from deidkit.proxy.server import Proxy
 
 log = logging.getLogger("deidkit.agents.host")
@@ -82,6 +83,8 @@ class AgentChoice:
     command: list[str] = field(default_factory=list)
     upstream: str | None = None
     unavailable: str | None = None
+    #: The session's `_meta` for this agent (``--agent-meta``): its own options.
+    meta: dict | None = None
 
 
 @dataclass
@@ -105,6 +108,8 @@ class HostConfig:
     #: A stylesheet the page loads after its own (``--style``): the look of the program that opens
     #: the page, which can then match its own windows. Not a secret, so served without the token.
     style: Path | None = None
+    #: The session's `_meta` when no agent of ``agents`` names its own (``--session-meta``).
+    session_meta: dict | None = None
 
 
 #: The token counts of ACP's draft ``PromptResponse.usage``; anything else in it is left out.
@@ -271,7 +276,9 @@ class AgentHost:
         self.agents = cfg.agents or [AgentChoice(name="", command=cfg.agent_command)]
         self.current = next((a for a in self.agents if not a.unavailable), self.agents[0])
         self.upstream = proxy.cfg.upstream           # for an agent without a server of its own
+        self.requests: list[RequestUsage] = []       # the model's answers in the task under way
         proxy.on_key_refused = self.key_refused
+        proxy.on_usage = self.answer_usage
 
     # ── events ───────────────────────────────────────────────────────────────
     def emit(self, event: dict) -> None:
@@ -360,7 +367,7 @@ class AgentHost:
                               on_update=self.on_update, on_permission=self.on_permission)
         try:
             info = await self.agent.start()
-            self.session_id = await self.agent.new_session(str(self.cfg.folder))
+            self.session_id = await self.agent.new_session(str(self.cfg.folder), choice.meta or self.cfg.session_meta)
             self.models = model_choice(self.agent.session_setup)
             if self.models:
                 self.emit({"kind": "models", **self.models})
@@ -448,25 +455,32 @@ class AgentHost:
         self.emit({"kind": "error", "text": text + " The key is wrong or revoked: replace it, "
                                                    "then open the agent again."})
 
+    def answer_usage(self, model: str, usage: dict) -> None:
+        """An answer of the model crossed the proxy: count it into the task under way."""
+        self.requests.append(RequestUsage.from_anthropic(usage, model))
+
     async def run_prompt(self, text: str) -> None:
         self.busy = True
         self.key_refused_told = False
+        self.requests = []
         self.emit({"kind": "user", "text": text})
         started = time.monotonic()
         try:
             result = await self.agent.prompt(self.session_id, text)
             usage = turn_usage(result)
             seconds = round(time.monotonic() - started, 1)
+            # What the task cost, from the answers the proxy saw: with the cache and without it.
+            cost = task_cost(self.requests) if self.requests else None
             self.emit({"kind": "turn_end", "stopReason": result.get("stopReason"),
-                       "usage": usage, "seconds": seconds})
-            self.count(result.get("stopReason"), usage, seconds)
+                       "usage": usage, "seconds": seconds, **({"cost": cost} if cost else {})})
+            self.count(result.get("stopReason"), usage, seconds, cost)
         except Exception as exc:                     # noqa: BLE001
             self.emit({"kind": "error", "text": f"The turn failed: {exc}"})
         finally:
             self.busy = False
             self.emit({"kind": "files", **self.changes()})
 
-    def count(self, stop_reason, usage: dict, seconds: float) -> None:
+    def count(self, stop_reason, usage: dict, seconds: float, cost: dict | None = None) -> None:
         """Add a finished task to the session's totals and to the usage log."""
         self.usage["tasks"] += 1
         for k, v in usage.items():
@@ -476,7 +490,7 @@ class AgentHost:
         line = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "scope": self.cfg.scope,
                 **({"agent": self.current.name} if len(self.agents) > 1 else {}),
                 "model": (self.models or {}).get("current"), "stopReason": stop_reason,
-                "seconds": seconds, "usage": usage}
+                "seconds": seconds, "usage": usage, **({"cost": cost} if cost else {})}
         try:
             _append_line(self.cfg.usage_log, line)
         except OSError:
