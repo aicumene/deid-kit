@@ -582,3 +582,22 @@ async def test_codex_reaches_openai_with_its_own_sign_in_while_the_host_holds_th
         await client.close()
         await upstream.close()
 
+
+async def test_an_agent_in_openais_shape_with_its_own_server_gets_its_responses_there(tmp_path):
+    agents = [AgentChoice("MatterAgent", [sys.executable, str(FAKE), "MatterAgent", "--wire", "responses"],
+                          upstream="http://127.0.0.1:9/"),
+              AgentChoice("Codex", [sys.executable, str(FAKE), "codex-acp"])]
+    assert agents[0].responses and agents[1].responses and not two_agents()[0].responses
+    assert AgentChoice("x", ["m", "--wire=responses"]).responses
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], dev_login=True, agents=agents)
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        assert host.proxy.cfg.upstream_openai == "http://127.0.0.1:9/v1"
+        assert host.proxy.cfg.upstream == "http://127.0.0.1:9"
+        await client.post("/deid-agent/api/agent", json={"value": "Codex"}, headers=headers)
+        await wait_for(lambda: host.status == "ready" and host.current.name == "Codex")
+        assert host.proxy.cfg.upstream_openai == "https://api.openai.com/v1"     # Codex goes to OpenAI again
+    finally:
+        await client.close()
+

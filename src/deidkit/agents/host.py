@@ -92,6 +92,14 @@ class AgentChoice:
         settings (:func:`~deidkit.agents.acp.codex_env`), not Claude's."""
         return any("codex-acp" in part for part in self.command)
 
+    @property
+    def responses(self) -> bool:
+        """It asks its model in OpenAI's shape (the Responses API): Codex, or an agent started with
+        ``--wire responses`` (matteragent). Its own ``upstream`` then answers ``/v1/responses``."""
+        wire = any(a == "--wire=responses" for a in self.command) or any(
+            a == "--wire" and b == "responses" for a, b in zip(self.command, self.command[1:]))
+        return self.codex or wire
+
 
 @dataclass
 class HostConfig:
@@ -284,6 +292,7 @@ class AgentHost:
         self.agents = cfg.agents or [AgentChoice(name="", command=cfg.agent_command)]
         self.current = next((a for a in self.agents if not a.unavailable), self.agents[0])
         self.upstream = proxy.cfg.upstream           # for an agent without a server of its own
+        self.upstream_openai = proxy.cfg.upstream_openai
         self.requests: list[RequestUsage] = []       # the model's answers in the task under way
         proxy.on_key_refused = self.key_refused
         proxy.on_usage = self.answer_usage
@@ -366,6 +375,9 @@ class AgentHost:
         # a server of the organization's own, which needs none — the key is for Anthropic.
         own_server = choice.upstream is not None
         self.proxy.cfg.upstream = (choice.upstream or self.upstream).rstrip("/")
+        # An agent in OpenAI's shape with a server of its own: its /v1/responses go there.
+        self.proxy.cfg.upstream_openai = choice.upstream.rstrip("/") + "/v1" if own_server and choice.responses \
+            else self.upstream_openai
         # Holding the key, the proxy lets only the stand-in through and strips other sign-ins: Codex,
         # on the person's own sign-in, would be refused. The key is Anthropic's; Codex goes without it.
         self.proxy.cfg.upstream_key = None if own_server or choice.codex else self.cfg.api_key

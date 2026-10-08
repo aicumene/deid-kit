@@ -42,7 +42,9 @@ from deidkit.proxy.spelling import spellings as _spellings
 
 #: Tools that act on the user's machine: their arguments get the real values back.
 LOCAL_TOOLS = frozenset({"exec_command", "write_stdin", "shell", "local_shell", "apply_patch",
-                         "update_plan", "view_image", "read_file", "list_dir", "grep_files"})
+                         "update_plan", "view_image", "read_file", "list_dir", "grep_files",
+                         # an agent in OpenAI's shape under Codex-style names (matteragent --wire responses)
+                         "write_file", "edit_file", "glob_files", "recall"})
 _UNTOUCHED = frozenset({"reasoning", "compaction", "compaction_summary", "additional_tools",
                         "web_search_call", "item_reference", "image_generation_call",
                         "tool_search_call", "tool_search_output"})
