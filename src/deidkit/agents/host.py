@@ -378,11 +378,12 @@ class AgentHost:
         # An agent in OpenAI's shape with a server of its own: its /v1/responses go there.
         self.proxy.cfg.upstream_openai = choice.upstream.rstrip("/") + "/v1" if own_server and choice.responses \
             else self.upstream_openai
-        # Holding the key, the proxy lets only the stand-in through and strips other sign-ins: Codex,
-        # on the person's own sign-in, would be refused. The key is Anthropic's; Codex goes without it.
-        self.proxy.cfg.upstream_key = None if own_server or choice.codex else self.cfg.api_key
-        # The organization's key is Anthropic's: Codex goes with the person's own sign-in.
-        lend = bool(self.cfg.api_key) and not own_server and not choice.codex
+        # Holding the key, the proxy lets only the stand-in through, toward Anthropic only, and strips
+        # other sign-ins: an agent in OpenAI's shape (Codex on the person's own sign-in, matteragent
+        # --wire responses) would be refused. The key is Anthropic's; they go without it.
+        self.proxy.cfg.upstream_key = None if own_server or choice.responses else self.cfg.api_key
+        # The organization's key is Anthropic's: an agent in OpenAI's shape is not lent it.
+        lend = bool(self.cfg.api_key) and not own_server and not choice.responses
         if choice.codex:
             extra = codex_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
                               codex_path=self.cfg.codex_executable)
