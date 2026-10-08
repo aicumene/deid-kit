@@ -14,6 +14,7 @@ pytest.importorskip("aiohttp")
 from aiohttp.test_utils import TestClient, TestServer       # noqa: E402
 
 from deidkit.agents.host import AgentChoice, AgentHost, HostConfig, model_choice  # noqa: E402
+from deidkit.patterns import RegexDetector                  # noqa: E402
 from deidkit.proxy.server import Proxy, ProxyConfig         # noqa: E402
 from deidkit.store import InMemoryTokenStore                # noqa: E402
 
@@ -545,4 +546,39 @@ def test_the_persons_codex_comes_from_the_command_line(tmp_path, monkeypatch):
               "--audit", str(tmp_path / "a.jsonl"), "--agent", "Codex=/x/codex-acp",
               "--codex-executable", "/Applications/Some.app/codex"])
     assert seen[0].codex_executable == "/Applications/Some.app/codex" and seen[0].agents[0].codex
+
+
+async def test_codex_reaches_openai_with_its_own_sign_in_while_the_host_holds_the_organizations_key(tmp_path):
+    # MEASURED 08.10.2026, in review: holding the key, the proxy refused every request without the
+    # stand-in (401) and stripped Authorization — Codex on a ChatGPT sign-in could not answer at all.
+    from aiohttp import web
+    from test_proxy_openai import HEADERS, Backend, request, seeds
+    backend = Backend()
+    app = web.Application()
+    app.router.add_post("/codex/responses", backend.responses)
+    upstream = TestServer(app)
+    await upstream.start_server()
+    agents = [AgentChoice("Claude Code", [sys.executable, str(FAKE), "Claude Code"]),
+              AgentChoice("Codex", [sys.executable, str(FAKE), "codex-acp"])]
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], api_key="sk-org", agents=agents)
+    proxy_cfg = ProxyConfig(default_scope="case-1", upstream_chatgpt=str(upstream.make_url("/codex")),
+                            detector=RegexDetector(), seeds=seeds())
+    host, client = await started(cfg, proxy_cfg)
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        assert host.proxy.cfg.upstream_key == "sk-org"          # Claude Code works first, with the key
+        r = await client.post("/deid-agent/api/agent", json={"value": "Codex"}, headers=headers)
+        assert r.status == 202
+        await wait_for(lambda: host.status == "ready")
+        assert host.proxy.cfg.upstream_key is None
+        r = await client.post("/v1/responses", json=request(), headers=HEADERS)
+        assert r.status == 200
+        await r.read()
+        assert backend.headers[0]["Authorization"] == "Bearer t"
+        r = await client.post("/deid-agent/api/agent", json={"value": "Claude Code"}, headers=headers)
+        await wait_for(lambda: host.status == "ready")
+        assert host.proxy.cfg.upstream_key == "sk-org"          # and the key is back for Claude Code
+    finally:
+        await client.close()
+        await upstream.close()
 

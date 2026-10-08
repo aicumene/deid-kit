@@ -366,7 +366,9 @@ class AgentHost:
         # a server of the organization's own, which needs none — the key is for Anthropic.
         own_server = choice.upstream is not None
         self.proxy.cfg.upstream = (choice.upstream or self.upstream).rstrip("/")
-        self.proxy.cfg.upstream_key = None if own_server else self.cfg.api_key
+        # Holding the key, the proxy lets only the stand-in through and strips other sign-ins: Codex,
+        # on the person's own sign-in, would be refused. The key is Anthropic's; Codex goes without it.
+        self.proxy.cfg.upstream_key = None if own_server or choice.codex else self.cfg.api_key
         # The organization's key is Anthropic's: Codex goes with the person's own sign-in.
         lend = bool(self.cfg.api_key) and not own_server and not choice.codex
         if choice.codex:
