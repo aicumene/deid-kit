@@ -314,12 +314,13 @@ async def test_the_page_switches_agents_between_tasks(tmp_path):
         state = await (await client.get("/deid-agent/api/state", headers=headers)).json()
         assert state["agents"] == {"current": "Claude Code", "options": [
             {"value": "Claude Code", "name": "Claude Code"}, {"value": "MatterAgent", "name": "MatterAgent"}]}
+        assert state["handover"] is None
         first = host.agent
 
         r = await client.post("/deid-agent/api/agent", json={"value": "MatterAgent"}, headers=headers)
         assert r.status == 202
         await wait_for(lambda: host.status == "ready" and host.agent is not first)
-        assert first.proc.returncode is not None                       # the other one stopped
+        assert first.proc.returncode is None                           # the other one keeps its seat
         assert host.current.name == "MatterAgent" and host.models["current"] == "default"
         kinds = [e["kind"] for e in host.events]
         assert kinds.count("agents") == 2 and {"kind": "models", "options": []} in \
@@ -330,17 +331,173 @@ async def test_the_page_switches_agents_between_tasks(tmp_path):
         await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))
         assert "[MatterAgent] Working on it" in "".join(e["text"] for e in host.events if e["kind"] == "message")
         busy = await client.post("/deid-agent/api/agent", json={"value": "Claude Code"}, headers=headers)
-        assert busy.status == 409 and host.current.name == "MatterAgent"
+        assert busy.status == 409 and host.current.name == "MatterAgent"   # a switch is between tasks…
+        assert "hand the task over" in (await busy.json())["error"]          # …or a handover
         ask = next(e for e in host.events if e["kind"] == "permission")
         await client.post("/deid-agent/api/permission", json={"id": ask["id"], "optionId": "reject"},
                           headers=headers)
         await wait_for(lambda: not host.busy)
+        done = next(e for e in host.events if e["kind"] == "permission_done" and e["id"] == ask["id"])
+        assert done["outcome"] == "refused"
+
+        # back to the first: the same process and session, at once
+        r = await client.post("/deid-agent/api/agent", json={"value": "Claude Code"}, headers=headers)
+        assert r.status == 202 and host.agent is first and host.status == "ready"
 
         unknown = await client.post("/deid-agent/api/agent", json={"value": "Codex"}, headers=headers)
         assert unknown.status == 400
         assert (await client.post("/deid-agent/api/agent", json={"value": "Claude Code"})).status == 401
     finally:
         await client.close()
+
+
+def echoing_agents():
+    """Two scripted agents that say which turn of their session it is and what their prompt held."""
+    return [AgentChoice("Claude Code", [sys.executable, str(FAKE), "Claude Code", "echo-prompt"]),
+            AgentChoice("Codex", [sys.executable, str(FAKE), "Codex", "echo-prompt"])]
+
+
+def said(host, after=0):
+    return "".join(e["text"] for e in host.events[after:] if e["kind"] == "message")
+
+
+def prompt_of(text: str) -> list[str]:
+    """The prompt's text blocks, as the scripted agent echoed them (the first echo in ``text``)."""
+    return json.JSONDecoder().raw_decode(text.split("[prompt ", 1)[1])[0]
+
+
+async def answer_all(client, host, headers, option="allow"):
+    """Answer the asks of the task under way until it ends."""
+    answered = set()
+    while host.busy or host.handover is not None:
+        for e in [e for e in host.events if e["kind"] == "permission" and e["id"] not in answered]:
+            answered.add(e["id"])
+            await client.post("/deid-agent/api/permission", json={"id": e["id"], "optionId": option}, headers=headers)
+        await asyncio.sleep(0.02)
+
+
+async def test_an_agent_picked_again_goes_on_in_its_session_told_only_what_it_has_not_seen(tmp_path):
+    """Caching and the separation of contexts: the agent that worked keeps its session; the other is told,
+    in a brief at the head of its prompt, the work it has not seen — the asks, what was said and done, how
+    it ended — and not what it has; nobody's reasoning goes across."""
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], dev_login=True,
+                     agents=echoing_agents())
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        claude = host.agent
+        await client.post("/deid-agent/api/prompt", json={"text": "Draft a reply to the landlord"}, headers=headers)
+        await wait_for(lambda: host.busy)
+        await answer_all(client, host, headers)
+        host.emit({"kind": "thought", "text": "SECRET REASONING of the first model"})
+        first = prompt_of(said(host))
+        assert first == ["Draft a reply to the landlord"]                   # nothing to tell at first
+
+        await client.post("/deid-agent/api/agent", json={"value": "Codex"}, headers=headers)
+        await wait_for(lambda: host.status == "ready" and host.current.name == "Codex")
+        mark = len(host.events)
+        await client.post("/deid-agent/api/prompt", json={"text": "Now check the draft"}, headers=headers)
+        await wait_for(lambda: host.busy)
+        await answer_all(client, host, headers, option="reject")
+        told, task = prompt_of(said(host, mark))
+        assert "[turn 1]" in said(host, mark) and task == "Now check the draft"
+        assert "Task 1 — the person asked Claude Code: Draft a reply to the landlord" in told
+        assert "Claude Code said: [Claude Code]" in told and "· Write draft.md — done" in told
+        assert "the person allowed it" in told and "Ended: finished." in told
+        assert "draft.md (new)" in told and "SECRET REASONING" not in told
+        shown = next(e for e in host.events[mark:] if e["kind"] == "brief")
+        assert shown == {**shown, "agent": "Codex", "text": told}            # the page shows what was told
+
+        # back to Claude Code: its own session goes on (its second turn), told only Codex's task
+        await client.post("/deid-agent/api/agent", json={"value": "Claude Code"}, headers=headers)
+        await wait_for(lambda: host.status == "ready" and host.current.name == "Claude Code")
+        assert host.agent is claude
+        mark = len(host.events)
+        await client.post("/deid-agent/api/prompt", json={"text": "Send it"}, headers=headers)
+        await wait_for(lambda: host.busy)
+        await answer_all(client, host, headers)
+        text = said(host, mark)
+        told, task = prompt_of(text)
+        assert "[turn 2]" in text and task == "Send it"
+        # only Codex's task: the one it did itself it is not told (an agent's words may quote anything)
+        assert [l for l in told.splitlines() if l.startswith("Task ")] == \
+            ["Task 1 — the person asked Codex: Now check the draft"]
+        assert "the person refused it" in told
+
+        # a task with no switch before it carries no brief
+        mark = len(host.events)
+        await client.post("/deid-agent/api/prompt", json={"text": "Thanks"}, headers=headers)
+        await wait_for(lambda: host.busy)
+        await answer_all(client, host, headers)
+        assert prompt_of(said(host, mark)) == ["Thanks"]
+        assert not any(e["kind"] == "brief" for e in host.events[mark:])
+    finally:
+        await client.close()
+
+
+async def test_a_task_under_way_is_handed_over_and_carried_on(tmp_path):
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], dev_login=True,
+                     agents=echoing_agents())
+    host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
+    headers = {"x-deid-agent-token": cfg.token}
+    try:
+        claude = host.agent
+        await client.post("/deid-agent/api/prompt", json={"text": "Draft a reply to the landlord"}, headers=headers)
+        await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))     # it waits on the person
+        ask = next(e for e in host.events if e["kind"] == "permission")
+
+        # the chat's switch (no handover) is refused while it works; the person's handover is not
+        assert (await client.post("/deid-agent/api/agent", json={"value": "Codex"}, headers=headers)).status == 409
+        r = await client.post("/deid-agent/api/agent", json={"value": "Codex", "handover": True}, headers=headers)
+        assert r.status == 202 and (await r.json())["handover"] == "Codex"
+        state = await (await client.get("/deid-agent/api/state", headers=headers)).json()
+        assert state["handover"] == "Codex"
+        assert (await client.post("/deid-agent/api/prompt", json={"text": "x"}, headers=headers)).status == 409
+
+        await wait_for(lambda: any(e["kind"] == "handover" for e in host.events))
+        assert next(e for e in host.events if e["kind"] == "permission_done" and e["id"] == ask["id"])["outcome"] \
+            == "cancelled"
+        ended = [e for e in host.events if e["kind"] == "turn_end"]
+        assert ended[0]["stopReason"] == "cancelled"
+        assert claude.proc.returncode is None                                # it keeps its session
+        handed = next(e for e in host.events if e["kind"] == "handover")
+        assert handed == {**handed, "from": "Claude Code", "to": "Codex"}
+
+        await wait_for(lambda: "[Codex]" in said(host))
+        mark = next(i for i, e in enumerate(host.events) if e["kind"] == "handover")
+        told, carry = prompt_of(said(host, mark))
+        assert "Task 1 — the person asked Claude Code: Draft a reply to the landlord" in told
+        assert "· Write draft.md — failed" in told and "did not answer before it stopped" in told
+        assert "Ended: stopped so that the person could hand the task over." in told
+        assert "Then the person handed the task to you." in told and "Handing the task over" not in told
+        assert carry.startswith("The person has handed you the last task above, which Claude Code was doing")
+        assert not any(e["kind"] == "user" for e in host.events[mark:])        # the person gave no new task
+        await answer_all(client, host, headers)
+        assert host.current.name == "Codex" and not host.busy
+    finally:
+        await client.close()
+
+
+def test_a_brief_is_the_same_for_the_same_work_and_carries_no_reasoning():
+    from deidkit.agents.host import BRIEF_SAID, BRIEF_STEPS, brief
+    events = [{"kind": "agents"}, {"kind": "user", "text": "Review the lease", "agent": "Claude Code"},
+              {"kind": "thought", "text": "the model's own reasoning"},
+              {"kind": "message", "text": "I will read "}, {"kind": "message", "text": "the lease."},
+              *[{"kind": "tool", "id": f"r{i}", "title": f"Read part {i}", "status": "pending"} for i in range(50)],
+              *[{"kind": "tool_update", "id": f"r{i}", "status": "completed"} for i in range(49)],
+              {"kind": "message", "text": "x" * (BRIEF_SAID + 500) + " THE END"},
+              {"kind": "usage", "used": 9000, "size": 32768},
+              {"kind": "turn_end", "stopReason": "end_turn", "seconds": 12.5, "cost": {"usd": 0.31}},
+              {"kind": "files", "changed": ["lease.md"], "added": [], "removed": []}]
+    text = brief(events, "Codex")
+    assert text == brief(list(events), "Codex")                            # the same work, the same words
+    assert "reasoning" not in text.replace("Their reasoning", "") and "12.5" not in text and "0.31" not in text
+    assert "Claude Code said: I will read the lease." in text and text.count("Claude Code said:") == 2
+    assert "THE END" in text and "x" * (BRIEF_SAID + 1) not in text      # an agent's words: their end
+    assert f"({50 - BRIEF_STEPS} earlier steps not listed)" in text and "· Read part 49 — not finished" in text
+    assert "Read part 0 —" not in text and "lease.md (changed)" in text
+    assert text.endswith("The person's new task follows; the work above is what came before it.")
+    assert brief([{"kind": "agents"}, {"kind": "status", "status": "ready"}], "Codex") is None
 
 
 async def test_an_agent_with_its_own_server_gets_no_key_and_its_requests_go_there(tmp_path):

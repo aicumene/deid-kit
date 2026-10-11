@@ -124,8 +124,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--port", type=int, default=8790)
     ap.add_argument("--agent-command", default=DEFAULT_AGENT, help="the ACP agent to start")
     ap.add_argument("--agent", action="append", default=[], metavar="NAME=COMMAND",
-                    help="an agent the page switches to, between tasks (repeat for each; the first "
-                         "that can start works first); instead of --agent-command")
+                    help="an agent the page switches to (repeat for each; the first that can start "
+                         "works first); each keeps its session, and a task under way can be handed "
+                         "over; instead of --agent-command")
     ap.add_argument("--agent-upstream", action="append", default=[], metavar="NAME=URL",
                     help="that agent's model requests go to this server of the organization's own "
                          "(Messages API), with no key")

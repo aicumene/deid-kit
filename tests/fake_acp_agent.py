@@ -4,7 +4,9 @@
 a path outside it, and writes the file when allowed. It offers two models as a config option and
 names the one it works on in its answer. It reports its window (usage_update) and what the turn
 cost (usage on its answer), as ACP has them. Given a name (its first argument), it says it in its
-answer: the tests that switch agents tell them apart by it."""
+answer: the tests that switch agents tell them apart by it. A ``session/cancel`` ends the turn at its
+next step with ``cancelled``. With ``echo-prompt`` among its arguments it also says which turn of its
+session this is and the text blocks of the prompt it was given."""
 
 import json
 import os
@@ -28,12 +30,20 @@ def send(msg):
     sys.stdout.flush()
 
 
+cancelled = False
+turns = 0
+ECHO = "echo-prompt" in sys.argv[2:]
+
+
 def ask(method, params):
-    global next_id
+    global next_id, cancelled
     next_id += 1
     send({"jsonrpc": "2.0", "id": next_id, "method": method, "params": params})
     while True:
         msg = json.loads(sys.stdin.readline())
+        if msg.get("method") == "session/cancel":
+            cancelled = True
+            continue
         if msg.get("id") == next_id and "result" in msg:
             return msg["result"]
 
@@ -57,6 +67,9 @@ mcp = None
 for line in sys.stdin:
     msg = json.loads(line)
     method, params, rid = msg.get("method"), msg.get("params") or {}, msg.get("id")
+    if method == "session/cancel":
+        cancelled = True                         # between turns: nothing to stop
+        continue
     if method == "initialize":
         send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentInfo": {"name": NAME or "fake"}}})
     elif method == "session/new":
@@ -71,7 +84,11 @@ for line in sys.stdin:
         else:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "invalid value"}})
     elif method == "session/prompt":
+        cancelled = False
+        turns += 1
         said = (f"[{NAME}] " if NAME else "") + (f"[meta {json.dumps(meta, sort_keys=True)}] " if meta else "")
+        if ECHO:
+            said += f"[turn {turns}] [prompt {json.dumps([b.get('text') for b in params.get('prompt') or []])}] "
         if mcp:
             said += f"[mcp {json.dumps(mcp, sort_keys=True)}] "
         if sys.argv[2:]:
@@ -90,6 +107,10 @@ for line in sys.stdin:
         update("s1", {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Write draft.md",
                       "kind": "edit", "status": "pending", "locations": [{"path": target}]})
         first = permission("s1", "t1", "Write draft.md", target)
+        if cancelled:
+            update("s1", {"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "failed"})
+            send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})
+            continue
         if first == "allow":
             with open(target, "w") as fh:
                 fh.write("Draft for the client.\n")

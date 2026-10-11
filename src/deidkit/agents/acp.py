@@ -97,9 +97,11 @@ class AcpAgent:
         ``models`` block instead of config options."""
         await self.request("session/set_model", {"sessionId": session_id, "modelId": model_id})
 
-    async def prompt(self, session_id: str, text: str) -> dict:
+    async def prompt(self, session_id: str, text: str | list[str]) -> dict:
+        """A prompt of one text block, or of several in order (a brief of the work, then the task)."""
+        blocks = [text] if isinstance(text, str) else list(text)
         return await self.request("session/prompt", {
-            "sessionId": session_id, "prompt": [{"type": "text", "text": text}]})
+            "sessionId": session_id, "prompt": [{"type": "text", "text": t} for t in blocks]})
 
     async def cancel(self, session_id: str) -> None:
         await self._send({"jsonrpc": "2.0", "method": "session/cancel",

@@ -115,12 +115,27 @@ enable_request_compression = false
   `{"tools": ["Read", "Write", "Edit", "Bash"], "strictMcpConfig": true}`: only the tools a matter
   needs, and no MCP servers of the person's own (claude.ai connectors included).
 - **More than one agent.** `--agent NAME=COMMAND`, repeated, lists the agents the page offers,
-  instead of `--agent-command`; the first that can start works first. The person switches between
-  tasks, and the agent picked starts over the same folder in a new session: it does not see the
-  earlier tasks, which stay on the page. `--agent-upstream NAME=URL` sends that agent's model
-  requests to a server of the organization's own (the Messages API) and gives it no key, since the
-  organization's key is for Anthropic. `--agent-unavailable NAME=REASON` lists an agent that cannot
-  start on this machine, and why, without offering it. The usage line names the agent.
+  instead of `--agent-command`; the first that can start works first. `--agent-upstream NAME=URL`
+  sends that agent's model requests to a server of the organization's own (the Messages API) and
+  gives it no key, since the organization's key is for Anthropic. `--agent-unavailable NAME=REASON`
+  lists an agent that cannot start on this machine, and why, without offering it. The usage line
+  names the agent.
+- **Switching keeps the work.** Each agent the person has worked with keeps its process and session
+  while another works. Picked again between tasks, it goes on in the same session — its context as
+  it was, and its model's prompt cache with it, since the context is only ever added to — and the
+  work done meanwhile by the others comes as a brief at the head of its next prompt: only what it has
+  not seen, in the same words for the same work (no times, counts or costs in it), so a brief does
+  not unsettle the cache. During a task the person can hand the task over (`POST
+  /deid-agent/api/agent` with `"handover": true`; the page asks first): the step under way stops —
+  `session/cancel`, the asks it waits on answered as cancelled, an agent that does not stop within
+  30 s stopped — and the one picked carries the task on in its own session, told what was done.
+  Without `handover`, as the desktop's chat asks, a switch during a task is refused.
+- **Contexts stay apart.** A brief is made from the record the person sees on the page — what was
+  asked, what each agent said, its steps and how each ended, the person's answers to its asks, the
+  documents changed — never from an agent's context: not its model's reasoning, not what it read.
+  The agent told reads again what it needs, under its own permissions. The brief goes in that
+  agent's prompt, so through the proxy like all it sends: its model sees tokens in it, not names.
+  The page shows each brief as it was given.
 - **Sub-agents on the organization's own servers.** `--subagents HOSTS` (matteragent's hosts file)
   hands the narrow jobs of a task — read, find, extract, calc, check, and consult where a head model
   answers — to sub-agents next to the folder, on models the organization runs; every quote in their

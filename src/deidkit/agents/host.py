@@ -29,6 +29,22 @@ it would run — is refused without asking.
 between tasks, through the agent (``session/set_config_option``). Every model the agent offers goes
 through the same proxy.
 
+**Agents switch without losing the work** (``--agent``, several). Each agent the person has worked with
+keeps its own process and session (:class:`Seat`) while another works: picked again, it goes on in the
+same session, its context as it was — and its model's prompt cache with it, since the context is only
+ever added to. What it has not seen, done meanwhile by the others, it is told in a brief at the head of
+its next prompt (:func:`brief`): only the part since it last took part, and the same words for the same
+work, so that a brief does not unsettle what the cache holds. A task under way can be handed over too:
+the step under way stops (``session/cancel``, the asks it waits on answered as cancelled), and the one
+picked carries the task on in its own session, told what was done.
+
+**Contexts stay apart.** No agent's context is copied into another's: a brief is made by the host from
+the record the person sees — the tasks, what the agents said, the steps they took and how each ended,
+the person's answers to their asks, the documents changed — and not from what an agent read or how its
+model reasoned; the one told reads again what it needs, under its own permissions. It goes in that
+agent's prompt, and so through the proxy like everything else the agent sends: the model sees tokens
+in it, never the names. The page shows each brief as it was given.
+
 **What a task cost** is taken as ACP carries it: the agent's ``usage_update`` (the tokens now in its
 window, and the window's size) is shown as it comes, and the turn's tokens on the answer to
 ``session/prompt`` (``usage``, ACP's End-Turn Token Usage draft; ``_meta.usage`` too) are shown
@@ -352,29 +368,217 @@ def _shebang_python(program: str) -> str | None:
     return None
 
 
+#: How much of the work a brief carries: of an agent's words in one run of a task, the end (where the
+#: answer is); of a task's text, the start; of a run's steps, the latest; and the whole brief, the older
+#: tasks shortened first.
+BRIEF_SAID = 1500
+BRIEF_TASK = 3000
+BRIEF_STEPS = 40
+BRIEF_CHARS = 24000
+
+_ENDED = {"end_turn": "finished", "cancelled": "stopped by the person", "refusal": "refused by the agent",
+          "max_tokens": "stopped: its reply ran out of room", "max_turn_requests": "stopped: it ran out of steps"}
+_STEP = {"completed": "done", "failed": "failed"}
+_ANSWER = {"allowed": "allowed it", "refused": "refused it", "cancelled": "did not answer before it stopped"}
+
+#: What an agent is told when the person hands it a task under way, after the brief.
+CARRY_ON = ("The person has handed you the last task above, which {previous} was doing and did not finish. "
+            "Carry it on from where it stopped: the documents are as {previous} left them. Read again "
+            "whatever you need, and finish the task as the person asked it.")
+
+
+def _clip_end(text: str, n: int) -> str:
+    text = text.strip()
+    return text if len(text) <= n else "…" + text[-n:].lstrip()
+
+
+def _clip_start(text: str, n: int) -> str:
+    text = text.strip()
+    return text if len(text) <= n else text[:n].rstrip() + "…"
+
+
+def brief(events: list[dict], me: str, *, carrying_on: bool = False) -> str | None:
+    """What an agent is told of work on the matter that is not in its own context: the tasks and their runs
+    in ``events`` — the page's record since it last took part — as the person saw them. What was asked,
+    what each agent said, the steps it took and how each ended, the person's answers to its asks, how each
+    run ended, and the documents changed. Not the agents' reasoning and not what they read: one agent's
+    context is not copied into another's. The same events give the same text, with nothing of time or cost
+    in it, so a brief does not unsettle a prompt cache. ``carrying_on``: the agent takes the last task over
+    (:data:`CARRY_ON` follows); otherwise the person's next task follows. None when there is no work."""
+    tasks: list[dict] = []
+    task = run = None
+    perms: dict[str, str] = {}
+    files = None
+
+    def new_run(agent: str, **extra) -> dict:
+        r = {"agent": agent, "items": [], "steps": {}, "plan": None, "end": None, **extra}
+        task["runs"].append(r)
+        return r
+
+    for e in events:
+        kind = e.get("kind")
+        if kind == "files":
+            files = e
+            continue
+        if kind == "user":
+            task = {"text": e.get("text", ""), "runs": []}
+            tasks.append(task)
+            run = new_run(e.get("agent") or "the agent")
+            continue
+        if kind == "handover":
+            if task is None:                        # the task under way when this agent left it
+                task = {"text": None, "runs": []}
+                tasks.append(task)
+            run = new_run(e.get("to") or "another agent", taken_from=e.get("from"))
+            continue
+        if run is None:
+            continue
+        items = run["items"]
+        if kind == "message":
+            if items and items[-1][0] == "said":
+                items[-1] = ("said", items[-1][1] + e.get("text", ""))
+            else:
+                items.append(("said", e.get("text", "")))
+        elif kind == "tool":
+            sid = e.get("id") or f"#{len(run['steps'])}"
+            run["steps"][sid] = {"title": e.get("title") or e.get("tool") or "a step",
+                                 "status": e.get("status") or "pending"}
+            items.append(("step", sid))
+        elif kind == "tool_update":
+            step = run["steps"].get(e.get("id"))
+            if step is not None:
+                step["status"] = e.get("status") or step["status"]
+                step["title"] = e.get("title") or step["title"]
+        elif kind == "plan":
+            run["plan"] = e.get("entries") or []
+        elif kind == "permission":
+            perms[e.get("id", "")] = e.get("title") or "an action"
+        elif kind == "permission_done" and e.get("id") in perms and e.get("outcome") in _ANSWER:
+            items.append(("line", f"It asked to: {perms[e['id']]} — the person {_ANSWER[e['outcome']]}."))
+        elif kind == "notice" and not e.get("handing"):          # the handover is told as how the run ended
+            items.append(("line", e.get("text", "")))
+        elif kind == "error":
+            items.append(("line", "Error: " + e.get("text", "")))
+        elif kind == "turn_end":
+            run["end"] = e.get("stopReason")
+
+    def render(task: dict, number: int, whole: bool) -> list[str]:
+        if task["text"] is None:
+            out = ["The task you were doing when it was handed over:"]
+        else:
+            first = task["runs"][0]["agent"] if task["runs"] else "the agent"
+            out = [f"Task {number} — the person asked {'you' if first == me else first}: "
+                   f"{_clip_start(task['text'], BRIEF_TASK)}"]
+        runs = task["runs"]
+        for i, r in enumerate(runs):
+            who = "you" if r["agent"] == me else r["agent"]
+            if r.get("taken_from") is not None:
+                gave = "you" if r["taken_from"] == me else r["taken_from"]
+                out.append(f"  Then the person handed the task to {who}." if who == "you" and not r["items"]
+                           else f"  {who[:1].upper() + who[1:]} took the task over from {gave}.")
+            if whole:
+                steps = [x for x in r["items"] if x[0] == "step"]
+                skip = max(0, len(steps) - BRIEF_STEPS)
+                if skip:
+                    out.append(f"  ({skip} earlier steps not listed)")
+                for kind, value in r["items"]:
+                    if kind == "said":
+                        if value.strip():
+                            out.append(f"  {who[:1].upper() + who[1:]} said: {_clip_end(value, BRIEF_SAID)}")
+                    elif kind == "step":
+                        if skip:
+                            skip -= 1
+                            continue
+                        st = r["steps"][value]
+                        out.append(f"  · {st['title']} — {_STEP.get(st['status'], 'not finished')}")
+                    else:
+                        out.append(f"  {value}")
+                if r["plan"]:
+                    out.append("  Plan: " + "; ".join(("✓ " if p.get("status") == "completed" else "• ")
+                                                      + str(p.get("content", "")) for p in r["plan"]))
+            if r["end"] is not None:
+                handed = i + 1 < len(runs) and runs[i + 1].get("taken_from") is not None
+                ended = (f"stopped so that the person could hand the task over"
+                         if handed and r["end"] == "cancelled" else _ENDED.get(r["end"], str(r["end"])))
+                out.append(f"  Ended: {ended}.")
+        return out
+
+    if not any(r["items"] or r["end"] is not None for t in tasks for r in t["runs"]):
+        return None
+    head = ("The work on this matter that you have not seen — done while another agent worked on it — as the "
+            "person saw it: what was asked, what each agent said and did, and how it ended. Their reasoning "
+            "and what they read are not part of it: read again whatever you need.")
+    tail = [("The person's new task follows; the work above is what came before it." if not carrying_on else "")]
+    if files:
+        parts = [f"{p} (changed)" for p in files.get("changed") or []] +                 [f"{p} (new)" for p in files.get("added") or []] + [f"{p} (removed)" for p in files.get("removed") or []]
+        if parts:
+            tail.insert(0, "Documents changed since the session began: " + ", ".join(parts) + ".")
+    numbered = [(t, sum(1 for x in tasks[:i + 1] if x["text"] is not None)) for i, t in enumerate(tasks)]
+    # whole, then the older tasks shortened to their ask and how they ended until it fits
+    for shortened in range(len(tasks) + 1):
+        lines = [head, ""]
+        for i, (t, n) in enumerate(numbered):
+            lines += render(t, n, whole=i >= shortened) + [""]
+        text = "\n".join(lines + [x for x in tail if x]).strip()
+        if len(text) <= BRIEF_CHARS:
+            return text
+    return "…" + text[-BRIEF_CHARS:]
+
+
+@dataclass
+class Seat:
+    """An agent of the page with its own process and session, kept while the person works with another:
+    picked again, it goes on in the same session — its context as it was, and its model's prompt cache
+    with it — told only what was done since it last took part."""
+    choice: AgentChoice
+    agent: AcpAgent | None = None
+    session_id: str | None = None
+    models: dict | None = None
+    context: dict | None = None                  # its last usage_update
+    #: The page's events before this index are in its context: its own work, or told in a brief.
+    seen: int = 0
+    #: Its confined Codex's profile and wrapper, while it runs.
+    codex_dir: str | None = None
+
+    @property
+    def alive(self) -> bool:
+        return bool(self.agent and self.session_id and self.agent.proc and self.agent.proc.returncode is None)
+
+
 class AgentHost:
     def __init__(self, cfg: HostConfig, proxy: Proxy) -> None:
         self.cfg = cfg
         self.proxy = proxy
-        self.agent: AcpAgent | None = None
-        self.session_id: str | None = None
         self.events: list[dict] = []
         self.listeners: set[asyncio.Queue] = set()
         self.permissions: dict[str, asyncio.Future] = {}
         self.busy = False
         self.baseline = snapshot(cfg.folder)
         self.status = "starting"
-        self.models: dict | None = None
         self.key_refused_told = False
-        self.context: dict | None = None             # the agent's last usage_update
         self.usage: dict = {"tasks": 0}              # the session's tokens, summed per field
         self.agents = cfg.agents or [AgentChoice(name="", command=cfg.agent_command)]
         self.current = next((a for a in self.agents if not a.unavailable), self.agents[0])
+        #: Each agent the person has worked with, by name: its process and session, kept.
+        self.seats: dict[str, Seat] = {}
+        #: The agent the task under way goes to once the one working has stopped (the person handed it over).
+        self.handover: AgentChoice | None = None
         self.upstream = proxy.cfg.upstream           # for an agent without a server of its own
         self.upstream_openai = proxy.cfg.upstream_openai
         self.requests: list[RequestUsage] = []       # the model's answers in the task under way
         proxy.on_key_refused = self.key_refused
         proxy.on_usage = self.answer_usage
+
+    @property
+    def seat(self) -> Seat:
+        """The seat of the agent at work."""
+        return self.seats.setdefault(self.current.name, Seat(self.current))
+
+    # The agent at work's process, session, models and window, as the rest of the host reads them.
+    agent = property(lambda self: self.seat.agent, lambda self, v: setattr(self.seat, "agent", v))
+    session_id = property(lambda self: self.seat.session_id, lambda self, v: setattr(self.seat, "session_id", v))
+    models = property(lambda self: self.seat.models, lambda self, v: setattr(self.seat, "models", v))
+    context = property(lambda self: self.seat.context, lambda self, v: setattr(self.seat, "context", v))
 
     # ── events ───────────────────────────────────────────────────────────────
     def emit(self, event: dict) -> None:
@@ -432,8 +636,57 @@ class AgentHost:
                              **({"unavailable": a.unavailable} if a.unavailable else {})}
                             for a in self.agents]}
 
+    def route(self, choice: AgentChoice) -> bool:
+        """Point the proxy at ``choice``'s model: where its requests go, whether the organization's key goes
+        with them, which tool namespaces leave its requests. Routed again at every switch — the agents kept
+        while another works send no requests. Returns whether the agent is lent the key (its stand-in)."""
+        # Where its model requests go, and whether the organization's key goes with them: not to
+        # a server of the organization's own, which needs none — the key is for Anthropic.
+        own_server = choice.upstream is not None
+        self.proxy.cfg.upstream = (choice.upstream or self.upstream).rstrip("/")
+        # An agent in OpenAI's shape with a server of its own: its /v1/responses go there.
+        self.proxy.cfg.upstream_openai = choice.upstream.rstrip("/") + "/v1" if own_server and choice.responses \
+            else self.upstream_openai
+        # Holding the key, the proxy lets only the stand-in through, toward Anthropic only, and strips
+        # other sign-ins: an agent in OpenAI's shape (Codex on the person's own sign-in, matteragent
+        # --wire responses) would be refused. The key is Anthropic's; they go without it.
+        self.proxy.cfg.upstream_key = None if own_server or choice.responses else self.cfg.api_key
+        # Codex's own sub-agents (the collaboration tools, in OpenAI's cloud) are not offered to its
+        # model when the session has sub-agents of the organization's own: the work beside it stays
+        # here. Codex has no setting that takes them away (measured 09.10.2026 with 0.161: with
+        # --disable multi_agent they stayed), so the proxy takes them out of its requests.
+        self.proxy.cfg.drop_tool_namespaces = frozenset({"collaboration"}) \
+            if self.subagent_server(choice) and choice.codex else frozenset()
+        # The organization's key is Anthropic's: an agent in OpenAI's shape is not lent it.
+        return bool(self.cfg.api_key) and not own_server and not choice.responses
+
+    def take_seat(self, choice: AgentChoice) -> bool:
+        """``choice`` becomes the agent at work. The one that worked keeps its seat, with all so far in its
+        context. True when ``choice``'s seat was alive and goes on (routed again, ready at once); False
+        when it has to start (:meth:`launch`)."""
+        if choice.name != self.current.name:
+            self.seat.seen = len(self.events)
+            self.current = choice
+        if len(self.agents) > 1:
+            self.emit({"kind": "agents", **self.agent_choice()})
+        seat = self.seat
+        if seat.alive:
+            self.route(choice)
+            self.status = "ready"
+            self.emit({"kind": "models", **seat.models} if seat.models else {"kind": "models", "options": []})
+            self.emit({"kind": "status", "status": "ready",
+                       "agent": (seat.agent.agent_info.get("agentInfo") or {}).get("name", "agent")})
+            return True
+        self.status = "starting"
+        self.emit({"kind": "models", "options": []})          # a stopped agent's models go
+        self.emit({"kind": "status", "status": "starting"})
+        return False
+
     async def launch(self, choice: AgentChoice) -> None:
-        """Start ``choice`` and open its session over the folder."""
+        """Start ``choice`` and open its session over the folder: its seat. A new session has none of the
+        work in it: what was done before, it is told with its first prompt."""
+        seat = self.seats.setdefault(choice.name, Seat(choice))
+        seat.seen = 0
         if choice.unavailable:
             self.status = "failed"
             self.emit({"kind": "error", "text": f"{choice.name} cannot start here: {choice.unavailable}"})
@@ -450,44 +703,27 @@ class AgentHost:
                                                     "setting, or give the agent the organization's "
                                                     "key."})
                 return
-        # Where its model requests go, and whether the organization's key goes with them: not to
-        # a server of the organization's own, which needs none — the key is for Anthropic.
-        own_server = choice.upstream is not None
-        self.proxy.cfg.upstream = (choice.upstream or self.upstream).rstrip("/")
-        # An agent in OpenAI's shape with a server of its own: its /v1/responses go there.
-        self.proxy.cfg.upstream_openai = choice.upstream.rstrip("/") + "/v1" if own_server and choice.responses \
-            else self.upstream_openai
-        # Holding the key, the proxy lets only the stand-in through, toward Anthropic only, and strips
-        # other sign-ins: an agent in OpenAI's shape (Codex on the person's own sign-in, matteragent
-        # --wire responses) would be refused. The key is Anthropic's; they go without it.
-        self.proxy.cfg.upstream_key = None if own_server or choice.responses else self.cfg.api_key
-        # The organization's key is Anthropic's: an agent in OpenAI's shape is not lent it.
-        lend = bool(self.cfg.api_key) and not own_server and not choice.responses
+        lend = self.route(choice)
         server = self.subagent_server(choice)
         command = list(choice.command)
         if self.cfg.subagents and choice.matteragent and "--subagents" not in command:
             command += ["--subagents", str(self.cfg.subagents)]
-        # Codex's own sub-agents (the collaboration tools, in OpenAI's cloud) are not offered to its
-        # model when the session has sub-agents of the organization's own: the work beside it stays
-        # here. Codex has no setting that takes them away (measured 09.10.2026 with 0.161: with
-        # --disable multi_agent they stayed), so the proxy takes them out of its requests.
-        self.proxy.cfg.drop_tool_namespaces = frozenset({"collaboration"}) if server and choice.codex else frozenset()
         if choice.codex:
             extra = codex_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
                               codex_path=self.cfg.codex_executable)
             codex_args = self.codex_server_args(server) if server else []
             if self.cfg.codex_confine or codex_args:
-                self._drop_codex_dir()
-                self._codex_dir = tempfile.mkdtemp(prefix="deid-codex-")
+                self._drop_codex_dir(seat)
+                seat.codex_dir = tempfile.mkdtemp(prefix="deid-codex-")
             if not self.cfg.codex_confine and codex_args:
-                extra["CODEX_PATH"] = str(codex_with(self.cfg.codex_executable, self._codex_dir, codex_args))
+                extra["CODEX_PATH"] = str(codex_with(self.cfg.codex_executable, seat.codex_dir, codex_args))
             if self.cfg.codex_confine:
                 try:
                     extra["CODEX_PATH"] = str(confined_codex(
-                        self.cfg.folder, self.cfg.codex_executable, self._codex_dir,
+                        self.cfg.folder, self.cfg.codex_executable, seat.codex_dir,
                         extra_read=self.subagent_paths(server) if server else (), args=codex_args))
                 except ConfinementUnavailable as exc:
-                    self._drop_codex_dir()
+                    self._drop_codex_dir(seat)
                     self.status = "failed"
                     self.emit({"kind": "error", "text": f"Codex was not started: {exc}."})
                     return
@@ -499,8 +735,10 @@ class AgentHost:
                 extra["MCP_TOOL_TIMEOUT"] = str(int(self.cfg.subagents_timeout * 1000))
         env = agent_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
                         api_key=self.cfg.agent_key if lend else None, extra=extra)
-        self.agent = AcpAgent(command, env=env, cwd=str(self.cfg.folder),
-                              on_update=self.on_update, on_permission=self.on_permission)
+        # what it sends is the page's only while it is the agent at work
+        seat.agent = AcpAgent(command, env=env, cwd=str(self.cfg.folder),
+                              on_update=lambda params, c=choice: self.on_update(params, c),
+                              on_permission=lambda params, c=choice: self.on_permission(params, c))
         meta = choice.meta or self.cfg.session_meta
         if server and choice.claude:
             meta = with_subagents(meta)
@@ -509,14 +747,14 @@ class AgentHost:
             # it has no tools of it for the whole task (measured 09.10.2026).
             meta = {**(meta or {}), "mcpStartupAwaitTimeoutMs": 30000}
         try:
-            info = await self.agent.start()
-            self.session_id = await self.agent.new_session(
+            info = await seat.agent.start()
+            seat.session_id = await seat.agent.new_session(
                 str(self.cfg.folder), meta,
                 mcp_servers=[{"name": "matter", "command": server["command"], "args": server["args"], "env": []}]
                 if server else None)
-            self.models = model_choice(self.agent.session_setup)
-            if self.models:
-                self.emit({"kind": "models", **self.models})
+            seat.models = model_choice(seat.agent.session_setup)
+            if seat.models:
+                self.emit({"kind": "models", **seat.models})
             self.status = "ready"
             self.emit({"kind": "status", "status": "ready",
                        "agent": (info.get("agentInfo") or {}).get("name", "agent")})
@@ -570,7 +808,10 @@ class AgentHost:
             paths.append(os.path.dirname(os.path.dirname(os.path.realpath(python))))
         return list(dict.fromkeys(paths))
 
-    async def on_update(self, params: dict) -> None:
+    async def on_update(self, params: dict, choice: AgentChoice | None = None) -> None:
+        if choice is not None and choice.name != self.current.name:
+            log.debug("an update from %s, which is not at work, left out", choice.name)
+            return
         u = params.get("update") or {}
         kind = u.get("sessionUpdate")
         content = u.get("content") or {}
@@ -601,7 +842,10 @@ class AgentHost:
                 self.models = choice
                 self.emit({"kind": "models", **choice})
 
-    async def on_permission(self, params: dict) -> dict:
+    async def on_permission(self, params: dict, choice: AgentChoice | None = None) -> dict:
+        # Only the agent at work asks the person; nor does one whose task is being handed over.
+        if (choice is not None and choice.name != self.current.name) or self.handover is not None:
+            return {"outcome": "cancelled"}
         call = params.get("toolCall") or {}
         options = params.get("options") or []
         paths = [loc.get("path", "") for loc in call.get("locations") or [] if loc.get("path")]
@@ -630,7 +874,13 @@ class AgentHost:
             return await fut
         finally:
             self.permissions.pop(rid, None)
-            self.emit({"kind": "permission_done", "id": rid})
+            # how it was answered — allowed, refused, or not at all (the turn stopped) — for the brief
+            answer = fut.result() if fut.done() and not fut.cancelled() else {}
+            option = next((o for o in options if answer.get("outcome") == "selected"
+                           and o.get("optionId") == answer.get("optionId")), None)
+            outcome = "cancelled" if option is None else \
+                "allowed" if str(option.get("kind", "")).startswith("allow") else "refused"
+            self.emit({"kind": "permission_done", "id": rid, "outcome": outcome})
 
     def key_refused(self) -> None:
         """The provider refused the organization's key. The agent would retry for minutes behind
@@ -650,14 +900,22 @@ class AgentHost:
         """An answer of the model crossed the proxy: count it into the task under way."""
         self.requests.append(request_usage(usage, model))
 
-    async def run_prompt(self, text: str) -> None:
+    async def run_prompt(self, text: str, *, carrying_from: str | None = None) -> None:
+        """A task for the agent at work — or, ``carrying_from`` another agent, the task under way, handed
+        over. What was done that it has not seen goes first in the same prompt, as a brief (:func:`brief`)."""
+        seat = self.seat
         self.busy = True
         self.key_refused_told = False
         self.requests = []
-        self.emit({"kind": "user", "text": text})
+        told = brief(self.events[seat.seen:], self.current.name, carrying_on=carrying_from is not None)
+        if carrying_from is None:
+            self.emit({"kind": "user", "text": text, "agent": self.current.name})
+        if told:
+            self.emit({"kind": "brief", "agent": self.current.name, "text": told})
+        seat.seen = len(self.events)
         started = time.monotonic()
         try:
-            result = await self.agent.prompt(self.session_id, text)
+            result = await self.agent.prompt(self.session_id, ([told] if told else []) + [text])
             usage = turn_usage(result)
             seconds = round(time.monotonic() - started, 1)
             # What the task cost, from the answers the proxy saw: with the cache and without it.
@@ -670,6 +928,46 @@ class AgentHost:
         finally:
             self.busy = False
             self.emit({"kind": "files", **self.changes()})
+            seat.seen = len(self.events)                     # its own work is in its context
+            if self.handover is not None:
+                asyncio.get_running_loop().create_task(self.carry_on(self.handover, self.current.name))
+
+    async def carry_on(self, choice: AgentChoice, previous: str) -> None:
+        """The task under way, stopped so that the person could hand it to ``choice``, goes on with
+        ``choice``: in its own session, told what was done. ``previous`` keeps its session for later."""
+        try:
+            if not self.take_seat(choice):
+                await self.launch(choice)
+        except Exception as exc:                     # noqa: BLE001
+            log.exception("the agent picked to carry the task on did not start")
+            self.status = "failed"
+            self.emit({"kind": "error", "text": f"{choice.name} did not start: {exc}"})
+        if self.status != "ready":
+            self.handover = None                     # the error is on the page; the task waits for the person
+            return
+        self.emit({"kind": "handover", "from": previous, "to": choice.name})
+        self.handover = None                         # no await between this and the task's start
+        await self.run_prompt(CARRY_ON.format(previous=previous), carrying_from=previous)
+
+    async def stop_turn(self) -> None:
+        """Stop the turn under way: ``session/cancel``, and the asks it waits on answered as cancelled —
+        what ACP asks of a client that cancels."""
+        if self.agent and self.session_id:
+            try:
+                await self.agent.cancel(self.session_id)
+            except Exception:                        # noqa: BLE001 — a gone agent stops anyway
+                log.warning("the cancel did not reach the agent")
+        for fut in list(self.permissions.values()):
+            if not fut.done():
+                fut.set_result({"outcome": "cancelled"})
+
+    async def stop_if_stuck(self, seat: Seat, after: float = 30.0) -> None:
+        """An agent that does not stop when asked, so that its task can be handed over, is stopped: the
+        task goes on with the other one, and this one starts a new session when it is picked again."""
+        await asyncio.sleep(after)
+        if self.busy and self.handover is not None and seat is self.seat and seat.agent:
+            self.emit({"kind": "notice", "text": f"{seat.choice.name} did not stop when asked: it was stopped."})
+            await seat.agent.stop()
 
     def count(self, stop_reason, usage: dict, seconds: float, cost: dict | None = None) -> None:
         """Add a finished task to the session's totals and to the usage log."""
@@ -718,6 +1016,7 @@ class AgentHost:
                                       "scope": self.cfg.scope, "status": self.status,
                                       "busy": self.busy, "auth": auth, "models": self.models,
                                       "agents": self.agent_choice(),
+                                      "handover": self.handover.name if self.handover else None,
                                       "usage": self.usage, "context": self.context,
                                       **self.changes()})
         if name == "events" and request.method == "GET":
@@ -726,7 +1025,7 @@ class AgentHost:
             text = ((await request.json()).get("text") or "").strip()
             if not text:
                 return web.json_response({"error": "empty task"}, status=400)
-            if self.busy or self.status != "ready":
+            if self.busy or self.status != "ready" or self.handover is not None:
                 return web.json_response({"error": "the agent is busy or not ready"}, status=409)
             asyncio.create_task(self.run_prompt(text))
             return web.json_response({"ok": True}, status=202)
@@ -742,10 +1041,10 @@ class AgentHost:
         if name == "model" and request.method == "POST":
             return await self._set_model(((await request.json()).get("value") or "").strip())
         if name == "agent" and request.method == "POST":
-            return await self._set_agent(((await request.json()).get("value") or "").strip())
+            body = await request.json()
+            return await self._set_agent((body.get("value") or "").strip(), handover=body.get("handover") is True)
         if name == "cancel" and request.method == "POST":
-            if self.agent and self.session_id:
-                await self.agent.cancel(self.session_id)
+            await self.stop_turn()
             return web.json_response({"ok": True})
         if name == "file" and request.method == "GET":
             rel = request.query.get("path", "")
@@ -779,30 +1078,39 @@ class AgentHost:
         self.emit({"kind": "models", **choice})
         return web.json_response({"ok": True, "models": choice})
 
-    async def _set_agent(self, value: str) -> web.Response:
-        """Switch to another agent between tasks: the one working stops, the other starts over the
-        same folder in a new session — it does not see the earlier tasks; the page keeps them."""
+    async def _set_agent(self, value: str, handover: bool = False) -> web.Response:
+        """Switch the agent at work. Between tasks, the one picked goes on in its own session (or starts
+        one), told with its next task what was done that it has not seen. During a task, only when the
+        person hands the task over (``handover``): the step under way stops, and the one picked carries the
+        task on, told what was done. The one that worked keeps its session in both cases."""
         choice = next((a for a in self.agents if a.name == value), None)
         if len(self.agents) < 2 or choice is None:
             return web.json_response({"error": "there is no such agent"}, status=400)
         if choice.unavailable:
             return web.json_response({"error": f"{choice.name} cannot start here: {choice.unavailable}"},
                                      status=409)
+        if self.handover is not None:
+            return web.json_response({"error": f"the task is being handed over to {self.handover.name}"},
+                                     status=409)
         if self.busy:
-            return web.json_response({"error": "the agent is working: switch between tasks"}, status=409)
+            if not handover:
+                return web.json_response({"error": "the agent is working: switch between tasks, or hand "
+                                                   "the task over"}, status=409)
+            if choice.name == self.current.name:
+                return web.json_response({"ok": True, "agents": self.agent_choice()})
+            self.handover = choice
+            self.emit({"kind": "notice", "handing": True,
+                       "text": f"Handing the task over to {choice.name}: {self.current.name} stops at its current step."})
+            await self.stop_turn()
+            asyncio.get_running_loop().create_task(self.stop_if_stuck(self.seat))
+            return web.json_response({"ok": True, "handover": choice.name, "agents": self.agent_choice()},
+                                     status=202)
         if self.status == "starting":
             return web.json_response({"error": "the agent is starting"}, status=409)
-        if choice is self.current and self.status == "ready":
+        if choice.name == self.current.name and self.status == "ready":
             return web.json_response({"ok": True, "agents": self.agent_choice()})
-        old, self.agent, self.session_id = self.agent, None, None
-        self.models, self.context = None, None
-        self.current, self.status = choice, "starting"
-        self.emit({"kind": "agents", **self.agent_choice()})
-        self.emit({"kind": "models", "options": []})          # the stopped agent's models go
-        self.emit({"kind": "status", "status": "starting"})
-        if old:
-            await old.stop()
-        asyncio.get_running_loop().create_task(self.launch(choice))
+        if not self.take_seat(choice):
+            asyncio.get_running_loop().create_task(self.launch(choice))
         return web.json_response({"ok": True, "agents": self.agent_choice()}, status=202)
 
     async def _events(self, request: web.Request) -> web.StreamResponse:
@@ -826,11 +1134,11 @@ class AgentHost:
             self.listeners.discard(q)
         return resp
 
-    def _drop_codex_dir(self) -> None:
-        """The confined Codex's profile and wrapper, once it no longer runs."""
-        if getattr(self, "_codex_dir", None):
-            shutil.rmtree(self._codex_dir, ignore_errors=True)
-            self._codex_dir = None
+    def _drop_codex_dir(self, seat: Seat) -> None:
+        """A confined Codex's profile and wrapper, once it no longer runs."""
+        if seat.codex_dir:
+            shutil.rmtree(seat.codex_dir, ignore_errors=True)
+            seat.codex_dir = None
 
     def app(self) -> web.Application:
         app = web.Application(client_max_size=64 * 1024 * 1024)
@@ -844,9 +1152,10 @@ class AgentHost:
             asyncio.create_task(self.start_agent())
 
         async def cleanup(app):
-            if self.agent:
-                await self.agent.stop()
-            self._drop_codex_dir()
+            for seat in self.seats.values():
+                if seat.agent:
+                    await seat.agent.stop()
+                self._drop_codex_dir(seat)
             await self.proxy._stop(app)
 
         app.on_startup.append(startup)
@@ -854,5 +1163,5 @@ class AgentHost:
         return app
 
 
-__all__ = ["AgentChoice", "AgentHost", "CODEX_SUBAGENTS_NOTE", "HostConfig", "inside", "model_choice", "snapshot",
-           "turn_usage", "with_subagents"]
+__all__ = ["AgentChoice", "AgentHost", "CARRY_ON", "CODEX_SUBAGENTS_NOTE", "HostConfig", "Seat", "brief", "inside",
+           "model_choice", "snapshot", "turn_usage", "with_subagents"]
