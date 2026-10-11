@@ -121,6 +121,20 @@ enable_request_compression = false
   requests to a server of the organization's own (the Messages API) and gives it no key, since the
   organization's key is for Anthropic. `--agent-unavailable NAME=REASON` lists an agent that cannot
   start on this machine, and why, without offering it. The usage line names the agent.
+- **Sub-agents on the organization's own servers.** `--subagents HOSTS` (matteragent's hosts file)
+  hands the narrow jobs of a task — read, find, extract, calc, check, and consult where a head model
+  answers — to sub-agents next to the folder, on models the organization runs; every quote in their
+  reports is checked against its file. Claude Code and Codex get them as the MCP server `matter`
+  (`--subagents-command`, default `matteragent-mcp` on the PATH), and their own cloud sub-agents are
+  taken away: Claude Code's `Task` tool is disallowed, and the proxy drops Codex's `collaboration`
+  tools from its requests (no Codex setting removes them: measured 09.10.2026 with 0.161).
+  matteragent gets its Subagent tool. The server's tools run without asking — they only read, inside
+  the folder — and the proxy restores real names in their arguments, so a sub-agent reads the
+  documents as they are and only its report, tokenized, goes to the cloud model. Codex keeps MCP
+  tools off its model's list (deferred, in code mode), so it is told of them in its instructions;
+  confined Codex may read the hosts file and the server's installation besides the folder.
+  `--subagents-timeout` (900 s) is how long Claude Code and Codex wait for one report. Without
+  `--subagents` nothing changes.
 - **Not applied yet.** Initials of a known person that no document defines, which the vault can
   tokenize (`deidkit.address.tokenize_initials`), are not yet applied by the proxy.
 

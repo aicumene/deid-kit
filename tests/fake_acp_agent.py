@@ -53,6 +53,7 @@ def permission(session, cid, title, path):
 
 cwd = None
 meta = None
+mcp = None
 for line in sys.stdin:
     msg = json.loads(line)
     method, params, rid = msg.get("method"), msg.get("params") or {}, msg.get("id")
@@ -61,6 +62,7 @@ for line in sys.stdin:
     elif method == "session/new":
         cwd = params["cwd"]
         meta = params.get("_meta")
+        mcp = params.get("mcpServers")
         send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "s1", "configOptions": config_options()}})
     elif method == "session/set_config_option":
         if params.get("configId") == "model" and params.get("value") in {m["value"] for m in MODELS}:
@@ -70,9 +72,19 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "invalid value"}})
     elif method == "session/prompt":
         said = (f"[{NAME}] " if NAME else "") + (f"[meta {json.dumps(meta, sort_keys=True)}] " if meta else "")
+        if mcp:
+            said += f"[mcp {json.dumps(mcp, sort_keys=True)}] "
+        if sys.argv[2:]:
+            said += f"[argv {json.dumps(sys.argv[2:])}] "
+        if os.environ.get("CODEX_PATH") and os.path.isfile(os.environ["CODEX_PATH"]):
+            with open(os.environ["CODEX_PATH"]) as fh:
+                said += f"[wrapper {json.dumps(fh.read())}] "
+        if os.environ.get("MCP_TOOL_TIMEOUT"):
+            said += f"[mcp-timeout {os.environ['MCP_TOOL_TIMEOUT']}] "
         if os.environ.get("MODEL_PROVIDER"):
             said += (f"[provider {os.environ['MODEL_PROVIDER']} {os.environ.get('CODEX_CONFIG', '')} "
-                     f"{os.environ.get('CODEX_PATH', '-')} {os.environ.get('ANTHROPIC_API_KEY', '-')}] ")
+                     f"{os.environ.get('CODEX_PATH', '-')} {os.environ.get('ANTHROPIC_API_KEY', '-')} "
+                     f"{os.environ.get('INITIAL_AGENT_MODE', '-')}] ")
         update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"{said}Working on it ({model}). "}})
         target = os.path.join(cwd, "draft.md")
         update("s1", {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Write draft.md",

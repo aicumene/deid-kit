@@ -142,6 +142,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="the claude binary the Claude adapter should run")
     ap.add_argument("--codex-executable", default=shutil.which("codex"),
                     help="the person's own codex binary, for an agent that is Codex (codex-acp)")
+    ap.add_argument("--codex-unconfined", action="store_true",
+                    help="start Codex without confining it to the folder (where that cannot be "
+                         "done: on macOS it is, with Seatbelt); it can then read the whole disk")
     ap.add_argument("--upstream", default="https://api.anthropic.com",
                     help="where the agent's model requests go: Anthropic, or a server of the "
                          "organization's own that speaks the Messages API (/v1/messages)")
@@ -152,6 +155,15 @@ def main(argv: list[str] | None = None) -> None:
                          '({"token": ..., "api_key": ...}) instead of the environment')
     ap.add_argument("--dev-login", action="store_true",
                     help="allow the machine's own Claude sign-in when no API key is set")
+    ap.add_argument("--subagents", metavar="HOSTS",
+                    help="sub-agents on the organization's own model servers (matteragent's hosts "
+                         "file): Claude Code and Codex get them as the MCP server 'matter' and lose "
+                         "their own cloud sub-agents; matteragent gets its Subagent tool")
+    ap.add_argument("--subagents-command", default=shutil.which("matteragent-mcp") or "",
+                    help="what starts the sub-agents' MCP server (default: matteragent-mcp on PATH), "
+                         "e.g. '<python> -m matteragent.mcp'")
+    ap.add_argument("--subagents-timeout", type=float, default=900.0,
+                    help="seconds a client waits for one sub-agent's report")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -170,13 +182,22 @@ def main(argv: list[str] | None = None) -> None:
     cfg = HostConfig(folder=folder, scope=args.scope, title=args.title or folder.name,
                      agent_command=shlex.split(args.agent_command), api_key=api_key,
                      dev_login=args.dev_login, claude_executable=args.claude_executable,
-                     codex_executable=args.codex_executable,
+                     codex_executable=args.codex_executable, codex_confine=not args.codex_unconfined,
                      port=args.port,
                      usage_log=Path(args.usage_log).expanduser() if args.usage_log else None,
                      agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable,
                                           args.agent_meta),
                      session_meta=json_object(args.session_meta, "--session-meta") if args.session_meta else None,
-                     style=Path(args.style).expanduser() if args.style else None)
+                     style=Path(args.style).expanduser() if args.style else None,
+                     subagents=Path(args.subagents).expanduser().resolve() if args.subagents else None,
+                     subagents_command=shlex.split(args.subagents_command or ""),
+                     subagents_timeout=args.subagents_timeout)
+    if cfg.subagents and not cfg.subagents.is_file():
+        sys.exit(f"deid-agent: --subagents: no such file: {cfg.subagents}")
+    if cfg.subagents and not cfg.subagents_command and not all(a.matteragent for a in cfg.agents or
+                                                                [AgentChoice("", cfg.agent_command)]):
+        sys.exit("deid-agent: --subagents needs --subagents-command for Claude Code and Codex "
+                 "(matteragent-mcp is not on PATH)")
     if cfg.agents and all(a.unavailable for a in cfg.agents):
         sys.exit("deid-agent: no agent can start here: "
                  + "; ".join(f"{a.name}: {a.unavailable}" for a in cfg.agents))

@@ -35,7 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from deidkit import namefold as nf
-from deidkit.proxy.anthropic import Refused, _Slot, _strings
+from deidkit.proxy.anthropic import SUBAGENT_TOOLS, Refused, _Slot, _strings
 from deidkit.proxy.engine import ScopeEngine
 from deidkit.proxy.spelling import holdback as _spelling_holdback
 from deidkit.proxy.spelling import spellings as _spellings
@@ -44,7 +44,7 @@ from deidkit.proxy.spelling import spellings as _spellings
 LOCAL_TOOLS = frozenset({"exec_command", "write_stdin", "shell", "local_shell", "apply_patch",
                          "update_plan", "view_image", "read_file", "list_dir", "grep_files",
                          # an agent in OpenAI's shape under Codex-style names (matteragent --wire responses)
-                         "write_file", "edit_file", "glob_files", "recall"})
+                         "write_file", "edit_file", "glob_files", "recall"}) | SUBAGENT_TOOLS
 _UNTOUCHED = frozenset({"reasoning", "compaction", "compaction_summary", "additional_tools",
                         "web_search_call", "item_reference", "image_generation_call",
                         "tool_search_call", "tool_search_output"})
@@ -115,11 +115,37 @@ def _output(holder: dict, key: str, slots, binary, withheld, where) -> None:
         raise Refused(f"unexpected output in {where}")
 
 
+def drop_namespaces(body: dict, names: frozenset[str]) -> int:
+    """Take the tools of the namespaces ``names`` out of a request — in the tool list and in Codex's
+    ``additional_tools`` items — and return how many were taken out. The model is not offered what
+    it may not use: Codex's own sub-agents (``collaboration``: ``spawn_agent`` …, in OpenAI's cloud)
+    when the session has sub-agents of the organization's own."""
+    dropped = 0
+
+    def keep(tools: list) -> list:
+        nonlocal dropped
+        kept = [t for t in tools if not (isinstance(t, dict) and t.get("type") == "namespace"
+                                         and t.get("name") in names)]
+        dropped += len(tools) - len(kept)
+        return kept
+
+    if names:
+        if isinstance(body.get("tools"), list):
+            body["tools"] = keep(body["tools"])
+        for item in body.get("input") or [] if isinstance(body.get("input"), list) else []:
+            if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list):
+                item["tools"] = keep(item["tools"])
+    return dropped
+
+
 async def prepare_responses(body: dict, engine: ScopeEngine, *, headers: dict[str, str],
                             restore_get: Callable[[str], str | None],
-                            binary: str = "withhold") -> PreparedResponses:
-    """The request as it may cross, the headers that carry metadata, and the mapping back."""
+                            binary: str = "withhold",
+                            drop: frozenset[str] = frozenset()) -> PreparedResponses:
+    """The request as it may cross, the headers that carry metadata, and the mapping back.
+    ``drop``: tool namespaces taken out of the request (:func:`drop_namespaces`)."""
     body = copy.deepcopy(body)
+    drop_namespaces(body, drop)
     headers = dict(headers)
     slots: list[_Slot] = []
     withheld: list[str] = []
@@ -209,6 +235,13 @@ async def _detok(obj, engine: ScopeEngine, mapping, spellings=None):
     return obj
 
 
+def tool_name(item: dict) -> str:
+    """A call's tool as the tool list names it: a tool in a namespace (Codex puts an MCP server's
+    tools in ``mcp__<server>``) by its full name, ``mcp__<server>__<tool>`` — as code mode calls it."""
+    name, space = str(item.get("name") or ""), item.get("namespace")
+    return f"{space}__{name}" if isinstance(space, str) and space and not name.startswith(space) else name
+
+
 def script_is_local(script: str, local_tools: frozenset[str]) -> bool:
     """Does a code-mode script call only tools that act on this machine?"""
     calls = _SCRIPT_CALL.findall(script or "")
@@ -235,7 +268,7 @@ async def restore_item(item: dict, engine: ScopeEngine, mapping: dict[str, str],
                 part["text"] = await engine.detokenize(original, mapping, spellings, prose=True)
                 if restore_put:
                     restore_put(_key("t:", part["text"]), original)
-    elif t == "function_call" and item.get("name") in local_tools:
+    elif t == "function_call" and tool_name(item) in local_tools:
         original = item.get("arguments", "")
         try:
             restored = _compact(await _detok(json.loads(original), engine, mapping, spellings))
@@ -318,7 +351,7 @@ class ResponsesRestorer:
         if t == "response.output_item.added":
             item = data.get("item") or {}
             if item.get("type") in ("function_call", "custom_tool_call") and \
-                    (item.get("name") in self.local_tools or item.get("name") == CODE_TOOL):
+                    (tool_name(item) in self.local_tools or item.get("name") == CODE_TOOL):
                 # For code mode the script is judged when it is complete (output_item.done);
                 # its deltas are only shown on this machine, so they are shown in names.
                 self.local_items.add(item.get("id") or str(data.get("output_index")))
@@ -387,5 +420,5 @@ class ResponsesRestorer:
         return out
 
 
-__all__ = ["LOCAL_TOOLS", "PreparedResponses", "ResponsesRestorer", "prepare_responses",
+__all__ = ["LOCAL_TOOLS", "PreparedResponses", "ResponsesRestorer", "drop_namespaces", "prepare_responses", "tool_name",
            "restore_item"]

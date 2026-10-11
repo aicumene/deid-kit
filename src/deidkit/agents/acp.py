@@ -72,10 +72,13 @@ class AcpAgent:
         })
         return self.agent_info
 
-    async def new_session(self, cwd: str, meta: dict | None = None) -> str:
+    async def new_session(self, cwd: str, meta: dict | None = None,
+                          mcp_servers: list[dict] | None = None) -> str:
         """A session over `cwd`; `meta` goes as the request's `_meta` (an agent's own options — the
-        Claude adapter reads `claudeCode.options`, e.g. which tools Claude Code offers the model)."""
-        params: dict = {"cwd": cwd, "mcpServers": []}
+        Claude adapter reads `claudeCode.options`, e.g. which tools Claude Code offers the model);
+        `mcp_servers` are MCP servers the agent starts for the session (ACP's stdio form:
+        ``{name, command, args, env}``)."""
+        params: dict = {"cwd": cwd, "mcpServers": list(mcp_servers or [])}
         if meta:
             params["_meta"] = meta
         result = await self.request("session/new", params)
@@ -212,7 +215,8 @@ def codex_env(*, base_url: str, scope: str, codex_path: str | None = None) -> di
     that is the proxy, signed in as the person signed Codex in (ChatGPT or an API key). The adapter
     merges ``CODEX_CONFIG`` into each session's config and opens the session on ``MODEL_PROVIDER``;
     ``CODEX_PATH`` is the person's own Codex, when given. The person's ``~/.codex/config.toml``
-    stays as it is: their Codex elsewhere does not go through a proxy that may not be running."""
+    stays as it is: their Codex elsewhere does not go through a proxy that may not be running.
+    ``INITIAL_AGENT_MODE=read-only``: Codex asks the person before every edit."""
     config = {
         "model_providers": {"deid": {
             "name": "OpenAI through deid-agent",
@@ -224,7 +228,10 @@ def codex_env(*, base_url: str, scope: str, codex_path: str | None = None) -> di
         # the proxy reads the requests it rewrites: none compressed
         "features": {"enable_request_compression": False},
     }
-    env = {"MODEL_PROVIDER": "deid", "CODEX_CONFIG": json.dumps(config)}
+    # The adapter's own default ("agent", Auto review) edits the workspace without asking and lets
+    # a model review the rest: in a matter the person approves every edit (measured 09.10.2026 —
+    # with the person refusing every write, Codex saved the file without asking).
+    env = {"MODEL_PROVIDER": "deid", "CODEX_CONFIG": json.dumps(config), "INITIAL_AGENT_MODE": "read-only"}
     if codex_path:
         env["CODEX_PATH"] = codex_path
     return env

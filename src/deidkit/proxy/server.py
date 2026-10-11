@@ -78,6 +78,9 @@ class ProxyConfig:
     #: machine cannot borrow it through the proxy.
     upstream_key: str | None = None
     agent_key: str | None = None
+    #: Tool namespaces taken out of an OpenAI request before it leaves (``collaboration``: Codex's
+    #: own cloud sub-agents, when the session's sub-agents are the organization's own).
+    drop_tool_namespaces: frozenset[str] = frozenset()
     extra: dict = field(default_factory=dict)
 
 
@@ -381,7 +384,7 @@ class Proxy:
         try:
             prep = await prepare_responses(body, engine, headers=self._headers(request),
                                            restore_get=self.restore.restore_get,
-                                           binary=self.cfg.binary)
+                                           binary=self.cfg.binary, drop=self.cfg.drop_tool_namespaces)
         except Refused as exc:
             log.warning("refused %s: %s", request.path, exc)
             return _error(400, f"deid proxy: {exc}")

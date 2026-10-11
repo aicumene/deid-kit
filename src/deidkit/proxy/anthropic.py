@@ -34,12 +34,18 @@ from deidkit.proxy.engine import ScopeEngine
 from deidkit.proxy.spelling import holdback as _spelling_holdback
 from deidkit.proxy.spelling import spellings as _spellings
 
+#: The kinds of job of matteragent's sub-agents (``matteragent.subagents``).
+SUBAGENT_KINDS = ("read", "find", "extract", "calc", "check", "consult")
+#: Sub-agents on the organization's own servers, next to the folder: matteragent's MCP server
+#: ("matter") as Claude Code and Codex name its tools, and matteragent's own Subagent tool, under
+#: its two wires' names. They read the matter on this side, so their questions get the real names.
+SUBAGENT_TOOLS = frozenset({"Subagent", "subagent"} | {f"mcp__matter__{k}" for k in SUBAGENT_KINDS})
 #: Tools that act on the user's machine: their arguments get the real values back.
 LOCAL_TOOLS = frozenset({
     "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "NotebookRead", "Bash", "BashOutput",
     "KillShell", "KillBash", "Monitor", "Glob", "Grep", "LS", "TodoWrite", "AskUserQuestion",
     "ExitPlanMode",
-})
+}) | SUBAGENT_TOOLS
 #: Blocks passed through untouched: produced by the model or the provider, or carrying no text.
 _UNTOUCHED = frozenset({
     "thinking", "redacted_thinking", "tool_reference", "server_tool_use", "web_search_tool_result",
@@ -334,5 +340,5 @@ class StreamRestorer:
         return [(name, data)]
 
 
-__all__ = ["LOCAL_TOOLS", "Prepared", "Refused", "StreamRestorer", "prepare_request",
+__all__ = ["LOCAL_TOOLS", "SUBAGENT_KINDS", "SUBAGENT_TOOLS", "Prepared", "Refused", "StreamRestorer", "prepare_request",
            "restore_json_response"]

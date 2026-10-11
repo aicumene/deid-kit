@@ -515,7 +515,7 @@ async def test_codex_goes_through_the_proxy_with_its_own_sign_in(tmp_path):
     agents = [AgentChoice("Codex", [sys.executable, str(FAKE), "codex-acp"])]
     assert agents[0].codex and not two_agents()[0].codex
     cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], api_key="sk-org",
-                     codex_executable="/opt/codex/bin/codex", agents=agents)
+                     codex_executable="/opt/codex/bin/codex", agents=agents, codex_confine=False)
     host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
     headers = {"x-deid-agent-token": cfg.token}
     try:
@@ -523,8 +523,9 @@ async def test_codex_goes_through_the_proxy_with_its_own_sign_in(tmp_path):
         await wait_for(lambda: any(e["kind"] == "permission" for e in host.events))
         said = "".join(e["text"] for e in host.events if e["kind"] == "message")
         provider = said.split("[provider ", 1)[1].split("] ", 1)[0]
-        name, config, path, key = provider.split(" ", 1)[0], *provider.split(" ", 1)[1].rsplit(" ", 2)
+        name, config, path, key, mode = provider.split(" ", 1)[0], *provider.split(" ", 1)[1].rsplit(" ", 3)
         assert name == "deid" and path == "/opt/codex/bin/codex"
+        assert mode == "read-only"            # Codex asks the person before every edit
         assert key == "-"                     # the organization's key is Anthropic's: Codex is not lent it
         deid = json.loads(config)["model_providers"]["deid"]
         assert deid["base_url"] == f"http://127.0.0.1:{cfg.port}/v1" and deid["requires_openai_auth"] is True
@@ -546,6 +547,10 @@ def test_the_persons_codex_comes_from_the_command_line(tmp_path, monkeypatch):
               "--audit", str(tmp_path / "a.jsonl"), "--agent", "Codex=/x/codex-acp",
               "--codex-executable", "/Applications/Some.app/codex"])
     assert seen[0].codex_executable == "/Applications/Some.app/codex" and seen[0].agents[0].codex
+    assert seen[0].codex_confine                      # confined unless the person says otherwise
+    cli.main(["--folder", str(folder), "--scope", "case-1", "--dev-login", "--vault", str(tmp_path / "v.sqlite"),
+              "--audit", str(tmp_path / "a.jsonl"), "--agent", "Codex=/x/codex-acp", "--codex-unconfined"])
+    assert seen[1].codex_confine is False
 
 
 async def test_codex_reaches_openai_with_its_own_sign_in_while_the_host_holds_the_organizations_key(tmp_path):
@@ -560,7 +565,8 @@ async def test_codex_reaches_openai_with_its_own_sign_in_while_the_host_holds_th
     await upstream.start_server()
     agents = [AgentChoice("Claude Code", [sys.executable, str(FAKE), "Claude Code"]),
               AgentChoice("Codex", [sys.executable, str(FAKE), "codex-acp"])]
-    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], api_key="sk-org", agents=agents)
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], api_key="sk-org", agents=agents,
+                     codex_confine=False)
     proxy_cfg = ProxyConfig(default_scope="case-1", upstream_chatgpt=str(upstream.make_url("/codex")),
                             detector=RegexDetector(), seeds=seeds())
     host, client = await started(cfg, proxy_cfg)
@@ -589,7 +595,8 @@ async def test_an_agent_in_openais_shape_with_its_own_server_gets_its_responses_
               AgentChoice("Codex", [sys.executable, str(FAKE), "codex-acp"])]
     assert agents[0].responses and agents[1].responses and not two_agents()[0].responses
     assert AgentChoice("x", ["m", "--wire=responses"]).responses
-    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], dev_login=True, agents=agents)
+    cfg = HostConfig(folder=tmp_path, scope="case-1", title="Case 1", agent_command=[], dev_login=True, agents=agents,
+                     codex_confine=False)
     host, client = await started(cfg, ProxyConfig(default_scope="case-1"))
     headers = {"x-deid-agent-token": cfg.token}
     try:

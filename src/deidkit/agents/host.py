@@ -48,6 +48,9 @@ import os
 import re
 import secrets
 import shlex
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,7 +58,9 @@ from pathlib import Path
 from aiohttp import web
 
 from deidkit.agents.acp import AcpAgent, agent_env, codex_env
+from deidkit.agents.confine import ConfinementUnavailable, codex_with, confined_codex
 from deidkit.agents.pricing import RequestUsage, request_usage, task_cost
+from deidkit.proxy.anthropic import SUBAGENT_KINDS
 from deidkit.proxy.server import Proxy
 
 log = logging.getLogger("deidkit.agents.host")
@@ -93,6 +98,17 @@ class AgentChoice:
         return any("codex-acp" in part for part in self.command)
 
     @property
+    def claude(self) -> bool:
+        """Claude Code through its ACP adapter (``claude-agent-acp``, or the desktop's ``claude-acp``)."""
+        return any("claude-agent-acp" in part or Path(part).name == "claude-acp" for part in self.command)
+
+    @property
+    def matteragent(self) -> bool:
+        """matteragent: it hands jobs to the sub-agents itself, with its Subagent tool."""
+        return any(Path(part).name == "matteragent" or part == "matteragent" for part in self.command) or any(
+            a == "-m" and b == "matteragent" for a, b in zip(self.command, self.command[1:]))
+
+    @property
     def responses(self) -> bool:
         """It asks its model in OpenAI's shape (the Responses API): Codex, or an agent started with
         ``--wire responses`` (matteragent). Its own ``upstream`` then answers ``/v1/responses``."""
@@ -112,6 +128,9 @@ class HostConfig:
     claude_executable: str | None = None
     #: The person's own Codex, for an agent that is Codex (``codex-acp``); none — the adapter's.
     codex_executable: str | None = None
+    #: Codex confined by the kernel to the matter folder (:mod:`deidkit.agents.confine`). Where that
+    #: cannot be done, Codex does not start unless this is False (``--codex-unconfined``).
+    codex_confine: bool = True
     port: int = 8790
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     #: What the agent sends as its key; the proxy swaps it for ``api_key``, which stays there.
@@ -126,6 +145,16 @@ class HostConfig:
     style: Path | None = None
     #: The session's `_meta` when no agent of ``agents`` names its own (``--session-meta``).
     session_meta: dict | None = None
+    #: Sub-agents on the organization's own model servers (``--subagents``): the hosts file of
+    #: matteragent's sub-agents. Claude Code and Codex get them as the MCP server "matter"
+    #: (``subagents_command``), matteragent as its Subagent tool; the cloud agents' own sub-agents
+    #: are then off. None: no sub-agents.
+    subagents: Path | None = None
+    #: What starts the sub-agents' MCP server (``python -m matteragent.mcp`` or the bundle's
+    #: ``matteragent-mcp``); deid-agent adds the folder, the hosts and the main agent's family.
+    subagents_command: list[str] = field(default_factory=list)
+    #: Seconds a client waits for one sub-agent's report.
+    subagents_timeout: float = 900.0
 
 
 #: The token counts of ACP's draft ``PromptResponse.usage``; anything else in it is left out.
@@ -273,6 +302,56 @@ def outside_paths(command: str, folder: Path) -> list[str]:
     return found
 
 
+#: The matter server's tools as Claude Code names them.
+SUBAGENT_MCP_TOOLS = tuple(f"mcp__matter__{k}" for k in SUBAGENT_KINDS)
+#: What Codex is told about the sub-agents. Codex keeps an MCP server's tools out of its model's tool
+#: list — deferred, on the global ``tools`` object of its code mode — and a model that is not told of
+#: them reads every document itself (measured 09.10.2026: told, Codex handed the reading to them).
+CODEX_SUBAGENTS_NOTE = (
+    "This matter has sub-agents on the organization's own model servers, next to its folder. They are "
+    "deferred tools on the global `tools` object of exec, named `mcp__matter__<kind>` — read, find, "
+    "extract, calc, check, and consult when a head model is up; `ALL_TOOLS` lists those available now. "
+    "Each takes a question and, optionally, the paths to read. Hand them the reading of the matter's "
+    "documents: a sub-agent reads the files where they are and reports back with exact quotes, each "
+    "checked against its file. Prefer them to reading long documents yourself.")
+
+
+def with_subagents(meta: dict | None) -> dict:
+    """The session's `_meta` for Claude Code with sub-agents of the organization's own: its own (the
+    Task tool, in Anthropic's cloud) off, so the work beside the main agent stays here; the matter
+    server's tools allowed without asking — they only read, inside the folder Claude Code reads anyway."""
+    meta = json.loads(json.dumps(meta or {}))
+    options = meta.setdefault("claudeCode", {}).setdefault("options", {})
+    disallowed = list(options.get("disallowedTools") or [])
+    options["disallowedTools"] = disallowed + [t for t in ("Task",) if t not in disallowed]
+    allowed = list(options.get("allowedTools") or [])
+    options["allowedTools"] = allowed + [t for t in SUBAGENT_MCP_TOOLS if t not in allowed]
+    return meta
+
+
+#: Where a Python and the sub-agents' package are installed: the environment, the interpreter's own
+#: installation, and the folder the package is imported from — an editable install keeps it in a
+#: source tree elsewhere, and the import lists that folder, not only the package in it.
+_WHERE_INSTALLED = ("import os, sys\nprint(sys.prefix)\nprint(sys.base_prefix)\ntry:\n    import matteragent\n"
+                    "    print(os.path.dirname(matteragent.__path__[0]))\nexcept Exception:\n    pass\n")
+
+
+def _shebang_python(program: str) -> str | None:
+    """The interpreter a script's first line names, when it is a Python (a console script)."""
+    try:
+        with open(program, "rb") as fh:
+            first = fh.readline(512).decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    if first.startswith("#!"):
+        parts = first[2:].split()
+        if parts and Path(parts[0]).name.startswith("python"):
+            return parts[0]
+        if len(parts) > 1 and Path(parts[0]).name == "env" and parts[1].startswith("python"):
+            return shutil.which(parts[1])
+    return None
+
+
 class AgentHost:
     def __init__(self, cfg: HostConfig, proxy: Proxy) -> None:
         self.cfg = cfg
@@ -384,18 +463,57 @@ class AgentHost:
         self.proxy.cfg.upstream_key = None if own_server or choice.responses else self.cfg.api_key
         # The organization's key is Anthropic's: an agent in OpenAI's shape is not lent it.
         lend = bool(self.cfg.api_key) and not own_server and not choice.responses
+        server = self.subagent_server(choice)
+        command = list(choice.command)
+        if self.cfg.subagents and choice.matteragent and "--subagents" not in command:
+            command += ["--subagents", str(self.cfg.subagents)]
+        # Codex's own sub-agents (the collaboration tools, in OpenAI's cloud) are not offered to its
+        # model when the session has sub-agents of the organization's own: the work beside it stays
+        # here. Codex has no setting that takes them away (measured 09.10.2026 with 0.161: with
+        # --disable multi_agent they stayed), so the proxy takes them out of its requests.
+        self.proxy.cfg.drop_tool_namespaces = frozenset({"collaboration"}) if server and choice.codex else frozenset()
         if choice.codex:
             extra = codex_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
                               codex_path=self.cfg.codex_executable)
+            codex_args = self.codex_server_args(server) if server else []
+            if self.cfg.codex_confine or codex_args:
+                self._drop_codex_dir()
+                self._codex_dir = tempfile.mkdtemp(prefix="deid-codex-")
+            if not self.cfg.codex_confine and codex_args:
+                extra["CODEX_PATH"] = str(codex_with(self.cfg.codex_executable, self._codex_dir, codex_args))
+            if self.cfg.codex_confine:
+                try:
+                    extra["CODEX_PATH"] = str(confined_codex(
+                        self.cfg.folder, self.cfg.codex_executable, self._codex_dir,
+                        extra_read=self.subagent_paths(server) if server else (), args=codex_args))
+                except ConfinementUnavailable as exc:
+                    self._drop_codex_dir()
+                    self.status = "failed"
+                    self.emit({"kind": "error", "text": f"Codex was not started: {exc}."})
+                    return
         else:
             extra = {"CLAUDE_CODE_EXECUTABLE": self.cfg.claude_executable} if self.cfg.claude_executable else {}
+            if server and choice.claude:
+                # Claude Code waits this long for an MCP tool; a sub-agent reading a long contract on
+                # a slow host takes minutes.
+                extra["MCP_TOOL_TIMEOUT"] = str(int(self.cfg.subagents_timeout * 1000))
         env = agent_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
                         api_key=self.cfg.agent_key if lend else None, extra=extra)
-        self.agent = AcpAgent(choice.command, env=env, cwd=str(self.cfg.folder),
+        self.agent = AcpAgent(command, env=env, cwd=str(self.cfg.folder),
                               on_update=self.on_update, on_permission=self.on_permission)
+        meta = choice.meta or self.cfg.session_meta
+        if server and choice.claude:
+            meta = with_subagents(meta)
+        if server and choice.codex:
+            # The adapter starts the first task only once the server is up: a task started before
+            # it has no tools of it for the whole task (measured 09.10.2026).
+            meta = {**(meta or {}), "mcpStartupAwaitTimeoutMs": 30000}
         try:
             info = await self.agent.start()
-            self.session_id = await self.agent.new_session(str(self.cfg.folder), choice.meta or self.cfg.session_meta)
+            self.session_id = await self.agent.new_session(
+                str(self.cfg.folder), meta,
+                mcp_servers=[{"name": "matter", "command": server["command"], "args": server["args"], "env": []}]
+                if server else None)
             self.models = model_choice(self.agent.session_setup)
             if self.models:
                 self.emit({"kind": "models", **self.models})
@@ -406,6 +524,51 @@ class AgentHost:
             self.status = "failed"
             log.exception("the agent did not start")
             self.emit({"kind": "error", "text": f"The agent did not start: {exc}"})
+
+    def subagent_server(self, choice: AgentChoice) -> dict | None:
+        """The sub-agents' MCP server for ``choice``, as ``{command, args}`` — none for an agent
+        that has its own way to them (matteragent), or when there are no sub-agents."""
+        if not self.cfg.subagents or not self.cfg.subagents_command or choice.matteragent:
+            return None
+        family = "gpt" if choice.codex else "claude" if choice.claude else ""
+        command = [*self.cfg.subagents_command, "--folder", str(self.cfg.folder),
+                   "--hosts", str(self.cfg.subagents)] + (["--author-family", family] if family else [])
+        return {"command": command[0], "args": command[1:]}
+
+    def codex_server_args(self, server: dict) -> list[str]:
+        """The matter server for Codex, defined whole where Codex starts (``-c``): the adapter's own
+        entry for it has no timeouts, and Codex waits 60 seconds for a tool by default — a sub-agent
+        reading a long contract on a slow host takes minutes. The session still names the server,
+        so the adapter waits for it to start; seeing it defined, the adapter adds no copy."""
+        def toml(value) -> str:
+            return json.dumps(value, ensure_ascii=False)          # a JSON string or list is TOML too
+        return ["-c", f"mcp_servers.matter.command={toml(server['command'])}",
+                "-c", f"mcp_servers.matter.args={toml(server['args'])}",
+                "-c", f"mcp_servers.matter.tool_timeout_sec={int(self.cfg.subagents_timeout)}",
+                "-c", "mcp_servers.matter.startup_timeout_sec=30",
+                # the sub-agents only read, inside the folder Codex may read anyway: not asked each time
+                "-c", 'mcp_servers.matter.default_tools_approval_mode="approve"',
+                "-c", f"developer_instructions={toml(CODEX_SUBAGENTS_NOTE)}"]
+
+    def subagent_paths(self, server: dict) -> list[str]:
+        """What the sub-agents' MCP server reads besides the folder, for Codex's confinement: its
+        hosts file, its program, and — for a Python program — the interpreter's installation and the
+        package, wherever they are installed (asked of the interpreter itself)."""
+        paths = [str(self.cfg.subagents)]
+        program = shutil.which(server["command"]) or server["command"]
+        paths.append(os.path.realpath(program))
+        # a wrapper in an installation's bin/ (the desktop's agent runtime: bin/matteragent-mcp beside
+        # python/): the installation with it — the profile skips what is too wide to open
+        paths.append(os.path.dirname(os.path.dirname(os.path.realpath(program))))
+        if Path(program).name.startswith("python") or _shebang_python(program):
+            python = _shebang_python(program) or program
+            try:
+                done = subprocess.run([python, "-c", _WHERE_INSTALLED], capture_output=True, text=True, timeout=20)
+                paths += [line for line in done.stdout.splitlines() if line.strip()]
+            except (OSError, subprocess.TimeoutExpired):
+                log.warning("could not ask %s where it is installed", python)
+            paths.append(os.path.dirname(os.path.dirname(os.path.realpath(python))))
+        return list(dict.fromkeys(paths))
 
     async def on_update(self, params: dict) -> None:
         u = params.get("update") or {}
@@ -663,6 +826,12 @@ class AgentHost:
             self.listeners.discard(q)
         return resp
 
+    def _drop_codex_dir(self) -> None:
+        """The confined Codex's profile and wrapper, once it no longer runs."""
+        if getattr(self, "_codex_dir", None):
+            shutil.rmtree(self._codex_dir, ignore_errors=True)
+            self._codex_dir = None
+
     def app(self) -> web.Application:
         app = web.Application(client_max_size=64 * 1024 * 1024)
         app.router.add_get("/", self.page)
@@ -677,6 +846,7 @@ class AgentHost:
         async def cleanup(app):
             if self.agent:
                 await self.agent.stop()
+            self._drop_codex_dir()
             await self.proxy._stop(app)
 
         app.on_startup.append(startup)
@@ -684,4 +854,5 @@ class AgentHost:
         return app
 
 
-__all__ = ["AgentChoice", "AgentHost", "HostConfig", "inside", "model_choice", "snapshot", "turn_usage"]
+__all__ = ["AgentChoice", "AgentHost", "CODEX_SUBAGENTS_NOTE", "HostConfig", "inside", "model_choice", "snapshot",
+           "turn_usage", "with_subagents"]
