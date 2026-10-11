@@ -27,6 +27,13 @@ from deidkit.proxy.openai import prepare_responses                      # noqa: 
 COMMAND = ["/opt/runtime/bin/python", "-m", "matteragent.mcp"]
 
 
+
+@pytest.fixture(autouse=True)
+def own_home(tmp_path, monkeypatch):
+    """The person's home is the test's: a matter's Codex home and sign-in link are made under it."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
 @pytest.fixture
 def hosts(tmp_path):
     path = tmp_path / "hosts.toml"

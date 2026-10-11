@@ -7,12 +7,20 @@ on macOS the kernel keeps a confined process inside the matter."""
 import os
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
 from deidkit.agents import confine
-from deidkit.agents.confine import ConfinementUnavailable, confined_codex, profile
+from deidkit.agents.confine import ConfinementUnavailable, confined_codex, matter_codex_home, profile
 
+
+
+@pytest.fixture(autouse=True)
+def own_home(tmp_path, monkeypatch):
+    """The person's home is the test's: a matter's Codex home and sign-in link are made under it."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
 def real(p):
     return os.path.realpath(str(p))
@@ -72,6 +80,86 @@ def test_the_kernel_keeps_a_confined_process_in_the_matter(tmp_path):
     code, said = read(os.path.expanduser("~/.zshrc") if os.path.exists(os.path.expanduser("~/.zshrc"))
                       else "/Users/Shared")
     assert code != 0
+
+
+def test_the_shared_temp_folders_are_closed_and_the_sign_in_is_the_one_file_opened_beside(tmp_path):
+    text = profile(tmp_path / "matters" / "case-1", "/opt/codex/bin/codex", tmp_path / "codex-home",
+                   auth_file=tmp_path / "person" / ".codex" / "auth.json")
+    deny = next(l for l in text.splitlines() if l.startswith("(deny "))
+    assert '(subpath "/private/tmp")' in deny and '(subpath "/private/var/folders")' in deny
+    opened = text.splitlines()
+    assert f'(allow file-read* file-write* (literal "{real(tmp_path / "person" / ".codex" / "auth.json")}"))' in opened
+    assert f'(subpath "{real(tmp_path / "person" / ".codex")}")' not in text      # not the rest of it
+
+
+def test_a_matter_has_its_own_codex_home_with_the_persons_sign_in_linked(tmp_path):
+    person = tmp_path / "person" / ".codex"
+    home = tmp_path / "deid" / "codex" / "case-1"
+    assert matter_codex_home(home, person) is None and not (home / "auth.json").exists()   # not signed in
+    person.mkdir(parents=True)
+    (person / "auth.json").write_text('{"tokens": "the person\'s"}')
+    auth = matter_codex_home(home, person)
+    assert auth == person.resolve() / "auth.json" and (home / "auth.json").is_symlink()
+    assert (home / "tmp").is_dir() and matter_codex_home(home, person) == auth            # made once
+    (home / "auth.json").write_text('{"tokens": "refreshed"}')                  # a write goes to theirs
+    assert (person / "auth.json").read_text() == '{"tokens": "refreshed"}'
+
+
+@pytest.mark.skipif(not confine.supported(), reason="Seatbelt is macOS's")
+def test_the_kernel_keeps_codex_out_of_the_shared_temp_and_of_the_persons_other_sessions(tmp_path):
+    """Probed 11.10.2026: a confined Codex read /tmp, $TMPDIR and every session in ~/.codex."""
+    matter = tmp_path / "matters" / "case-1"
+    matter.mkdir(parents=True)
+    person = tmp_path / "person" / ".codex"
+    (person / "sessions").mkdir(parents=True)
+    (person / "auth.json").write_text("signed in\n")
+    (person / "sessions" / "other-matter.jsonl").write_text("another matter's transcript\n")
+    shared = tempfile.NamedTemporaryFile("w", dir="/private/tmp", prefix="deid-confine-", delete=False)
+    shared.write("another program's scratch\n")
+    shared.close()
+    home = tmp_path / "deid" / "codex" / "case-1"
+    auth = matter_codex_home(home, person)
+    tools = tmp_path / "tools" / "bin"
+    tools.mkdir(parents=True)
+    # "Codex": runs the shell line it is given, under the profile, with the wrapper's TMPDIR
+    (tools / "codex").write_text('#!/bin/sh\nexec /bin/sh -c "$1"\n')
+    (tools / "codex").chmod(0o755)
+    wrapper = confined_codex(matter, str(tools / "codex"), tmp_path / "w", home, auth_file=auth)
+
+    def run(line):
+        done = subprocess.run([str(wrapper), line], capture_output=True, text=True, timeout=30)
+        return done.returncode, done.stdout + done.stderr
+
+    try:
+        assert run(f'cat "{home / "auth.json"}"') == (0, "signed in\n")        # its sign-in, through the link
+        assert run(f'cat "{person / "sessions" / "other-matter.jsonl"}"')[0] != 0
+        code, said = run(f'cat "{shared.name}"')
+        assert code != 0 and "scratch" not in said
+        code, said = run('echo own > "$TMPDIR/x" && cat "$TMPDIR/x" && echo "$TMPDIR"')
+        assert code == 0 and said.startswith("own\n") and said.strip().endswith(str(home.resolve() / "tmp") + "/")
+    finally:
+        os.unlink(shared.name)
+
+
+async def test_codex_gets_the_matters_own_home(tmp_path):
+    from deidkit.agents.host import AgentChoice, HostConfig
+    from deidkit.proxy.server import ProxyConfig
+    from test_agent_host import FAKE, started
+
+    person = tmp_path / "home" / ".codex"                    # HOME is tmp_path/home in these tests
+    person.mkdir(parents=True)
+    (person / "auth.json").write_text("{}")
+    agents = [AgentChoice("Codex", [sys.executable, str(FAKE), "codex-acp"])]
+    cfg = HostConfig(folder=tmp_path / "m", scope="case/1", title="Case 1", agent_command=[], dev_login=True,
+                     codex_executable="/opt/codex/bin/codex", agents=agents, codex_confine=False)
+    (tmp_path / "m").mkdir()
+    host, client = await started(cfg, ProxyConfig(default_scope="case/1"))
+    try:
+        home = tmp_path / "home" / ".deid" / "agent" / "codex" / "case_1"
+        assert host.agent.env["CODEX_HOME"] == str(home)
+        assert (home / "auth.json").is_symlink() and os.path.realpath(home / "auth.json") == real(person / "auth.json")
+    finally:
+        await client.close()
 
 
 async def test_the_host_does_not_start_codex_where_it_cannot_be_confined(tmp_path, monkeypatch):

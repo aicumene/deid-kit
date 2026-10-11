@@ -74,7 +74,7 @@ from pathlib import Path
 from aiohttp import web
 
 from deidkit.agents.acp import AcpAgent, agent_env, codex_env
-from deidkit.agents.confine import ConfinementUnavailable, codex_with, confined_codex
+from deidkit.agents.confine import ConfinementUnavailable, codex_with, confined_codex, matter_codex_home
 from deidkit.agents.pricing import RequestUsage, request_usage, task_cost
 from deidkit.proxy.anthropic import SUBAGENT_KINDS
 from deidkit.proxy.server import Proxy
@@ -147,6 +147,9 @@ class HostConfig:
     #: Codex confined by the kernel to the matter folder (:mod:`deidkit.agents.confine`). Where that
     #: cannot be done, Codex does not start unless this is False (``--codex-unconfined``).
     codex_confine: bool = True
+    #: Codex's home for this matter (``--codex-home``): its own sessions and settings, the person's
+    #: sign-in linked in. None: ``~/.deid/agent/codex/<scope>``.
+    codex_home: Path | None = None
     port: int = 8790
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     #: What the agent sends as its key; the proxy swaps it for ``api_key``, which stays there.
@@ -709,8 +712,12 @@ class AgentHost:
         if self.cfg.subagents and choice.matteragent and "--subagents" not in command:
             command += ["--subagents", str(self.cfg.subagents)]
         if choice.codex:
+            # Codex's home for this matter: the person's ~/.codex holds the sessions of all their work.
+            home = self.cfg.codex_home or \
+                Path("~/.deid/agent/codex").expanduser() / re.sub(r"[^A-Za-z0-9._-]", "_", self.cfg.scope)
+            auth = matter_codex_home(home)
             extra = codex_env(base_url=f"http://127.0.0.1:{self.cfg.port}", scope=self.cfg.scope,
-                              codex_path=self.cfg.codex_executable)
+                              codex_path=self.cfg.codex_executable, codex_home=str(home))
             codex_args = self.codex_server_args(server) if server else []
             if self.cfg.codex_confine or codex_args:
                 self._drop_codex_dir(seat)
@@ -720,8 +727,9 @@ class AgentHost:
             if self.cfg.codex_confine:
                 try:
                     extra["CODEX_PATH"] = str(confined_codex(
-                        self.cfg.folder, self.cfg.codex_executable, seat.codex_dir,
-                        extra_read=self.subagent_paths(server) if server else (), args=codex_args))
+                        self.cfg.folder, self.cfg.codex_executable, seat.codex_dir, codex_home=home,
+                        extra_read=self.subagent_paths(server) if server else (), args=codex_args,
+                        auth_file=auth))
                 except ConfinementUnavailable as exc:
                     self._drop_codex_dir(seat)
                     self.status = "failed"

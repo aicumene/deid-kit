@@ -143,6 +143,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="the claude binary the Claude adapter should run")
     ap.add_argument("--codex-executable", default=shutil.which("codex"),
                     help="the person's own codex binary, for an agent that is Codex (codex-acp)")
+    ap.add_argument("--codex-home", metavar="DIR",
+                    help="Codex's home for this matter (default ~/.deid/agent/codex/<scope>): its own "
+                         "sessions and settings, the person's sign-in linked in")
     ap.add_argument("--codex-unconfined", action="store_true",
                     help="start Codex without confining it to the folder (where that cannot be "
                          "done: on macOS it is, with Seatbelt); it can then read the whole disk")
@@ -184,6 +187,7 @@ def main(argv: list[str] | None = None) -> None:
                      agent_command=shlex.split(args.agent_command), api_key=api_key,
                      dev_login=args.dev_login, claude_executable=args.claude_executable,
                      codex_executable=args.codex_executable, codex_confine=not args.codex_unconfined,
+                     codex_home=Path(args.codex_home).expanduser() if args.codex_home else None,
                      port=args.port,
                      usage_log=Path(args.usage_log).expanduser() if args.usage_log else None,
                      agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable,
