@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "deidkit-fold"
+version = "0.1.0"
+description = "deid-kit's name fold in Rust (deidkit.namefold uses it when it is installed)"
+requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+authors = [{ name = "Alexandra Bernadotte" }]
+
+[tool.maturin]
+module-name = "deidkit_fold"

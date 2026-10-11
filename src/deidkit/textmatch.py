@@ -59,7 +59,8 @@ def normalize(text: str) -> str:
     s = text or ""
     s = _LINEBREAK_HYPHEN.sub("", s)
     s = unicodedata.normalize("NFKC", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
+    if not s.isascii():                 # ASCII has no format characters: the walk is for the rest
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
     s = s.translate(_PUNCT_FOLD)
     return _WS.sub(" ", s).strip().casefold()
 

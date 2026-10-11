@@ -70,6 +70,7 @@ src/deidkit/
   seedfile.py        load_seed_files — known people and organisations from a TOML file
   proxy/             deid-proxy — the local proxy between a coding agent and its model:
                      anthropic.py (Claude Code), openai.py (Codex), server.py, cli.py
+native/              deidkit_fold — namefold's fold in Rust, optional (see Install and test)
 tests/               pytest suite, no network, no database, invented names only
 ```
 
@@ -87,6 +88,21 @@ No runtime dependencies (standard library only). Optional extra `proxy` (`aiohtt
 as `en_core_web_sm` is installed separately). Test extra: `pytest`, `pytest-asyncio`, `aiohttp`.
 Python 3.11 or newer. llm-kit is not required; when it is installed, `Sensitivity`,
 `PrivacyViolation` and the request types are llm-kit's own objects (see `model.py`).
+
+The fold in Rust, optional. `namefold` folds a text one character at a time, and on a long document
+that walk was three quarters of a request's time in the proxy: 0.54 s for a Claude Code request
+carrying a 183K-character contract (measured 10.10.2026). `native/` is the same fold in Rust (PyO3);
+with it the same request takes 0.20 s. Install it into the environment that runs deid-kit — it needs
+Rust and builds its tables from that interpreter's Unicode database:
+
+```
+.venv/bin/pip install ./native
+```
+
+`namefold` uses it when it is installed and was built for this interpreter's Unicode version, and the
+Python fold otherwise (a module built for another refuses to start, with a warning);
+`DEIDKIT_NATIVE=0` keeps the Python. `tests/test_namefold_native.py` holds the two folds to the same
+answers on every code point.
 
 ## Plugging in a deployment
 

@@ -1,0 +1,19 @@
+[package]
+name = "deidkit-fold"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+description = "deid-kit's name fold in Rust: deidkit.namefold's fold, confusable and strip_marks over tables of the interpreter's own Unicode database"
+
+[lib]
+name = "deidkit_fold"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

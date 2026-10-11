@@ -34,6 +34,8 @@ Pure: stdlib only. No ORM, no settings, no model.
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -123,6 +125,13 @@ def fold(raw: str) -> Folded:
     The steps, in ``normalize``'s order: drop hyphen-before-linebreak, NFKC, drop format
     characters, fold punctuation shapes, collapse whitespace, casefold.
     """
+    if NATIVE is not None:
+        try:
+            text, starts, ends = NATIVE.fold(raw or "")
+        except UnicodeEncodeError:      # a lone surrogate: a Rust string cannot hold one
+            pass
+        else:
+            return Folded(text=text, starts=starts, ends=ends, raw_len=len(raw or ""))
     raw = raw or ""
     skip: set[int] = set()
     for m in _LINEBREAK_HYPHEN.finditer(raw):
@@ -203,6 +212,11 @@ def confusable(folded_text: str) -> str:
         (legal forms, patronymic tails, generic/structure/role words), so a table written in
         Cyrillic still matches text this function has rewritten.
     """
+    if NATIVE is not None:
+        try:
+            return NATIVE.confusable(folded_text)
+        except UnicodeEncodeError:
+            pass
     out = []
     for ch in folded_text:
         if ch in _CONFUSABLE_KEEP:
@@ -236,6 +250,18 @@ def strip_marks(text: str, folded: Folded | None = None) -> tuple[str, Folded | 
     Offsets stay valid because a dropped mark's raw span is folded into the span of the
     character it decorates: the replacement still covers every raw byte it consumed.
     """
+    if NATIVE is not None:
+        try:
+            stripped = NATIVE.strip_marks(text, *((folded.starts, folded.ends) if folded is not None else ()))
+        except UnicodeEncodeError:
+            pass
+        else:
+            if stripped is None:
+                return text, folded
+            out, starts, ends = stripped
+            if folded is None:
+                return out, None
+            return out, Folded(text=out, starts=starts, ends=ends, raw_len=folded.raw_len)
     if not any(unicodedata.category(c) in _MARK_CATS for c in text):
         return text, folded
     chars: list[str] = []
@@ -259,14 +285,57 @@ def strip_marks(text: str, folded: Folded | None = None) -> tuple[str, Folded | 
 
 def key(value: str) -> str:
     """The vault's match key for a needle: canonical fold, confusable fold, marks dropped."""
-    return strip_marks(confusable(canonical_normalize(value)))[0]
+    normalized = canonical_normalize(value)
+    if NATIVE is not None:
+        try:
+            return NATIVE.key_tail(normalized)
+        except UnicodeEncodeError:
+            pass
+    return strip_marks(confusable(normalized))[0]
 
 
 def fold_haystack(raw: str) -> tuple[str, Folded]:
     """(searchable text, offsets) for a document, folded exactly as :func:`key` folds a needle."""
+    if NATIVE is not None:
+        try:
+            text, folded_text, starts, ends = NATIVE.fold_haystack(raw or "")
+        except UnicodeEncodeError:
+            pass
+        else:
+            return text, Folded(text=folded_text, starts=starts, ends=ends, raw_len=len(raw or ""))
     f = fold(raw)
     text, f2 = strip_marks(confusable(f.text), f)
     return text, (f2 or f)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b. The same fold in Rust, when it is installed
+# ─────────────────────────────────────────────────────────────────────────────
+# MEASURED 10.10.2026: on a 183K-character contract the walks above, one character at a time, were three
+# quarters of the proxy's 0.54 s for the request. ``deidkit_fold`` (``native/``, Rust) takes the same
+# steps over tables made from this interpreter's own Unicode database when it was built, and is handed
+# the maps above, so the two folds answer from the same data — tests/test_namefold_native.py holds
+# them to the same answers on every code point. A module built for another Unicode version refuses to
+# start and the Python above folds; so it does for a string Rust cannot hold (a lone surrogate), and
+# everywhere with DEIDKIT_NATIVE=0.
+
+def _native():
+    if os.environ.get("DEIDKIT_NATIVE", "1") == "0":
+        return None
+    try:
+        import deidkit_fold
+    except ImportError:
+        return None
+    try:
+        return deidkit_fold.Fold(unicodedata.unidata_version, _LINEBREAK_HYPHEN.pattern, _WS_RE.pattern,
+                                 dict(_PUNCT_FOLD), dict(_HOMOGLYPH), dict(_CONFUSABLE_SINGLETON),
+                                 sorted(_CONFUSABLE_KEEP))
+    except ValueError as exc:
+        logging.getLogger(__name__).warning("the native fold is not used: %s", exc)
+        return None
+
+
+NATIVE = _native()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
