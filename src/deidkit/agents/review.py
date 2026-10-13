@@ -665,13 +665,67 @@ def new_path_ok(folder: Path, path: str) -> bool:
     return not (folder / path).exists()
 
 
+# ── votes on the chat's answers ───────────────────────────────────────────────────────────────────
+CHAT_FEEDBACK = "chat-feedback"
+MAX_ANSWER = 20000
+MAX_QUESTION = 4000
+
+
+def vote(*, key: str, question: str, answer: str, agent: str, model: str, verdict: str, creator: dict,
+         comment: str = "", correction: str = "") -> dict:
+    """A person's 👍 or 👎 on an answer of the agent in the chat, with the question it answered, the answer, and
+    what they said and would have had it say. One per answer: ``key`` (the chat's and the answer's ids) names
+    it, and a later vote replaces it."""
+    body = [{"type": "TextualBody", "value": verdict, "purpose": "assessing"}]
+    if comment:
+        body.append({"type": "TextualBody", "value": comment, "purpose": "commenting"})
+    if correction:
+        body.append({"type": "TextualBody", "value": correction, "purpose": "replacing"})
+    ann = _base("assessing", creator, {"source": "chat"}, body, {
+        "kind": "vote", "verdict": verdict, "question": question[:MAX_QUESTION], "answer": answer[:MAX_ANSWER],
+        "agent": _text(agent, 80), "model": _text(model, 80)})
+    ann["id"] = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return ann
+
+
+def store_vote(folder: Path, ann: dict) -> Path:
+    target = folder / NOTES / CHAT_FEEDBACK / f"{ann['id']}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(ann, ensure_ascii=False, indent=2) + "\n", "utf-8")
+    tmp.replace(target)
+    return target
+
+
+def votes(folder: Path) -> list[dict]:
+    """The votes on the chat's answers kept in this folder, as records."""
+    root = folder / NOTES / CHAT_FEEDBACK
+    out = []
+    for f in sorted(root.glob("*.json")) if root.is_dir() else []:
+        try:
+            ann = json.loads(f.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        bernio = ann.get("bernio") if isinstance(ann, dict) and isinstance(ann.get("bernio"), dict) else {}
+        if bernio.get("kind") != "vote" or bernio.get("verdict") not in ("up", "down"):
+            continue
+        out.append({"type": "answer_vote", "at": _text(ann.get("created"), 40),
+                    "agent": _text(bernio.get("agent"), 80), "model": _text(bernio.get("model"), 80),
+                    "question": str(bernio.get("question") or "")[:MAX_QUESTION],
+                    "answer": str(bernio.get("answer") or "")[:MAX_ANSWER],
+                    "verdict": bernio["verdict"], "comment": _body(ann, "commenting"),
+                    "correction": _body(ann, "replacing", MAX_REPLACEMENT)})
+    return out
+
+
 # ── what people decided, for the harness and for learning ─────────────────────────────────────────
 def records(folder: Path) -> list[dict]:
     """What people decided of the agents' work in this folder, one record each — with the agent and its
-    model, the note or change it was about, the verdict and the person's words — and what people wrote
-    over documents an agent wrote. Real text: it goes out only tokenized (``dataset``)."""
+    model, the note or change it was about, the verdict and the person's words — what people wrote over
+    documents an agent wrote, and their votes on the agent's answers in the chat. Real text: it goes out
+    only tokenized (``dataset``)."""
     root = folder / NOTES / "markup"
-    out: list[dict] = []
+    out: list[dict] = votes(folder)
     if not root.is_dir():
         return out
     docs = sorted({str(f.parent.relative_to(root)) for f in root.rglob("*.json")})

@@ -1175,12 +1175,12 @@ class AgentHost:
             return await self._review_view(request.query.get("path", ""))
         if name == "review" and request.method == "POST":
             return await self._review_start(((await request.json()).get("path") or "").strip())
-        if name in ("review-suggest", "review-decide", "review-text") and request.method == "POST":
+        if name in ("review-suggest", "review-decide", "review-text", "review-vote") and request.method == "POST":
             body = await request.json()
             if not isinstance(body, dict):
                 return web.json_response({"error": "bad request"}, status=400)
             return await {"review-suggest": self._review_suggest, "review-decide": self._review_decide,
-                          "review-text": self._review_text}[name](body)
+                          "review-text": self._review_text, "review-vote": self._review_vote}[name](body)
         if name == "review-dataset" and request.method == "GET":
             records = await review.dataset(self.cfg.folder, self.proxy.engine(self.cfg.scope))
             return web.json_response({"records": records, "count": len(records)})
@@ -1258,6 +1258,21 @@ class AgentHost:
             path=path, target=target, verdict=verdict, creator=review.person(self.cfg.person),
             comment=comment, correction=correction, applied=applied))
         return web.json_response({"ok": True, "applied": applied, **({"why": why} if why else {})})
+
+    async def _review_vote(self, body: dict) -> web.Response:
+        """The person's 👍 or 👎 on an answer of the agent in the chat, kept in the matter's notes folder for
+        learning (``review-dataset``); a later vote on the same answer replaces it."""
+        key, verdict = body.get("key"), body.get("verdict")
+        question, answer = body.get("question"), body.get("answer")
+        if verdict not in ("up", "down") or not isinstance(key, str) or not key.strip() or len(key) > 200 \
+                or not isinstance(answer, str) or not answer.strip() or not isinstance(question, str):
+            return web.json_response({"error": "no such vote"}, status=400)
+        correction = body["correction"].strip()[:review.MAX_REPLACEMENT] if isinstance(body.get("correction"), str) else ""
+        ann = review.vote(key=key, question=question, answer=answer, agent=str(body.get("agent") or ""),
+                          model=str(body.get("model") or ""), verdict=verdict, creator=review.person(self.cfg.person),
+                          comment=review._text(body.get("comment"), review.MAX_NOTE), correction=correction)
+        review.store_vote(self.cfg.folder, ann)
+        return web.json_response({"ok": True, "id": ann["id"]})
 
     async def _review_text(self, body: dict) -> web.Response:
         """The person's own writing, from the editor: the whole text of a Markdown or text document, over

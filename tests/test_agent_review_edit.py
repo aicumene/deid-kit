@@ -222,3 +222,23 @@ def test_a_person_s_own_document_gives_no_revision_record(tmp_path):
     review.store(tmp_path, "notes.md", review.revision(path="notes.md", before="a\n", after="b\n",
                                                        creator=review.person("ada")))
     assert review.records(tmp_path) == []
+
+
+# ── votes on the chat's answers ───────────────────────────────────────────────────────────────────
+async def test_a_vote_on_an_answer_is_kept_once_and_goes_out_tokenized(rig):
+    host, call, folder = rig
+    body = {"key": "chat-1/a-7", "question": "Can the tenant break early?", "answer": "Yes, write to t.wren@example.com.",
+            "agent": "Claude Code", "model": "claude-opus-5-5", "verdict": "up"}
+    status, first = await call("review-vote", body)
+    assert status == 200
+    status, again = await call("review-vote", {**body, "verdict": "down", "comment": "ask t.wren@example.com first",
+                                               "correction": "Only after the first year."})
+    assert again["id"] == first["id"]                                   # one vote an answer: the later one
+    files = list((folder / ".legix/chat-feedback").glob("*.json"))
+    assert len(files) == 1 and json.loads(files[0].read_text())["bernio"]["verdict"] == "down"
+    _, out = await call("review-dataset", {}, "GET")
+    [rec] = [r for r in out["records"] if r["type"] == "answer_vote"]
+    assert rec["verdict"] == "down" and rec["agent"] == "Claude Code" and rec["correction"] == "Only after the first year."
+    assert "t.wren@example.com" not in json.dumps(rec) and "EMAIL_" in rec["answer"]
+    for bad in ({**body, "verdict": "meh"}, {**body, "answer": " "}, {**body, "key": ""}, {**body, "key": "x" * 201}):
+        assert (await call("review-vote", bad))[0] == 400
