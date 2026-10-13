@@ -171,6 +171,23 @@ enable_request_compression = false
   confined Codex may read the hosts file and the server's installation besides the folder.
   `--subagents-timeout` (900 s) is how long Claude Code and Codex wait for one report. Without
   `--subagents` nothing changes.
+- **Reviewing a document.** `GET /deid-agent/api/review?path=` gives a document of the folder with
+  its layers, as the desktop's review tab shows them (`deidkit/agents/review.py`): its text (a Word
+  document's is `.legix/text/<path>.md`, which the app writes), where each token of the scope's engine
+  stands in it (`deid`: what a model sees as a token, found by walking the tokenized text against the
+  original), the norms it refers to (`norms`: the server's citation extractor, copied without its
+  knowledge base, so a mention is found, not checked), and the agents' notes. `POST` with `{"path"}`
+  has the agent at work review it: it is asked for one JSON object of notes, each on a quote of the
+  document's own words, with its kind (risk, question, point, or clause — what a clause does: type,
+  who, what, for whom, when), aspect, importance 1–5, the norm it turns on and a note. The proxy
+  tokenizes the task and the text as always. Each quote is looked up in the text by code — typographic
+  quotes, dashes, white space, Markdown's escapes and an ellipsis between parts are allowed for —
+  and a note whose quote is not there is not kept; the `review` event says how many were kept and why
+  the others were not. A kept note is a W3C Web Annotation, one file each in
+  `.legix/markup/<path>/<id>.json`, with the agent and the model that answered as its creator. The
+  matter's notes folder is versioned and synced by leGix with the documents, and the host does not
+  count it as the agent's work. Nothing in a note file is trusted when it is read: its words are
+  looked up in the text again, so a note shows where they are now, or that they are gone.
 - **Not applied yet.** Initials of a known person that no document defines, which the vault can
   tokenize (`deidkit.address.tokenize_initials`), are not yet applied by the proxy.
 

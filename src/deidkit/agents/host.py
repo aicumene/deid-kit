@@ -68,11 +68,13 @@ import shutil
 import subprocess
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiohttp import web
 
+from deidkit.agents import review
 from deidkit.agents.acp import AcpAgent, agent_env, codex_env
 from deidkit.agents.confine import ConfinementUnavailable, codex_with, confined_codex, matter_codex_home
 from deidkit.agents.pricing import RequestUsage, request_usage, task_cost
@@ -81,7 +83,9 @@ from deidkit.proxy.server import Proxy
 
 log = logging.getLogger("deidkit.agents.host")
 
-_SKIP_DIRS = {".git", ".claude", ".codex", "node_modules", "__pycache__", ".venv"}
+# `.legix` is the matter's notes folder: the app writes the texts of documents and the review's notes there,
+# and neither is the agent's work to show as changed.
+_SKIP_DIRS = {".git", ".claude", ".codex", ".legix", "node_modules", "__pycache__", ".venv"}
 _MAX_FILE = 2 * 1024 * 1024
 #: What :meth:`AgentHost.warm_vault` reads: the folder's text documents, not its binaries.
 _WARM_SUFFIXES = {".md", ".txt", ".csv", ".json", ".html", ".xml", ".eml"}
@@ -117,6 +121,13 @@ class AgentChoice:
     def claude(self) -> bool:
         """Claude Code through its ACP adapter (``claude-agent-acp``, or the desktop's ``claude-acp``)."""
         return any("claude-agent-acp" in part or Path(part).name == "claude-acp" for part in self.command)
+
+    @property
+    def label(self) -> str:
+        """What the person calls it: its name, or, for the one agent of ``--agent-command``, what it is."""
+        if self.name:
+            return self.name
+        return "Claude Code" if self.claude else "Codex" if self.codex else "MatterAgent" if self.matteragent else "Agent"
 
     @property
     def matteragent(self) -> bool:
@@ -994,16 +1005,17 @@ class AgentHost:
         """An answer of the model crossed the proxy: count it into the task under way."""
         self.requests.append(request_usage(usage, model))
 
-    async def run_prompt(self, text: str, *, carrying_from: str | None = None) -> None:
+    async def run_prompt(self, text: str, *, carrying_from: str | None = None, shown: str | None = None) -> None:
         """A task for the agent at work — or, ``carrying_from`` another agent, the task under way, handed
-        over. What was done that it has not seen goes first in the same prompt, as a brief (:func:`brief`)."""
+        over. What was done that it has not seen goes first in the same prompt, as a brief (:func:`brief`).
+        ``shown`` is what the page and the other agents' briefs say of the task, if not its own words."""
         seat = self.seat
         self.busy = True
         self.key_refused_told = False
         self.requests = []
         told = brief(self.events[seat.seen:], self.current.name, carrying_on=carrying_from is not None)
         if carrying_from is None:
-            self.emit({"kind": "user", "text": text, "agent": self.current.name})
+            self.emit({"kind": "user", "text": shown or text, "agent": self.current.name})
         if told:
             self.emit({"kind": "brief", "agent": self.current.name, "text": told})
         seat.seen = len(self.events)
@@ -1140,6 +1152,10 @@ class AgentHost:
         if name == "cancel" and request.method == "POST":
             await self.stop_turn()
             return web.json_response({"ok": True})
+        if name == "review" and request.method == "GET":
+            return await self._review_view(request.query.get("path", ""))
+        if name == "review" and request.method == "POST":
+            return await self._review_start(((await request.json()).get("path") or "").strip())
         if name == "file" and request.method == "GET":
             rel = request.query.get("path", "")
             target = self.cfg.folder / rel
@@ -1148,6 +1164,65 @@ class AgentHost:
             data = target.read_bytes()[:_MAX_FILE]
             return web.json_response({"path": rel, "text": data.decode("utf-8", "replace")})
         return web.json_response({"error": "not found"}, status=404)
+
+    # ── review ───────────────────────────────────────────────────────────────
+    async def _review_view(self, path: str) -> web.Response:
+        """The document ``path`` under review: its text, and over it what is de-identified, the norms it
+        refers to and the agents' notes (:mod:`deidkit.agents.review`)."""
+        read = review.read_text(self.cfg.folder, path)
+        if read is None:
+            return web.json_response({"error": "no text for this document", "source": review.text_source(path)},
+                                     status=404)
+        source, text = read
+        red = (await self.proxy.engine(self.cfg.scope).tokenize_all([text]))[0]
+        deid = review.deid_spans(text, red.text, red.surfaces or {}, red.mapping or {})
+        return web.json_response({
+            "path": path, "source": source, "text": text, "deid": deid,
+            "norms": review.norm_mentions(text),
+            "notes": review.load(self.cfg.folder, path, text),
+            "agent": {"name": self.current.label, "busy": self.busy, "ready": self.status == "ready"},
+        })
+
+    async def _review_start(self, path: str) -> web.Response:
+        read = review.read_text(self.cfg.folder, path)
+        if read is None:
+            return web.json_response({"error": "no text for this document", "source": review.text_source(path)},
+                                     status=404)
+        if self.busy or self.status != "ready" or self.handover is not None:
+            return web.json_response({"error": "the agent is busy or not ready"}, status=409)
+        run = uuid.uuid4().hex[:12]
+        self.busy = True                     # taken now: a second review or a task cannot slip in before it starts
+        asyncio.create_task(self.run_review(path, read[0], run))
+        return web.json_response({"ok": True, "run": run}, status=202)
+
+    def _model_name(self) -> str:
+        """The model that answered the task just done, as the provider named it; else as the agent does."""
+        if self.requests and self.requests[-1].model:
+            return self.requests[-1].model
+        models = self.models or {}
+        return next((o["name"] for o in models.get("options") or [] if o.get("value") == models.get("current")),
+                    str(models.get("current") or ""))
+
+    async def run_review(self, path: str, source: str, run: str) -> None:
+        """The agent at work reviews the document; the notes whose quotes are in the text are kept."""
+        agent = self.current.label
+        self.emit({"kind": "review", "state": "started", "path": path, "run": run, "agent": agent})
+        at = len(self.events)
+        self.busy = False                    # run_prompt takes it again at once, with no await between
+        await self.run_prompt(review.prompt(path, source), shown=f"Review {path}")
+        answer = "".join(e.get("text", "") for e in self.events[at:] if e.get("kind") == "message")
+        failed = next((e.get("text") for e in self.events[at:] if e.get("kind") == "error"), None)
+        notes = review.parse_notes(answer)
+        read = review.read_text(self.cfg.folder, path)
+        if notes is None or read is None:
+            why = failed or ("the document's text is gone" if read is None else "the agent did not answer with notes")
+            self.emit({"kind": "review", "state": "failed", "path": path, "run": run, "agent": agent, "text": why})
+            return
+        model = self._model_name()
+        creator = {"type": "Software", "name": agent, **({"model": model} if model else {})}
+        kept = review.keep(self.cfg.folder, path, read[1], notes, creator=creator, run=run)
+        self.emit({"kind": "review", "state": "done", "path": path, "run": run, "agent": agent, "model": model,
+                   "kept": len(kept["kept"]), "refused": kept["refused"]})
 
     async def _set_model(self, value: str) -> web.Response:
         """Switch the agent's model between tasks. The agent's own answer is what the page shows:

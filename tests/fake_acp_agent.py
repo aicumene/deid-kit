@@ -6,7 +6,9 @@ names the one it works on in its answer. It reports its window (usage_update) an
 cost (usage on its answer), as ACP has them. Given a name (its first argument), it says it in its
 answer: the tests that switch agents tell them apart by it. A ``session/cancel`` ends the turn at its
 next step with ``cancelled``. With ``echo-prompt`` among its arguments it also says which turn of its
-session this is and the text blocks of the prompt it was given."""
+session this is and the text blocks of the prompt it was given. With ``review`` among them it answers a
+review task (deidkit.agents.review) with notes: one on the document's third line, its apostrophes curled
+the way models write them, and one on words the document does not have."""
 
 import json
 import os
@@ -86,6 +88,21 @@ for line in sys.stdin:
     elif method == "session/prompt":
         cancelled = False
         turns += 1
+        asked = " ".join(b.get("text") or "" for b in params.get("prompt") or [])
+        if "review" in sys.argv[2:] and "Review the document" in asked:
+            source = asked.split('Its text is in the file "', 1)[1].split('"', 1)[0]
+            with open(os.path.join(cwd, source), encoding="utf-8") as fh:
+                line = fh.read().split("\n")[2]
+            notes = {"notes": [
+                {"quote": line[:70].replace("'", "’"), "kind": "risk", "aspect": "termination", "importance": 4,
+                 "clause_type": "right", "who": "the Tenant", "what": "break the lease",
+                 "norm": "Housing Act 1988 s. 21", "note": "A break right on short notice."},
+                {"quote": "Words this document never had.", "kind": "question", "aspect": "payment",
+                 "importance": 2, "note": "Invented."}]}
+            update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "I read it {first}. "}})
+            update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": json.dumps(notes)}})
+            send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+            continue
         said = (f"[{NAME}] " if NAME else "") + (f"[meta {json.dumps(meta, sort_keys=True)}] " if meta else "")
         if ECHO:
             said += f"[turn {turns}] [prompt {json.dumps([b.get('text') for b in params.get('prompt') or []])}] "
