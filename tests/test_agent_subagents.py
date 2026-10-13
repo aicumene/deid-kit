@@ -146,8 +146,9 @@ async def test_without_sub_agents_nothing_changes(tmp_path):
     agent = AgentChoice("Claude Code", [sys.executable, str(FAKE), "claude-agent-acp"], meta=meta)
     folder = tmp_path / "matter"
     folder.mkdir()
+    # Claude Code's sandbox settings are added with or without sub-agents (test_agent_claude_confine)
     said = await said_by(HostConfig(folder=folder, scope="case-1", title="Case 1", agent_command=[],
-                                    dev_login=True, agents=[agent]))
+                                    dev_login=True, agents=[agent], claude_confine=False))
     assert "[mcp " not in said and "[mcp-timeout" not in said and bracket(said, "meta") == meta
 
 

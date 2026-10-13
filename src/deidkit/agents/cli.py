@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -33,6 +34,8 @@ from deidkit.proxy.server import Proxy, ProxyConfig
 from deidkit.seedfile import load_scope_paths, load_seed_files
 from deidkit.seeds import SeedEntity
 from deidkit.sqlite_store import SQLiteTokenStore
+
+log = logging.getLogger("deidkit.agents.cli")
 
 #: The Claude adapter at a fixed version. Unpinned, `npx -y` fetches each new release at the
 #: agent's start: on 1 October 2026 a new release brought a new Agent SDK with its 216 MB
@@ -149,6 +152,15 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--codex-unconfined", action="store_true",
                     help="start Codex without confining it to the folder (where that cannot be "
                          "done: on macOS it is, with Seatbelt); it can then read the whole disk")
+    ap.add_argument("--claude-unconfined", action="store_true",
+                    help="run Claude Code's shell commands outside its sandbox: they can then reach "
+                         "the network and read the whole disk (by default no network, and people's "
+                         "files closed but the folder)")
+    ap.add_argument("--guard", default=os.environ.get("DEID_AGENT_GUARD") or shutil.which("agent-guard") or "",
+                    help="agent-guard, which decides each of Claude Code's tool calls before it runs and "
+                         "journals it (default: $DEID_AGENT_GUARD, or agent-guard on PATH); the journal "
+                         "is <the audit's folder>/guard/<scope>.jsonl")
+    ap.add_argument("--no-guard", action="store_true", help="start Claude Code without agent-guard")
     ap.add_argument("--upstream", default="https://api.anthropic.com",
                     help="where the agent's model requests go: Anthropic, or a server of the "
                          "organization's own that speaks the Messages API (/v1/messages)")
@@ -196,7 +208,18 @@ def main(argv: list[str] | None = None) -> None:
                      style=Path(args.style).expanduser() if args.style else None,
                      subagents=Path(args.subagents).expanduser().resolve() if args.subagents else None,
                      subagents_command=shlex.split(args.subagents_command or ""),
-                     subagents_timeout=args.subagents_timeout)
+                     subagents_timeout=args.subagents_timeout,
+                     claude_confine=not args.claude_unconfined)
+    if args.guard and not args.no_guard:
+        guard = Path(args.guard).expanduser()
+        if not (guard.is_file() and os.access(guard, os.X_OK)):
+            sys.exit(f"deid-agent: --guard: not an executable file: {guard}")
+        cfg.guard = [str(guard)]
+        journals = Path(args.audit).expanduser().parent / "guard"
+        journals.mkdir(parents=True, exist_ok=True, mode=0o700)
+        cfg.guard_log = journals / (re.sub(r"[^A-Za-z0-9._-]", "_", args.scope) + ".jsonl")
+    elif not args.no_guard:
+        log.warning("agent-guard is not on PATH: Claude Code works without it (--guard, or --no-guard)")
     if cfg.subagents and not cfg.subagents.is_file():
         sys.exit(f"deid-agent: --subagents: no such file: {cfg.subagents}")
     if cfg.subagents and not cfg.subagents_command and not all(a.matteragent for a in cfg.agents or

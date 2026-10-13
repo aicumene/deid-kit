@@ -174,6 +174,14 @@ class HostConfig:
     subagents_command: list[str] = field(default_factory=list)
     #: Seconds a client waits for one sub-agent's report.
     subagents_timeout: float = 900.0
+    #: Claude Code's shell commands in its sandbox (:func:`claude_settings`). Where the sandbox cannot
+    #: start, Claude Code does not start, unless this is False (``--claude-unconfined``).
+    claude_confine: bool = True
+    #: agent-guard's command (``--guard``): it decides each of Claude Code's tool calls before it runs
+    #: and journals it after. Empty: no guard.
+    guard: list[str] = field(default_factory=list)
+    #: Where agent-guard journals this matter (``<the audit's folder>/guard/<scope>.jsonl``).
+    guard_log: Path | None = None
 
 
 #: The token counts of ACP's draft ``PromptResponse.usage``; anything else in it is left out.
@@ -345,6 +353,75 @@ def with_subagents(meta: dict | None) -> dict:
     options["disallowedTools"] = disallowed + [t for t in ("Task",) if t not in disallowed]
     allowed = list(options.get("allowedTools") or [])
     options["allowedTools"] = allowed + [t for t in SUBAGENT_MCP_TOOLS if t not in allowed]
+    return meta
+
+
+#: Where people's files live: closed to Claude Code's shell commands (``sandbox.filesystem.denyRead``),
+#: but for the matter folder, which ``allowRead`` opens again inside them.
+PEOPLES_FILES = ("/Users", "/Volumes", "/home", "/root", "/mnt", "/media")
+#: The events agent-guard hears: the request (journalled as its fingerprint, not its text), each tool
+#: call before it runs (allow, ask, deny), and how it ended — a call that fails has no PostToolUse.
+GUARD_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure")
+
+
+def claude_settings(folder: Path, *, confine: bool = True, guard: list[str] | None = None,
+                    guard_log: Path | None = None) -> dict:
+    """Claude Code's settings for a matter. The session gives them as ``claudeCode.options.settings``,
+    which the adapter passes on as ``--settings``: the flag tier, which the person's or a folder's own
+    settings files cannot loosen.
+
+    ``confine``: its shell commands run in its sandbox (Seatbelt on macOS, a namespace on Linux), so
+    the kernel holds them where the host's reading of a command line (:func:`outside_paths`) holds
+    only what the command spells out. No network at all; people's files closed, the matter folder
+    open; writes to the folder and a temp folder only. No command leaves the sandbox, and Claude
+    Code does not start without it. The person is still asked before each command, since one that
+    writes changes the matter's files.
+
+    ``guard``: agent-guard's command. Each tool call is decided by it before it runs (allow, ask —
+    the person's card — or deny) and journalled after, in ``guard_log``: a file under the person's
+    home, which the agent's commands cannot read."""
+    settings: dict = {}
+    if confine:
+        settings["sandbox"] = {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "allowUnsandboxedCommands": False,
+            "autoAllowBashIfSandboxed": False,
+            "filesystem": {"denyRead": list(PEOPLES_FILES), "allowRead": [str(folder)]},
+            "network": {"allowedDomains": [], "strictAllowlist": True},
+        }
+    if guard:
+        command = " ".join(shlex.quote(part) for part in [*guard, "hook"])
+        if guard_log is not None:
+            command = f"AGENT_GUARD_LOG={shlex.quote(str(guard_log))} {command}"
+        settings["hooks"] = {event: [{"matcher": "*", "hooks": [{"type": "command", "command": command,
+                                                                 "timeout": 10}]}]
+                             for event in GUARD_EVENTS}
+    return settings
+
+
+def with_claude_settings(meta: dict | None, settings: dict, folder: Path) -> dict:
+    """The session's `_meta` with ``settings`` (:func:`claude_settings`) added to the settings it
+    already gives: the matter's sandbox replaces any sandbox given, its hooks run after any given."""
+    meta = json.loads(json.dumps(meta or {}))
+    if not settings:
+        return meta
+    options = meta.setdefault("claudeCode", {}).setdefault("options", {})
+    given = options.get("settings") or {}
+    if isinstance(given, str):                     # a file, read as the adapter would: from the folder
+        given = json.loads(Path(folder, given).read_text(encoding="utf-8"))
+    if not isinstance(given, dict):
+        raise ValueError("claudeCode.options.settings is neither an object nor a file of one")
+    merged = dict(given)
+    for key, value in settings.items():
+        if key == "hooks":
+            hooks = dict(merged.get("hooks") or {})
+            for event, entries in value.items():
+                hooks[event] = list(hooks.get(event) or []) + entries
+            merged["hooks"] = hooks
+        else:
+            merged[key] = value
+    options["settings"] = merged
     return meta
 
 
@@ -750,6 +827,15 @@ class AgentHost:
         meta = choice.meta or self.cfg.session_meta
         if server and choice.claude:
             meta = with_subagents(meta)
+        if choice.claude:
+            try:
+                meta = with_claude_settings(meta, claude_settings(
+                    self.cfg.folder, confine=self.cfg.claude_confine, guard=self.cfg.guard,
+                    guard_log=self.cfg.guard_log), self.cfg.folder)
+            except (OSError, ValueError) as exc:
+                self.status = "failed"
+                self.emit({"kind": "error", "text": f"Claude Code was not started: its settings: {exc}"})
+                return
         if server and choice.codex:
             # The adapter starts the first task only once the server is up: a task started before
             # it has no tools of it for the whole task (measured 09.10.2026).
