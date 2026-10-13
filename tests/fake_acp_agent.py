@@ -96,7 +96,8 @@ for line in sys.stdin:
             notes = {"notes": [
                 {"quote": line[:70].replace("'", "’"), "kind": "risk", "aspect": "termination", "importance": 4,
                  "clause_type": "right", "who": "the Tenant", "what": "break the lease",
-                 "norm": "Housing Act 1988 s. 21", "note": "A break right on short notice."},
+                 "norm": "Housing Act 1988 s. 21", "note": "A break right on short notice.",
+                 "suggestion": "The Tenant may not break the lease"},
                 {"quote": "Words this document never had.", "kind": "question", "aspect": "payment",
                  "importance": 2, "note": "Invented."}]}
             update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "I read it {first}. "}})

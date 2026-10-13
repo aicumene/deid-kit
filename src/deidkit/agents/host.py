@@ -193,6 +193,8 @@ class HostConfig:
     guard: list[str] = field(default_factory=list)
     #: Where agent-guard journals this matter (``<the audit's folder>/guard/<scope>.jsonl``).
     guard_log: Path | None = None
+    #: Who the person at this Mac is, in the notes and decisions they make on documents (``--person``).
+    person: str = field(default_factory=lambda: os.environ.get("USER", "") or "person")
 
 
 #: The token counts of ACP's draft ``PromptResponse.usage``; anything else in it is left out.
@@ -1020,6 +1022,7 @@ class AgentHost:
             self.emit({"kind": "brief", "agent": self.current.name, "text": told})
         seat.seen = len(self.events)
         started = time.monotonic()
+        before = snapshot(self.cfg.folder)
         try:
             result = await self.agent.prompt(self.session_id, ([told] if told else []) + [text])
             usage = turn_usage(result)
@@ -1033,10 +1036,26 @@ class AgentHost:
             self.emit({"kind": "error", "text": f"The turn failed: {exc}"})
         finally:
             self.busy = False
+            self.note_written(before)
             self.emit({"kind": "files", **self.changes()})
             seat.seen = len(self.events)                     # its own work is in its context
             if self.handover is not None:
                 asyncio.get_running_loop().create_task(self.carry_on(self.handover, self.current.name))
+
+    def note_written(self, before: dict[str, str]) -> None:
+        """Who wrote what in the task just done: each text document the agent added or changed gets a note
+        of it — the agent and the model — so that what a person later writes over it is a pair for learning
+        (:func:`deidkit.agents.review.records`). Only documents the review can show; nothing in .legix."""
+        try:
+            now = snapshot(self.cfg.folder)
+            model = self._model_name()
+            for path, digest in now.items():
+                how = "added" if path not in before else "changed" if before[path] != digest else ""
+                if how and review.writable(path):
+                    creator = {"type": "Software", "name": self.current.label, **({"model": model} if model else {})}
+                    review.store(self.cfg.folder, path, review.written(path=path, creator=creator, how=how))
+        except OSError:
+            log.warning("who wrote the documents of the task was not noted")
 
     async def carry_on(self, choice: AgentChoice, previous: str) -> None:
         """The task under way, stopped so that the person could hand it to ``choice``, goes on with
@@ -1156,6 +1175,15 @@ class AgentHost:
             return await self._review_view(request.query.get("path", ""))
         if name == "review" and request.method == "POST":
             return await self._review_start(((await request.json()).get("path") or "").strip())
+        if name in ("review-suggest", "review-decide", "review-text") and request.method == "POST":
+            body = await request.json()
+            if not isinstance(body, dict):
+                return web.json_response({"error": "bad request"}, status=400)
+            return await {"review-suggest": self._review_suggest, "review-decide": self._review_decide,
+                          "review-text": self._review_text}[name](body)
+        if name == "review-dataset" and request.method == "GET":
+            records = await review.dataset(self.cfg.folder, self.proxy.engine(self.cfg.scope))
+            return web.json_response({"records": records, "count": len(records)})
         if name == "file" and request.method == "GET":
             rel = request.query.get("path", "")
             target = self.cfg.folder / rel
@@ -1179,9 +1207,89 @@ class AgentHost:
         return web.json_response({
             "path": path, "source": source, "text": text, "deid": deid,
             "norms": review.norm_mentions(text),
-            "notes": review.load(self.cfg.folder, path, text),
+            **review.view(self.cfg.folder, path, text),
+            "writable": review.writable(path), "sha": review.sha(text), "person": self.cfg.person,
             "agent": {"name": self.current.label, "busy": self.busy, "ready": self.status == "ready"},
         })
+
+    async def _review_suggest(self, body: dict) -> web.Response:
+        """A change the person proposes: positions in characters of the text as the page has it."""
+        path, start, end = str(body.get("path") or ""), body.get("start"), body.get("end")
+        replacement = body.get("text") if isinstance(body.get("text"), str) else None
+        read = review.read_text(self.cfg.folder, path)
+        if read is None:
+            return web.json_response({"error": "no text for this document"}, status=404)
+        text = read[1]
+        if not (isinstance(start, int) and isinstance(end, int) and 0 <= start <= end <= len(text)) \
+                or replacement is None or len(replacement) > review.MAX_REPLACEMENT \
+                or (start == end and not replacement) or text[start:end] == replacement:
+            return web.json_response({"error": "no change to propose"}, status=400)
+        if body.get("sha") and body["sha"] != review.sha(text):
+            return web.json_response({"error": "the document changed: open it again"}, status=409)
+        ann = review.suggestion(path=path, text=text, start=start, end=end, replacement=replacement,
+                                creator=review.person(self.cfg.person))
+        review.store(self.cfg.folder, path, ann)
+        return web.json_response({"ok": True, "id": ann["id"]})
+
+    async def _review_decide(self, body: dict) -> web.Response:
+        """What the person decided of a note or a proposed change. Accepted, a change is made in the
+        document — one whose text is the document itself; a Word document is changed in Word."""
+        path, target, verdict = str(body.get("path") or ""), str(body.get("target") or ""), body.get("verdict")
+        comment = review._text(body.get("comment"), review.MAX_NOTE)
+        correction = body["correction"].strip()[:review.MAX_REPLACEMENT] if isinstance(body.get("correction"), str) else ""
+        if verdict not in review.VERDICTS:
+            return web.json_response({"error": "no such decision"}, status=400)
+        ann = review.find(self.cfg.folder, path, target)
+        if ann is None or review._kind(ann) in ("decision", "revision", "written"):
+            return web.json_response({"error": "no such note"}, status=404)
+        applied, why = False, ""
+        replacement = review._body(ann, "replacing", review.MAX_REPLACEMENT)
+        if verdict == "accepted" and (replacement or review._kind(ann) == "edit"):
+            if not review.writable(path):
+                why = "a Word document is changed in Word: the decision is kept"
+            else:
+                read = review.read_text(self.cfg.folder, path)
+                changed = review.apply(read[1], ann, replacement) if read else None
+                if changed is None:
+                    return web.json_response({"error": "its words are no longer in the document"}, status=409)
+                review.write_text(self.cfg.folder, path, changed)
+                applied = True
+        review.store(self.cfg.folder, path, review.decision(
+            path=path, target=target, verdict=verdict, creator=review.person(self.cfg.person),
+            comment=comment, correction=correction, applied=applied))
+        return web.json_response({"ok": True, "applied": applied, **({"why": why} if why else {})})
+
+    async def _review_text(self, body: dict) -> web.Response:
+        """The person's own writing, from the editor: the whole text of a Markdown or text document, over
+        the text it was opened with (``sha``; empty — a new document). The change is kept as theirs."""
+        path, text, base = str(body.get("path") or ""), body.get("text"), str(body.get("sha") or "")
+        if not isinstance(text, str) or len(text.encode("utf-8")) > review.MAX_TEXT:
+            return web.json_response({"error": "no text"}, status=400)
+        me = review.person(self.cfg.person)
+        if not base:
+            if not review.new_path_ok(self.cfg.folder, path):
+                return web.json_response({"error": "a new document is a .md or .txt file of the folder, "
+                                                   "not one that is there"}, status=400)
+            review.write_text(self.cfg.folder, path, text)
+            by = body.get("written_by") if isinstance(body.get("written_by"), dict) else None
+            creator = ({"type": "Software", "name": review._text(by.get("agent"), 80) or "Agent",
+                        **({"model": review._text(by.get("model"), 80)} if by.get("model") else {})} if by else me)
+            review.store(self.cfg.folder, path, review.written(path=path, creator=creator, how="wrote"))
+            if by:
+                # The person saved what the agent wrote: the agent wrote it, the person keeps it.
+                review.store(self.cfg.folder, path, review.written(path=path, creator=me, how="saved"))
+            return web.json_response({"ok": True, "sha": review.sha(text)})
+        if not review.writable(path):
+            return web.json_response({"error": "a Word document is changed in Word"}, status=400)
+        read = review.read_text(self.cfg.folder, path)
+        if read is None:
+            return web.json_response({"error": "no such document"}, status=404)
+        if review.sha(read[1]) != base:
+            return web.json_response({"error": "the document changed since it was opened: open it again"}, status=409)
+        if text != read[1]:
+            review.write_text(self.cfg.folder, path, text)
+            review.store(self.cfg.folder, path, review.revision(path=path, before=read[1], after=text, creator=me))
+        return web.json_response({"ok": True, "sha": review.sha(text)})
 
     async def _review_start(self, path: str) -> web.Response:
         read = review.read_text(self.cfg.folder, path)

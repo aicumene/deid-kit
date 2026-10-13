@@ -188,6 +188,21 @@ enable_request_compression = false
   matter's notes folder is versioned and synced by leGix with the documents, and the host does not
   count it as the agent's work. Nothing in a note file is trusted when it is read: its words are
   looked up in the text again, so a note shows where they are now, or that they are gone.
+- **The person's side of the review.** The person proposes changes as Word's tracked changes
+  (`POST /deid-agent/api/review-suggest`: these words, or none, to read so), and decides of each change
+  and each note of an agent (`review-decide`): a change accepted or rejected, a note useful, not
+  useful or wrong, with what they say and what they would have written instead. An agent's note may
+  carry its own wording for the quote, which the person accepts like a change. Accepted, a change is
+  made in the document when its text is the document itself (Markdown, plain text); a Word document
+  is changed in Word, and the decision is kept. The person also writes in the editor
+  (`review-text`): the whole text, over the text it was opened with (its SHA-256: a document changed
+  meanwhile is refused), or a new .md or .txt document — a draft the agent wrote in the chat, saved
+  with who wrote it. Every one of these is the person's annotation in the same notes folder, and
+  after each task deid-agent notes which text documents the agent added or changed, with the model.
+  `GET review-dataset` makes records of it all — each decision with the agent, model and note or
+  change it was about, and each revision a person made over a document an agent wrote — every text
+  in them tokenized by the scope's engine, the person a role and not a name: data for the harness
+  and for learning (RL) that can leave the Mac.
 - **Not applied yet.** Initials of a known person that no document defines, which the vault can
   tokenize (`deidkit.address.tokenize_initials`), are not yet applied by the proxy.
 

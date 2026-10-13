@@ -161,6 +161,8 @@ def main(argv: list[str] | None = None) -> None:
                          "journals it (default: $DEID_AGENT_GUARD, or agent-guard on PATH); the journal "
                          "is <the audit's folder>/guard/<scope>.jsonl")
     ap.add_argument("--no-guard", action="store_true", help="start Claude Code without agent-guard")
+    ap.add_argument("--person", default=os.environ.get("USER", "") or "person",
+                    help="who the person at this Mac is, in the notes and decisions they make on documents")
     ap.add_argument("--upstream", default="https://api.anthropic.com",
                     help="where the agent's model requests go: Anthropic, or a server of the "
                          "organization's own that speaks the Messages API (/v1/messages)")
@@ -200,7 +202,7 @@ def main(argv: list[str] | None = None) -> None:
                      dev_login=args.dev_login, claude_executable=args.claude_executable,
                      codex_executable=args.codex_executable, codex_confine=not args.codex_unconfined,
                      codex_home=Path(args.codex_home).expanduser() if args.codex_home else None,
-                     port=args.port,
+                     port=args.port, person=args.person,
                      usage_log=Path(args.usage_log).expanduser() if args.usage_log else None,
                      agents=agent_choices(args.agent, args.agent_upstream, args.agent_unavailable,
                                           args.agent_meta),

@@ -18,6 +18,7 @@ W3C Web Annotation model the markup is kept in.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -43,6 +44,10 @@ MOTIVATION = {"risk": "assessing", "question": "questioning", "point": "commenti
 MAX_QUOTE = 600
 MAX_NOTE = 1200
 MAX_NOTES = 80
+MAX_REPLACEMENT = 4000
+#: What a person decides of a note or a proposed change: of a change, accepted or rejected; of an agent's
+#: note, whether it helped. Kept as the person's own annotations — what the RL and harness data are made of.
+VERDICTS = ("accepted", "rejected", "useful", "not useful", "wrong")
 
 PROMPT = """Review the document "{path}" for the lawyer. Its text is in the file "{source}" in this folder: \
 read that file, all of it. Do not change any file.
@@ -60,11 +65,13 @@ clause that matters);
 text only, empty where it does not say;
 - "norm": the statute or regulation the point turns on, as it is usually cited (for example "§ 573c BGB", \
 "Housing Act 1988 s. 21", "Art. 28 GDPR"), or empty;
+- "suggestion": where you would fix the point by changing the words, the words to put in place of the quote, \
+exactly as they should read — the lawyer accepts or rejects it; otherwise empty;
 - "note": one or two sentences for the lawyer, in the language they write to you in.
 
 Answer with one JSON object and nothing else:
 {{"notes": [{{"quote": "...", "kind": "risk", "aspect": "termination", "importance": 4, "clause_type": "", \
-"who": "", "what": "", "to_whom": "", "when": "", "norm": "", "note": "..."}}]}}"""
+"who": "", "what": "", "to_whom": "", "when": "", "norm": "", "suggestion": "", "note": "..."}}]}}"""
 
 
 def prompt(path: str, source: str) -> str:
@@ -319,6 +326,8 @@ def parse_notes(answer: str) -> list[dict] | None:
             **{k: _text(raw.get(k), 200) for k in ("who", "what", "to_whom", "when")},
             "norm": _text(raw.get("norm"), 120),
             "note": _text(raw.get("note"), MAX_NOTE),
+            # The wording itself, line breaks and all: it goes into the document as written.
+            "suggestion": raw["suggestion"].strip()[:MAX_REPLACEMENT] if isinstance(raw.get("suggestion"), str) else "",
         })
     return out
 
@@ -343,6 +352,8 @@ def annotation(note: dict, *, path: str, text: str, start: int, end: int, creato
         body.append({"type": "TextualBody", "value": note["clause_type"], "purpose": "classifying"})
     if note.get("norm"):
         body.append({"type": "TextualBody", "value": note["norm"], "purpose": "linking"})
+    if note.get("suggestion"):
+        body.append({"type": "TextualBody", "value": note["suggestion"], "purpose": "replacing"})
     return {
         "@context": "http://www.w3.org/ns/anno.jsonld",
         "id": uuid.uuid4().hex,
@@ -382,23 +393,127 @@ def _selector(ann: dict, kind: str) -> dict:
 
 def place(ann: dict, folded: Folded) -> tuple[str, int, int] | None:
     """Where the annotation's words are in the text now: ``("here", start, end)`` — where it was put;
-    ``("moved", …)`` — found again elsewhere; None — the words are no longer in the text."""
+    ``("moved", …)`` — found again elsewhere; None — the words are no longer in the text. A proposed
+    insertion has no words of its own: it stands between the words before and after it."""
     quote = _selector(ann, "TextQuoteSelector")
     exact = quote.get("exact") if isinstance(quote.get("exact"), str) else ""
     pos = _selector(ann, "TextPositionSelector")
     start, end = pos.get("start"), pos.get("end")
+    text = folded.text
     if not exact:
+        prefix = quote.get("prefix") if isinstance(quote.get("prefix"), str) else ""
+        suffix = quote.get("suffix") if isinstance(quote.get("suffix"), str) else ""
+        if not (prefix or suffix):
+            return None
+        if isinstance(start, int) and text[max(0, start - len(prefix)):start] == prefix \
+                and text[start:start + len(suffix)] == suffix:
+            return "here", start, start
+        # The words around it may have changed too: the nearer words first, then fewer of them; of several
+        # places, the one nearest where it was.
+        for p, q in ((len(prefix), len(suffix)), (16, 16), (16, 0), (0, 16)):
+            before, after = prefix[max(0, len(prefix) - p):] if p else "", suffix[:q]
+            if not (before or after):
+                continue
+            hits = [m + len(before) for m in _all(text, before + after)]
+            if hits:
+                at = min(hits, key=lambda h: abs(h - start)) if isinstance(start, int) else hits[0]
+                return "moved", at, at
         return None
-    if isinstance(start, int) and isinstance(end, int) and folded.text[start:end] == exact:
+    if isinstance(start, int) and isinstance(end, int) and text[start:end] == exact:
         return "here", start, end
     found = folded.find(exact, near=start if isinstance(start, int) else None)
     return ("moved", *found) if found else None
 
 
-def load(folder: Path, path: str, text: str) -> list[dict]:
-    """The document's notes, each placed in the text as it is now. A file that is not an annotation of
-    this document is left out; so is anything but our own fields of one."""
-    folded = Folded.of(text)
+def _now() -> str:
+    """To the microsecond: decisions made one after the other keep their order."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _base(motivation: str, creator: dict, target: dict, body: list[dict], bernio: dict) -> dict:
+    return {"@context": "http://www.w3.org/ns/anno.jsonld", "id": uuid.uuid4().hex, "type": "Annotation",
+            "motivation": motivation, "creator": creator, "created": _now(), "target": target, "body": body,
+            "bernio": bernio}
+
+
+def person(name: str) -> dict:
+    return {"type": "Person", "name": name or "person"}
+
+
+def suggestion(*, path: str, text: str, start: int, end: int, replacement: str, creator: dict) -> dict:
+    """A change a person proposes, as Word's tracked change: these words (none, for an insertion) to read
+    as ``replacement`` (empty, for a deletion). It changes nothing until it is accepted."""
+    selectors: list[dict] = [
+        {"type": "TextQuoteSelector", "exact": text[start:end], "prefix": text[max(0, start - 32):start],
+         "suffix": text[end:end + 32]},
+        {"type": "TextPositionSelector", "start": start, "end": end},
+    ]
+    clause = clause_at(text, start)
+    if clause:
+        selectors.append({"type": "FragmentSelector", "value": clause})
+    return _base("editing", creator, {"source": path, "selector": selectors},
+                 [{"type": "TextualBody", "value": replacement, "purpose": "replacing"}], {"kind": "edit"})
+
+
+def decision(*, path: str, target: str, verdict: str, creator: dict, comment: str = "", correction: str = "",
+             applied: bool = False) -> dict:
+    """What a person decided of a note or a proposed change (``target``, its annotation's id): ``verdict``,
+    and what they said and would have written instead."""
+    body = [{"type": "TextualBody", "value": verdict, "purpose": "assessing"}]
+    if comment:
+        body.append({"type": "TextualBody", "value": comment, "purpose": "commenting"})
+    if correction:
+        body.append({"type": "TextualBody", "value": correction, "purpose": "replacing"})
+    return _base("assessing", creator, {"source": path, "annotation": target}, body,
+                 {"kind": "decision", "verdict": verdict, **({"applied": True} if applied else {})})
+
+
+_WORD = re.compile(r"\s+|\w+|[^\w\s]")
+
+
+def hunks(before: str, after: str, limit: int = 200) -> list[dict]:
+    """How ``after`` differs from ``before``, word by word: ``{at, old, new}``, ``at`` the place in ``before``."""
+    import difflib
+    a, b = _WORD.findall(before), _WORD.findall(after)
+    starts, at = [], 0
+    for w in a:
+        starts.append(at)
+        at += len(w)
+    starts.append(at)
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag != "equal":
+            out.append({"at": starts[i1], "old": "".join(a[i1:i2]), "new": "".join(b[j1:j2])})
+            if len(out) >= limit:
+                break
+    return out
+
+
+def revision(*, path: str, before: str, after: str, creator: dict) -> dict:
+    """The person's own writing, saved from the editor: how the text read before and after, as changes word
+    by word. Already made, nothing to accept; it is the record of who wrote what."""
+    return _base("editing", creator, {"source": path}, [], {
+        "kind": "revision", "before": sha(before), "after": sha(after), "hunks": hunks(before, after)})
+
+
+def written(*, path: str, creator: dict, how: str, run: str = "") -> dict:
+    """Who wrote the document: an agent in a task (``how``: added or changed), or a person."""
+    return _base("describing", creator, {"source": path}, [], {"kind": "written", "how": how,
+                                                               **({"run": run} if run else {})})
+
+
+def sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def writable(path: str) -> bool:
+    """A document whose text is the document itself (Markdown, plain text): changes are made in it. A Word
+    document's text is its picture; it is changed in Word."""
+    return Path(path).suffix.lower() in TEXT_SUFFIXES and path.split("/", 1)[0] != NOTES
+
+
+def annotations(folder: Path, path: str) -> list[dict]:
+    """The document's annotations as they are in its files; what is not one of this document is left out."""
     root = markup_dir(folder, path)
     out = []
     for f in sorted(root.glob("*.json")) if root.is_dir() else []:
@@ -406,30 +521,94 @@ def load(folder: Path, path: str, text: str) -> list[dict]:
             ann = json.loads(f.read_text("utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(ann, dict) or (ann.get("target") or {}).get("source") != path:
+        if isinstance(ann, dict) and isinstance(ann.get("target"), dict) and ann["target"].get("source") == path:
+            ann.setdefault("id", f.stem)
+            out.append(ann)
+    return out
+
+
+def _who(creator) -> dict:
+    if isinstance(creator, dict):
+        return {"name": _text(creator.get("name"), 80), "model": _text(creator.get("model"), 80),
+                "person": creator.get("type") == "Person"}
+    return {"name": _text(creator, 80), "model": "", "person": False}
+
+
+def _body(ann: dict, purpose: str, limit: int = MAX_NOTE) -> str:
+    for b in ann.get("body") or []:
+        if isinstance(b, dict) and b.get("purpose") == purpose and isinstance(b.get("value"), str):
+            return b["value"][:limit] if purpose == "replacing" else _text(b["value"], limit)
+    return ""
+
+
+def _kind(ann: dict) -> str:
+    bernio = ann.get("bernio") if isinstance(ann.get("bernio"), dict) else {}
+    return bernio.get("kind") if isinstance(bernio.get("kind"), str) else ""
+
+
+def load(folder: Path, path: str, text: str) -> list[dict]:
+    """The document's notes and proposed changes, each placed in the text as it is now, with what people
+    decided of it. Nothing in a file is trusted: the words are looked up again, and only our own fields
+    are read."""
+    return view(folder, path, text)["notes"]
+
+
+def view(folder: Path, path: str, text: str) -> dict:
+    """``notes`` (the agents' notes and the proposed changes), ``revisions`` (what people wrote in the
+    editor) and ``written`` (who wrote the document)."""
+    folded = Folded.of(text)
+    anns = annotations(folder, path)
+    decided: dict[str, list[dict]] = {}
+    revisions, authors, notes = [], [], []
+    for ann in anns:
+        kind = _kind(ann)
+        if kind == "decision":
+            target = ann["target"].get("annotation")
+            verdict = (ann.get("bernio") or {}).get("verdict")
+            if isinstance(target, str) and verdict in VERDICTS:
+                decided.setdefault(target, []).append({
+                    "verdict": verdict, "by": _who(ann.get("creator"))["name"], "at": _text(ann.get("created"), 40),
+                    "comment": _body(ann, "commenting"), "correction": _body(ann, "replacing", MAX_REPLACEMENT),
+                    "applied": (ann.get("bernio") or {}).get("applied") is True})
+        elif kind == "revision":
+            hs = (ann.get("bernio") or {}).get("hunks")
+            revisions.append({"id": _text(ann.get("id"), 64), "by": _who(ann.get("creator")),
+                              "at": _text(ann.get("created"), 40), "changes": len(hs) if isinstance(hs, list) else 0})
+        elif kind == "written":
+            how = (ann.get("bernio") or {}).get("how")
+            authors.append({"by": _who(ann.get("creator")), "at": _text(ann.get("created"), 40),
+                            "how": how if how in ("added", "changed", "wrote", "saved") else ""})
+    for ann in anns:
+        kind = _kind(ann)
+        if kind not in (*KINDS, "edit"):
             continue
         where = place(ann, folded)
-        bernio = ann.get("bernio") if isinstance(ann.get("bernio"), dict) else {}
-        creator = ann.get("creator")
-        body = [b for b in ann.get("body") or [] if isinstance(b, dict)]
-        out.append({
-            "id": _text(ann.get("id"), 64) or f.stem,
+        bernio = ann.get("bernio") or {}
+        decisions = sorted(decided.get(str(ann.get("id")), []), key=lambda d: d["at"])
+        state = next((d["verdict"] for d in reversed(decisions) if d["verdict"] in ("accepted", "rejected")), "")
+        notes.append({
+            "id": _text(ann.get("id"), 64),
             "created": _text(ann.get("created"), 40),
-            "creator": {"name": _text(creator.get("name"), 80), "model": _text(creator.get("model"), 80)}
-            if isinstance(creator, dict) else {"name": _text(creator, 80), "model": ""},
+            "creator": {k: v for k, v in _who(ann.get("creator")).items() if k != "person"},
+            "by_person": _who(ann.get("creator"))["person"],
             "run": _text((ann.get("generator") or {}).get("run"), 64) if isinstance(ann.get("generator"), dict) else "",
             "status": where[0] if where else "gone",
             "start": where[1] if where else None,
             "end": where[2] if where else None,
             "quote": _text(_selector(ann, "TextQuoteSelector").get("exact"), MAX_QUOTE),
             "clause": _text(_selector(ann, "FragmentSelector").get("value"), 80),
-            "note": next((_text(b.get("value"), MAX_NOTE) for b in body if b.get("purpose") == "commenting"), ""),
-            "kind": bernio.get("kind") if bernio.get("kind") in KINDS else "point",
-            "aspect": bernio.get("aspect") if bernio.get("aspect") in ASPECTS else "other",
+            "note": _body(ann, "commenting"),
+            "kind": kind,
+            "aspect": bernio.get("aspect") if bernio.get("aspect") in ASPECTS else ("" if kind == "edit" else "other"),
             "importance": bernio.get("importance") if bernio.get("importance") in (1, 2, 3, 4, 5) else 3,
             **{k: _text(bernio.get(k), 200) for k in ("clause_type", "who", "what", "to_whom", "when", "norm")},
+            "suggestion": _body(ann, "replacing", MAX_REPLACEMENT),
+            "decisions": decisions,
+            "state": state,
         })
-    return sorted(out, key=lambda n: (n["start"] is None, n["start"] or 0, -n["importance"]))
+    notes.sort(key=lambda n: (n["start"] is None, n["start"] or 0, -n["importance"]))
+    return {"notes": notes, "revisions": sorted(revisions, key=lambda r: r["at"]),
+            "written": sorted(authors, key=lambda a: a["at"])}
 
 
 def keep(folder: Path, path: str, text: str, notes: list[dict], *, creator: dict, run: str) -> dict:
@@ -445,3 +624,120 @@ def keep(folder: Path, path: str, text: str, notes: list[dict], *, creator: dict
         store(folder, path, ann)
         kept.append(ann["id"])
     return {"kept": kept, "refused": refused}
+
+
+def find(folder: Path, path: str, ident: str) -> dict | None:
+    """The document's annotation by its id."""
+    if not re.fullmatch(r"[0-9a-f]{8,64}", ident or ""):
+        return None
+    return next((a for a in annotations(folder, path) if a.get("id") == ident), None)
+
+
+def apply(text: str, ann: dict, replacement: str) -> str | None:
+    """The text with the annotation's words read as ``replacement``; None — they are no longer in it."""
+    where = place(ann, Folded.of(text))
+    if where is None:
+        return None
+    return text[:where[1]] + replacement + text[where[2]:]
+
+
+def write_text(folder: Path, path: str, text: str) -> None:
+    """The document's new text, whole or not at all."""
+    target = folder / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_text(text, "utf-8")
+    tmp.replace(target)
+
+
+def new_path_ok(folder: Path, path: str) -> bool:
+    """A new document may be written here: Markdown or plain text, inside the folder, not in its notes,
+    not over a document that is there."""
+    if not path or path.startswith("/") or "\x00" in path or not writable(path):
+        return False
+    parts = Path(path).parts
+    if any(p in ("..", ".") or p.startswith(".") for p in parts):
+        return False
+    try:
+        (folder / path).resolve().relative_to(folder.resolve())
+    except (OSError, ValueError):
+        return False
+    return not (folder / path).exists()
+
+
+# ── what people decided, for the harness and for learning ─────────────────────────────────────────
+def records(folder: Path) -> list[dict]:
+    """What people decided of the agents' work in this folder, one record each — with the agent and its
+    model, the note or change it was about, the verdict and the person's words — and what people wrote
+    over documents an agent wrote. Real text: it goes out only tokenized (``dataset``)."""
+    root = folder / NOTES / "markup"
+    out: list[dict] = []
+    if not root.is_dir():
+        return out
+    docs = sorted({str(f.parent.relative_to(root)) for f in root.rglob("*.json")})
+    for path in docs:
+        anns = annotations(folder, path)
+        by_id = {a.get("id"): a for a in anns}
+        agent_wrote = [a for a in anns if _kind(a) == "written" and not _who(a.get("creator"))["person"]]
+        for ann in anns:
+            kind = _kind(ann)
+            if kind == "decision":
+                target = by_id.get(ann["target"].get("annotation"))
+                if target is None:
+                    continue
+                who = _who(target.get("creator"))
+                bernio = target.get("bernio") or {}
+                out.append({
+                    "type": "decision", "document": path, "at": _text(ann.get("created"), 40),
+                    "about": {"by": "person" if who["person"] else "agent",
+                              **({} if who["person"] else {"agent": who["name"], "model": who["model"]}),
+                              "run": _text((target.get("generator") or {}).get("run"), 64)
+                              if isinstance(target.get("generator"), dict) else "",
+                              "kind": _kind(target), "quote": _text(_selector(target, "TextQuoteSelector").get("exact"),
+                                                                    MAX_QUOTE),
+                              "note": _body(target, "commenting"),
+                              "suggestion": _body(target, "replacing", MAX_REPLACEMENT),
+                              **{k: bernio[k] for k in ("aspect", "importance", "clause_type", "who", "what",
+                                                        "to_whom", "when", "norm") if bernio.get(k) not in (None, "")}},
+                    "verdict": (ann.get("bernio") or {}).get("verdict"),
+                    "comment": _body(ann, "commenting"),
+                    "correction": _body(ann, "replacing", MAX_REPLACEMENT),
+                })
+            elif kind == "revision" and agent_wrote:
+                author = _who(agent_wrote[-1].get("creator"))
+                out.append({"type": "revision", "document": path, "at": _text(ann.get("created"), 40),
+                            "written_by": {"agent": author["name"], "model": author["model"]},
+                            "changes": (ann.get("bernio") or {}).get("hunks") or []})
+    return out
+
+
+async def dataset(folder: Path, engine) -> list[dict]:
+    """``records`` with every text in them tokenized by the scope's engine — the names in them read as
+    the tokens a model sees, so the records can leave this Mac."""
+    out = []
+    for rec in records(folder):
+        texts: list[str] = []
+
+        def collect(v):
+            if isinstance(v, str):
+                texts.append(v)
+            elif isinstance(v, dict):
+                for x in v.values():
+                    collect(x)
+            elif isinstance(v, list):
+                for x in v:
+                    collect(x)
+        collect(rec)
+        reds = await engine.tokenize_all(texts) if texts else []
+        swap = iter(r.text for r in reds)
+
+        def rebuild(v):
+            if isinstance(v, str):
+                return next(swap)
+            if isinstance(v, dict):
+                return {k: rebuild(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [rebuild(x) for x in v]
+            return v
+        out.append(rebuild(rec))
+    return out
