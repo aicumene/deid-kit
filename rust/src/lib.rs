@@ -12,6 +12,7 @@ pub mod log;
 pub mod namefold;
 pub mod odict;
 pub mod patterns;
+pub mod proxy;
 pub mod py;
 pub mod pyre;
 pub mod seeds;

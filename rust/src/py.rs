@@ -546,3 +546,43 @@ pub fn expanduser(text: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
+
+/// `json.dumps(value, ensure_ascii=False, sort_keys=sort, separators=(",", ":") if compact)`.
+pub fn dumps_with(value: &serde_json::Value, sort: bool, compact: bool) -> String {
+    fn walk(v: &serde_json::Value, sort: bool, compact: bool, out: &mut String) {
+        use serde_json::Value;
+        let (item, kv) = if compact { (",", ":") } else { (", ", ": ") };
+        match v {
+            Value::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(item);
+                    }
+                    walk(x, sort, compact, out);
+                }
+                out.push(']');
+            }
+            Value::Object(m) => {
+                out.push('{');
+                let mut keys: Vec<&String> = m.keys().collect();
+                if sort {
+                    keys.sort();
+                }
+                for (i, k) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(item);
+                    }
+                    out.push_str(&dumps(&Value::String(k.clone())));
+                    out.push_str(kv);
+                    walk(&m[k], sort, compact, out);
+                }
+                out.push('}');
+            }
+            other => out.push_str(&dumps(other)),
+        }
+    }
+    let mut out = String::new();
+    walk(value, sort, compact, &mut out);
+    out
+}

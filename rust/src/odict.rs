@@ -107,3 +107,15 @@ impl<V: Clone> ODict<V> {
         out
     }
 }
+
+impl<V> ODict<V> {
+    /// The first key (`next(iter(d))`).
+    pub fn first_key(&self) -> Option<String> {
+        self.keys().next().map(str::to_string)
+    }
+
+    /// The values in order.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, v)| v)
+    }
+}
