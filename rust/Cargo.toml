@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 Alexandra Bernadotte
+[package]
+name = "deidkit"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+description = "deid-kit in Rust: the vault, deid-proxy and deid-agent, behaving as the Python package does"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+sha2 = "0.11"
+hex = "0.4"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
