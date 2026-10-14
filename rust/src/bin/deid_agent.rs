@@ -201,8 +201,13 @@ fn main() {
     cfg.subagents_command = shlex_split(&sub_cmd).unwrap_or_else(|_| die("deid-agent: --subagents-command: No closing quotation"));
     cfg.subagents_timeout = timeout;
     cfg.claude_confine = !args.on("--claude-unconfined");
+    // agent-guard: given, else $DEID_AGENT_GUARD, else the one beside this program (the app's agent runtime
+    // carries both in bin/ — what the Python runtime's wrapper said in $DEID_AGENT_GUARD), else on PATH
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("agent-guard")))
+        .filter(|g| g.is_file()).map(|g| g.to_string_lossy().into_owned());
     let guard = args.get("--guard").map(str::to_string)
         .or_else(|| std::env::var("DEID_AGENT_GUARD").ok().filter(|g| !g.is_empty()))
+        .or(beside)
         .or_else(|| confine::which("agent-guard")).unwrap_or_default();
     if !guard.is_empty() && !args.on("--no-guard") {
         let g = py::expanduser(&guard);
