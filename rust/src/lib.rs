@@ -6,8 +6,10 @@
 //! the Python vault made.
 
 pub mod address;
+pub mod cli;
 pub mod detect;
 pub mod gateway;
+pub mod http;
 pub mod log;
 pub mod namefold;
 pub mod odict;
@@ -21,3 +23,4 @@ pub mod textmatch;
 pub mod unicode;
 pub mod unicode_tables;
 pub mod vault;
+pub mod zstd;

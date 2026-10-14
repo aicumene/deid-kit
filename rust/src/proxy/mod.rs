@@ -6,4 +6,5 @@ pub mod anthropic;
 pub mod engine;
 pub mod openai;
 pub mod spelling;
+pub mod server;
 pub mod sse;
