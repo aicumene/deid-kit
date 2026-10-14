@@ -60,7 +60,7 @@ fn main() {
         eprintln!("deid-proxy: --glossary is not in this build");
         std::process::exit(2);
     }
-    let _ = log::init("deidkit.proxy", "INFO");
+    let _ = log::init("", "INFO");
     let host = args.str("--host");
     let port: u16 = cli::number(PROG, OPTS, "--port", &args.str("--port"), "int");
     let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());

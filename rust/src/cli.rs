@@ -26,6 +26,7 @@ pub const fn flag(name: &'static str, help: &'static str) -> Opt {
 
 pub struct Args {
     values: HashMap<&'static str, String>,
+    lists: HashMap<&'static str, Vec<String>>,
     flags: Vec<&'static str>,
 }
 
@@ -40,6 +41,11 @@ impl Args {
 
     pub fn on(&self, name: &str) -> bool {
         self.flags.contains(&name)
+    }
+
+    /// Every value given to an option, in order (`action="append"`).
+    pub fn all(&self, name: &str) -> Vec<String> {
+        self.lists.get(name).cloned().unwrap_or_default()
     }
 }
 
@@ -67,7 +73,7 @@ fn fail(prog: &str, opts: &[Opt], message: &str) -> ! {
 }
 
 pub fn parse(prog: &str, description: &str, opts: &[Opt], argv: &[String]) -> Args {
-    let mut args = Args { values: HashMap::new(), flags: Vec::new() };
+    let mut args = Args { values: HashMap::new(), lists: HashMap::new(), flags: Vec::new() };
     let mut i = 0;
     while i < argv.len() {
         let a = &argv[i];
@@ -120,6 +126,7 @@ pub fn parse(prog: &str, description: &str, opts: &[Opt], argv: &[String]) -> Ar
             fail(prog, opts, &format!("argument {}: invalid choice: {} (choose from {})", o.name, crate::py::repr_str(&value),
                                       o.choices.iter().map(|c| crate::py::repr_str(c)).collect::<Vec<_>>().join(", ")));
         }
+        args.lists.entry(o.name).or_default().push(value.clone());
         args.values.insert(o.name, value);
         i += 1;
     }

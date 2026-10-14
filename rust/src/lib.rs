@@ -6,8 +6,10 @@
 //! the Python vault made.
 
 pub mod address;
+pub mod agents;
 pub mod cli;
 pub mod detect;
+pub mod difflib;
 pub mod gateway;
 pub mod http;
 pub mod log;
@@ -16,6 +18,7 @@ pub mod odict;
 pub mod patterns;
 pub mod proxy;
 pub mod py;
+pub mod pyjson;
 pub mod pyre;
 pub mod seeds;
 pub mod store;

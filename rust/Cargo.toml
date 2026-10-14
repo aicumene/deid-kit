@@ -37,3 +37,7 @@ strip = true
 [[bin]]
 name = "deid-proxy"
 path = "src/bin/deid_proxy.rs"
+
+[[bin]]
+name = "deid-agent"
+path = "src/bin/deid_agent.rs"

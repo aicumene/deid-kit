@@ -39,8 +39,11 @@ pub fn write(level: u8, label: &str, message: &str) {
     if level < LEVEL.load(Ordering::Relaxed) {
         return;
     }
-    let name = NAME.get().map_or("deidkit", String::as_str);
-    let _ = writeln!(std::io::stderr().lock(), "{} {name} {label} {message}", now());
+    // Python's basicConfig format: the logger's name only when one is set
+    match NAME.get().map(String::as_str).filter(|n| !n.is_empty()) {
+        Some(name) => { let _ = writeln!(std::io::stderr().lock(), "{} {name} {label} {message}", now()); }
+        None => { let _ = writeln!(std::io::stderr().lock(), "{} {label} {message}", now()); }
+    }
 }
 
 pub fn info(message: &str) {

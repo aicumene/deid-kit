@@ -178,10 +178,23 @@ impl RestoreTable for StoreRestore {
 
 pub type UsageHook = Box<dyn Fn(&str, &Map<String, Value>)>;
 
+/// Where requests go and with which key: set from the configuration, changed by deid-agent at each
+/// switch of agents (`AgentHost.route`).
+#[derive(Clone)]
+pub struct Route {
+    pub upstream: String,
+    pub upstream_openai: String,
+    pub upstream_key: Option<String>,
+    pub drop_tool_namespaces: HashSet<String>,
+}
+
 pub struct Proxy {
     pub store: Rc<dyn TokenStore>,
     pub restore: Rc<dyn RestoreTable>,
     pub cfg: ProxyConfig,
+    /// `cfg.upstream`, `cfg.upstream_openai`, `cfg.upstream_key` and `cfg.drop_tool_namespaces` as they
+    /// are now: read from here, not from `cfg`.
+    pub route: RefCell<Route>,
     engines: RefCell<HashMap<String, Rc<ScopeEngine>>>,
     /// Audit records when no file is set (`InMemoryAuditSink`).
     pub audited: RefCell<Vec<Value>>,
@@ -212,7 +225,9 @@ fn back_headers(up: &http::Upstream) -> Headers {
 
 impl Proxy {
     pub fn new(store: Rc<dyn TokenStore>, restore: Rc<dyn RestoreTable>, cfg: ProxyConfig) -> Rc<Proxy> {
-        Rc::new(Proxy { store, restore, cfg, engines: RefCell::new(HashMap::new()), audited: RefCell::new(Vec::new()),
+        let route = Route { upstream: cfg.upstream.clone(), upstream_openai: cfg.upstream_openai.clone(),
+                            upstream_key: cfg.upstream_key.clone(), drop_tool_namespaces: cfg.drop_tool_namespaces.clone() };
+        Rc::new(Proxy { store, restore, cfg, route: RefCell::new(route), engines: RefCell::new(HashMap::new()), audited: RefCell::new(Vec::new()),
                         on_key_refused: RefCell::new(None), on_usage: RefCell::new(None) })
     }
 
@@ -248,11 +263,11 @@ impl Proxy {
         let mut out: Headers = dedupe(req.headers.iter().filter(|(k, _)| !HOP.contains(&k.to_lowercase().as_str())).cloned().collect());
         out.retain(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding"));
         out.push(("Accept-Encoding".into(), "identity".into()));
-        if let Some(key) = &self.cfg.upstream_key {
+        if let Some(key) = self.route.borrow().upstream_key.clone() {
             let lend = self.from_agent(req);
             out.retain(|(k, _)| !k.eq_ignore_ascii_case("x-api-key") && !k.eq_ignore_ascii_case("authorization"));
             if lend {
-                out.push(("x-api-key".into(), key.clone()));
+                out.push(("x-api-key".into(), key));
             }
         }
         out
@@ -273,7 +288,7 @@ impl Proxy {
             log::warning(&format!("refused {} {}: not the agent's key", req.method, req.path));
             return Some(error(401, "deid proxy: this proxy holds the organization's key and lends it only to its own agent"));
         }
-        if req.path.ends_with("/responses") || !self.url(req).starts_with(self.cfg.upstream.trim_end_matches('/')) {
+        if req.path.ends_with("/responses") || !self.url(req).starts_with(self.route.borrow().upstream.trim_end_matches('/')) {
             return Some(error(403, "deid proxy: the organization's key is for Anthropic only"));
         }
         None
@@ -281,7 +296,7 @@ impl Proxy {
 
     fn openai_base(&self, req: &Request) -> String {
         let chatgpt = req.header("chatgpt-account-id").is_some();
-        (if chatgpt { &self.cfg.upstream_chatgpt } else { &self.cfg.upstream_openai }).trim_end_matches('/').to_string()
+        if chatgpt { self.cfg.upstream_chatgpt.trim_end_matches('/').to_string() } else { self.route.borrow().upstream_openai.trim_end_matches('/').to_string() }
     }
 
     /// Where a request goes: Anthropic for Claude Code, OpenAI or ChatGPT for Codex.
@@ -290,7 +305,7 @@ impl Proxy {
             let path = req.path_qs.strip_prefix("/v1").unwrap_or(&req.path_qs);
             return self.openai_base(req) + path;
         }
-        self.cfg.upstream.trim_end_matches('/').to_string() + &req.path_qs
+        self.route.borrow().upstream.trim_end_matches('/').to_string() + &req.path_qs
     }
 
     pub async fn handle(self: Rc<Self>, req: Request) -> Response {
@@ -300,7 +315,7 @@ impl Proxy {
         if req.header("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
             return Response::text(426, "deid proxy: HTTP only");
         }
-        if self.cfg.upstream_key.is_some() {
+        if self.route.borrow().upstream_key.is_some() {
             if let Some(refused) = self.lend_key(&req) {
                 return refused;
             }
@@ -383,8 +398,9 @@ impl Proxy {
         };
         let engine = self.engine(&scope);
         let restore = self.restore.clone();
+        let drop = self.route.borrow().drop_tool_namespaces.clone();
         let prep = match openai::prepare_responses(&body, &engine, &self.headers(&req), &|k| restore.get(k), &self.cfg.binary,
-                                                   &self.cfg.drop_tool_namespaces) {
+                                                   &drop) {
             Ok(p) => p,
             Err(PrepareError::Refused(r)) => {
                 log::warning(&format!("refused {}: {r}", req.path));
@@ -464,15 +480,16 @@ impl Proxy {
             }
         };
         let sent = py::dumps_with(&prep.body, false, true);
-        self.audit(&scope, &req.path, &sent, &prep.mapping, &self.cfg.upstream);
+        let upstream = self.route.borrow().upstream.clone();
+        self.audit(&scope, &req.path, &sent, &prep.mapping, &upstream);
         self.record(json!({"dir": "out", "scope": scope, "path": req.path_qs, "body": prep.body, "withheld": prep.withheld}));
         log::info(&format!("{} scope={scope} tokens={} withheld={} restored={}", req.path, prep.mapping.len(), prep.withheld.len(), prep.restored));
-        let url = format!("{}{}", self.cfg.upstream.trim_end_matches('/'), req.path_qs);
+        let url = format!("{}{}", upstream.trim_end_matches('/'), req.path_qs);
         let mut up = match http::fetch("POST", &url, &self.headers(&req), Bytes::from(sent), CONNECT, READ).await {
             Ok(u) => u,
             Err(e) => return error(502, &format!("deid proxy: {e}")),
         };
-        if self.cfg.upstream_key.is_some() && up.status == 401 {
+        if self.route.borrow().upstream_key.is_some() && up.status == 401 {
             log::warning("the provider refused the held key");
             if let Some(hook) = self.on_key_refused.borrow().as_ref() {
                 hook();

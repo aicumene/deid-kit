@@ -586,3 +586,143 @@ pub fn dumps_with(value: &serde_json::Value, sort: bool, compact: bool) -> Strin
     walk(value, sort, compact, &mut out);
     out
 }
+
+/// `round(x, ndigits)` of a float: the decimal nearest to `x`'s exact value with `ndigits` places,
+/// ties to even (Rust's exact formatting rounds the same way), read back as a float.
+pub fn round(x: f64, ndigits: usize) -> f64 {
+    if !x.is_finite() {
+        return x;
+    }
+    format!("{:.*}", ndigits, x).parse().unwrap_or(x)
+}
+
+/// `json.dumps(value, ensure_ascii=False, indent=n)`: one item a line, `": "` after keys, `[]` and `{}`
+/// for the empty ones.
+pub fn dumps_indent(value: &Value, indent: usize) -> String {
+    fn walk(v: &Value, indent: usize, level: usize, out: &mut String) {
+        let pad = |l: usize| " ".repeat(indent * l);
+        match v {
+            Value::Array(items) if !items.is_empty() => {
+                out.push('[');
+                for (i, x) in items.iter().enumerate() {
+                    out.push_str(if i > 0 { ",\n" } else { "\n" });
+                    out.push_str(&pad(level + 1));
+                    walk(x, indent, level + 1, out);
+                }
+                out.push('\n');
+                out.push_str(&pad(level));
+                out.push(']');
+            }
+            Value::Object(map) if !map.is_empty() => {
+                out.push('{');
+                for (i, (k, x)) in map.iter().enumerate() {
+                    out.push_str(if i > 0 { ",\n" } else { "\n" });
+                    out.push_str(&pad(level + 1));
+                    string(k, out);
+                    out.push_str(": ");
+                    walk(x, indent, level + 1, out);
+                }
+                out.push('\n');
+                out.push_str(&pad(level));
+                out.push('}');
+            }
+            other => write(other, false, out),
+        }
+    }
+    let mut out = String::new();
+    walk(value, indent, 0, &mut out);
+    out
+}
+
+// ── files as Python's text mode reads them, randomness as `secrets` and `uuid` make it, time ────────
+
+/// `Path.read_text("utf-8", errors="replace")`: bad bytes as U+FFFD, and the universal newlines of
+/// text mode (`\r\n` and `\r` read as `\n`).
+pub fn read_text(path: &Path) -> std::io::Result<String> {
+    Ok(newlines(&String::from_utf8_lossy(&std::fs::read(path)?)))
+}
+
+/// `Path.read_text("utf-8")`: None for bytes that are not UTF-8 (Python's UnicodeDecodeError).
+pub fn read_text_strict(path: &Path) -> std::io::Result<Option<String>> {
+    Ok(String::from_utf8(std::fs::read(path)?).ok().map(|s| newlines(&s)))
+}
+
+/// Text mode's universal newlines.
+pub fn newlines(text: &str) -> String {
+    if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text.to_string() }
+}
+
+/// `n` random bytes from the system.
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = vec![0u8; n];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).expect("/dev/urandom");
+    buf
+}
+
+/// `secrets.token_hex(n)`.
+pub fn token_hex(n: usize) -> String {
+    hex::encode(random_bytes(n))
+}
+
+/// `secrets.token_urlsafe(n)`: base64url of `n` random bytes, without padding.
+pub fn token_urlsafe(n: usize) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = random_bytes(n);
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let v = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for k in 0..chunk.len() + 1 {
+            out.push(ABC[(v >> (18 - 6 * k) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// `uuid.uuid4().hex`.
+pub fn uuid4_hex() -> String {
+    let mut b = random_bytes(16);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    hex::encode(b)
+}
+
+/// `time.time()`.
+pub fn time() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// The UTC date and time of a moment: (year, month, day, hour, minute, second, microsecond).
+pub fn utc(secs: i64, micros: u32) -> (i64, u32, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    // civil_from_days (H. Hinnant)
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    (y, m, d, (rem / 3600) as u32, (rem % 3600 / 60) as u32, (rem % 60) as u32, micros)
+}
+
+fn now_parts() -> (i64, u32, u32, u32, u32, u32, u32) {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    utc(d.as_secs() as i64, d.subsec_micros())
+}
+
+/// `time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())`.
+pub fn utc_seconds() -> String {
+    let (y, mo, d, h, mi, s, _) = now_parts();
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// `datetime.now(timezone.utc).isoformat(timespec="microseconds")` with `Z` for `+00:00`.
+pub fn utc_micros() -> String {
+    let (y, mo, d, h, mi, s, us) = now_parts();
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{us:06}Z")
+}
