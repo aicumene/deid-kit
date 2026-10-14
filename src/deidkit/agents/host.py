@@ -1174,7 +1174,9 @@ class AgentHost:
         if name == "review" and request.method == "GET":
             return await self._review_view(request.query.get("path", ""))
         if name == "review" and request.method == "POST":
-            return await self._review_start(((await request.json()).get("path") or "").strip())
+            body = await request.json()
+            body = body if isinstance(body, dict) else {}
+            return await self._review_start(str(body.get("path") or "").strip(), str(body.get("agent") or "").strip())
         if name in ("review-suggest", "review-decide", "review-text", "review-vote") and request.method == "POST":
             body = await request.json()
             if not isinstance(body, dict):
@@ -1306,17 +1308,34 @@ class AgentHost:
             review.store(self.cfg.folder, path, review.revision(path=path, before=read[1], after=text, creator=me))
         return web.json_response({"ok": True, "sha": review.sha(text)})
 
-    async def _review_start(self, path: str) -> web.Response:
+    async def _review_start(self, path: str, agent: str = "") -> web.Response:
+        """A review by the agent at work, or by ``agent`` — a second reviewer: it takes the document between
+        tasks, and the one at work comes back after it."""
         read = review.read_text(self.cfg.folder, path)
         if read is None:
             return web.json_response({"error": "no text for this document", "source": review.text_source(path)},
                                      status=404)
+        reviewer = None
+        if agent and agent not in (self.current.name, self.current.label):
+            reviewer = next((a for a in self.agents if agent in (a.name, a.label)), None)
+            if reviewer is None:
+                return web.json_response({"error": "there is no such agent"}, status=400)
+            if reviewer.unavailable:
+                return web.json_response({"error": f"{reviewer.name} cannot start here: {reviewer.unavailable}"},
+                                         status=409)
         if self.busy or self.status != "ready" or self.handover is not None:
             return web.json_response({"error": "the agent is busy or not ready"}, status=409)
         run = uuid.uuid4().hex[:12]
         self.busy = True                     # taken now: a second review or a task cannot slip in before it starts
-        asyncio.create_task(self.run_review(path, read[0], run))
+        asyncio.create_task(self.run_review(path, read[0], run, reviewer))
         return web.json_response({"ok": True, "run": run}, status=202)
+
+    async def _at_work(self, choice: AgentChoice) -> bool:
+        """``choice`` becomes the agent at work, between tasks (started if it has no seat yet); False — it did
+        not start."""
+        if not self.take_seat(choice):
+            await self.launch(choice)
+        return self.status == "ready"
 
     def _model_name(self) -> str:
         """The model that answered the task just done, as the provider named it; else as the agent does."""
@@ -1326,8 +1345,27 @@ class AgentHost:
         return next((o["name"] for o in models.get("options") or [] if o.get("value") == models.get("current")),
                     str(models.get("current") or ""))
 
-    async def run_review(self, path: str, source: str, run: str) -> None:
-        """The agent at work reviews the document; the notes whose quotes are in the text are kept."""
+    async def run_review(self, path: str, source: str, run: str, reviewer: AgentChoice | None = None) -> None:
+        """The agent at work reviews the document — or ``reviewer``, which takes over between tasks and hands
+        back to the agent that was at work when it is done; the notes whose quotes are in the text are kept."""
+        if reviewer is None:
+            return await self._review(path, source, run)
+        back = self.current
+        try:
+            if not await self._at_work(reviewer):
+                self.emit({"kind": "review", "state": "failed", "path": path, "run": run, "agent": reviewer.label,
+                           "text": f"{reviewer.name} did not start"})
+                return
+            await self._review(path, source, run)
+        finally:
+            self.busy = True                 # nothing slips in while the agent at work comes back
+            try:
+                if self.current.name != back.name:
+                    await self._at_work(back)
+            finally:
+                self.busy = False
+
+    async def _review(self, path: str, source: str, run: str) -> None:
         agent = self.current.label
         self.emit({"kind": "review", "state": "started", "path": path, "run": run, "agent": agent})
         at = len(self.events)

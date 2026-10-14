@@ -172,6 +172,46 @@ def test_a_file_that_is_not_this_document_s_note_is_left_out(tmp_path):
 
 
 # ── through the host ──────────────────────────────────────────────────────────────────────────────
+async def test_a_second_reviewer_takes_the_document_and_hands_back(tmp_path):
+    folder = tmp_path / "matter"
+    folder.mkdir()
+    (folder / "lease.md").write_text(LEASE)
+    claude = AgentChoice("Claude Code", [sys.executable, str(FAKE), "Claude Code", "review"])
+    ours = AgentChoice("MatterAgent", [sys.executable, str(FAKE), "MatterAgent", "review"])
+    gone = AgentChoice("Codex", [sys.executable, str(FAKE), "Codex"], unavailable="not signed in")
+    cfg = HostConfig(folder=folder, scope="case-1", title="Case 1", dev_login=True, agent_command=claude.command,
+                     agents=[claude, ours, gone])
+    host = AgentHost(cfg, Proxy(InMemoryTokenStore(), ProxyConfig(default_scope="case-1", detector=RegexDetector())))
+    client = TestClient(TestServer(host.app()))
+    await client.start_server()
+    try:
+        await wait_for(lambda: host.status == "ready")
+        headers = {"x-deid-agent-token": host.cfg.token}
+        post = lambda body: client.post("/deid-agent/api/review", json=body, headers=headers)  # noqa: E731
+        assert (await post({"path": "lease.md", "agent": "Nobody"})).status == 400
+        assert (await post({"path": "lease.md", "agent": "Codex"})).status == 409
+
+        # Claude Code first, then MatterAgent as the second reviewer.
+        for who in ("Claude Code", "MatterAgent"):
+            r = await post({"path": "lease.md", "agent": who})
+            assert r.status == 202, await r.text()
+            run = (await r.json())["run"]
+            await wait_for(lambda: any(e["kind"] == "review" and e.get("run") == run and e["state"] in ("done", "failed")
+                                       for e in host.events))
+            await wait_for(lambda: not host.busy and host.status == "ready")
+            done = next(e for e in host.events if e["kind"] == "review" and e.get("run") == run and e["state"] != "started")
+            assert done["state"] == "done" and done["agent"] == who and done["kept"] == 1, done
+            # the agent at work is the one that was, after either review
+            assert host.current.name == "Claude Code"
+        notes = review.load(folder, "lease.md", LEASE)
+        assert sorted(n["creator"]["name"] for n in notes) == ["Claude Code", "MatterAgent"]
+        # the chat heard the hand-over both ways
+        switched = [e["current"] for e in host.events if e["kind"] == "agents"]
+        assert switched[-2:] == ["MatterAgent", "Claude Code"], switched
+    finally:
+        await client.close()
+
+
 @pytest.fixture
 async def rig(tmp_path):
     folder = tmp_path / "matter"
