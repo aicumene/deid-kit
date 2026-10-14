@@ -1373,7 +1373,7 @@ class AgentHost:
         await self.run_prompt(review.prompt(path, source), shown=f"Review {path}")
         answer = "".join(e.get("text", "") for e in self.events[at:] if e.get("kind") == "message")
         failed = next((e.get("text") for e in self.events[at:] if e.get("kind") == "error"), None)
-        notes = review.parse_notes(answer)
+        notes, cut = review.notes_of(answer)
         read = review.read_text(self.cfg.folder, path)
         if notes is None or read is None:
             why = failed or ("the document's text is gone" if read is None else "the agent did not answer with notes")
@@ -1383,7 +1383,7 @@ class AgentHost:
         creator = {"type": "Software", "name": agent, **({"model": model} if model else {})}
         kept = review.keep(self.cfg.folder, path, read[1], notes, creator=creator, run=run)
         self.emit({"kind": "review", "state": "done", "path": path, "run": run, "agent": agent, "model": model,
-                   "kept": len(kept["kept"]), "refused": kept["refused"]})
+                   "kept": len(kept["kept"]), "refused": kept["refused"], **({"cut": True} if cut else {})})
 
     async def _set_model(self, value: str) -> web.Response:
         """Switch the agent's model between tasks. The agent's own answer is what the page shows:

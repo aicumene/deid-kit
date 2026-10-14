@@ -67,9 +67,9 @@ text only, empty where it does not say;
 "Housing Act 1988 s. 21", "Art. 28 GDPR"), or empty;
 - "suggestion": where you would fix the point by changing the words, the words to put in place of the quote, \
 exactly as they should read — the lawyer accepts or rejects it; otherwise empty;
-- "note": one or two sentences for the lawyer, in the language they write to you in.
+- "note": one or two sentences for the lawyer, in the language they write to you in — under 300 characters.
 
-Answer with one JSON object and nothing else:
+At most 20 points, the most important first. Answer with one JSON object and nothing else:
 {{"notes": [{{"quote": "...", "kind": "risk", "aspect": "termination", "importance": 4, "clause_type": "", \
 "who": "", "what": "", "to_whom": "", "when": "", "norm": "", "suggestion": "", "note": "..."}}]}}"""
 
@@ -274,6 +274,27 @@ def clause_at(text: str, at: int) -> str | None:
 _NOTES_OBJECT = re.compile(r'\{\s*"notes"\s*:')
 
 
+def _cut_notes(answer: str) -> list | None:
+    """The whole notes of an answer cut short — its length ran out in the middle of the list: each note that was
+    written to its end, in order; None — no list of notes begins in it."""
+    starts = list(_NOTES_OBJECT.finditer(answer))
+    if not starts:
+        return None
+    at = answer.find("[", starts[-1].end())
+    if at < 0 or answer[starts[-1].end():at].strip():
+        return None
+    decoder = json.JSONDecoder(strict=False)
+    notes, at = [], at + 1
+    while True:
+        while at < len(answer) and answer[at] in " \t\r\n,":
+            at += 1
+        try:
+            value, at = decoder.raw_decode(answer, at)
+        except ValueError:
+            return notes
+        notes.append(value)
+
+
 def _json_object(answer: str) -> dict | None:
     """The notes object in the agent's answer. The answer is everything the agent said in the task —
     "I'll read the file first", then the object, perhaps fenced — so the object is looked for where it
@@ -301,10 +322,25 @@ def _text(value, limit: int) -> str:
 
 
 def parse_notes(answer: str) -> list[dict] | None:
-    """The notes in an agent's answer, each with its fields in our vocabulary; None — no notes object in it."""
+    """The notes in an agent's answer, each with its fields in our vocabulary; None — no notes object in it.
+    An answer cut short in the middle of its notes gives the ones written to their end (:func:`notes_of`)."""
+    return notes_of(answer)[0]
+
+
+def notes_of(answer: str) -> tuple[list[dict] | None, bool]:
+    """``(notes, cut)``: the notes, as :func:`parse_notes` gives them, and whether the answer was cut short —
+    then its whole notes are kept, and the one it was writing is lost."""
     data = _json_object(answer)
+    cut = False
     if data is None or not isinstance(data.get("notes"), list):
-        return None
+        whole = _cut_notes(answer) if data is None else None
+        if not whole:
+            return None, False
+        data, cut = {"notes": whole}, True
+    return _notes(data), cut
+
+
+def _notes(data: dict) -> list[dict]:
     out = []
     for raw in data["notes"][:MAX_NOTES]:
         if not isinstance(raw, dict):

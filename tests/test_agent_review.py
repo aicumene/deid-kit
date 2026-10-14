@@ -118,6 +118,13 @@ def test_notes_are_read_from_whatever_the_agent_said_around_them():
     assert note["kind"] == "risk" and note["aspect"] == "other" and note["importance"] == 5
     assert note["note"] == "two words" and note["clause_type"] == ""
     assert review.parse_notes("No notes today.") is None
+    # An answer whose length ran out in the middle of its notes: the whole ones are kept, in order.
+    cut = ('I read it. {"notes": [{"quote": "may break", "kind": "risk", "note": "Short."}, '
+           '{"quote": "rent", "kind": "point", "note": "Monthly."}, {"quote": "The term is ten years", "kind": "cla')
+    notes, was_cut = review.notes_of(cut)
+    assert [n["quote"] for n in notes] == ["may break", "rent"] and was_cut
+    assert review.notes_of('{"notes": [{"quote": "x", "note": "y"}]}')[1] is False
+    assert review.notes_of('{"notes": [{"quote": "unfinished') == (None, False)
     assert review.parse_notes('{"notes": "none"}') is None
 
 
