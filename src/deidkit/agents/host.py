@@ -1376,7 +1376,10 @@ class AgentHost:
         notes, cut = review.notes_of(answer)
         read = review.read_text(self.cfg.folder, path)
         if notes is None or read is None:
-            why = failed or ("the document's text is gone" if read is None else "the agent did not answer with notes")
+            # The agent's own words when it said why (MatterAgent: "The model's server did not answer…") — not ours.
+            said = " ".join(answer.split())
+            why = failed or ("the document's text is gone" if read is None else
+                             said if 0 < len(said) <= 400 else "the agent did not answer with notes")
             self.emit({"kind": "review", "state": "failed", "path": path, "run": run, "agent": agent, "text": why})
             return
         model = self._model_name()

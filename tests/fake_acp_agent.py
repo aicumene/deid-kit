@@ -90,6 +90,12 @@ for line in sys.stdin:
         cancelled = False
         turns += 1
         asked = " ".join(b.get("text") or "" for b in params.get("prompt") or [])
+        if "review-down" in sys.argv[2:] and "Review the document" in asked:
+            # its model's server is down: it says so, and gives no notes
+            update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text",
+                   "text": "The model's server did not answer (500 Internal Server Error). Try again in a moment."}})
+            send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+            continue
         if "review" in sys.argv[2:] and "Review the document" in asked:
             time.sleep(0.3)                  # a review takes a while: a second request meets it under way
             source = asked.split('Its text is in the file "', 1)[1].split('"', 1)[0]

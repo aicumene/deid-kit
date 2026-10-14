@@ -219,6 +219,27 @@ async def test_a_second_reviewer_takes_the_document_and_hands_back(tmp_path):
         await client.close()
 
 
+async def test_a_review_without_notes_says_why_in_the_agent_s_words(tmp_path):
+    folder = tmp_path / "matter"
+    folder.mkdir()
+    (folder / "lease.md").write_text(LEASE)
+    down = AgentChoice("MatterAgent", [sys.executable, str(FAKE), "MatterAgent", "review-down"])
+    cfg = HostConfig(folder=folder, scope="case-1", title="Case 1", dev_login=True, agent_command=down.command,
+                     agents=[down])
+    host = AgentHost(cfg, Proxy(InMemoryTokenStore(), ProxyConfig(default_scope="case-1", detector=RegexDetector())))
+    client = TestClient(TestServer(host.app()))
+    await client.start_server()
+    try:
+        await wait_for(lambda: host.status == "ready")
+        r = await client.post("/deid-agent/api/review", json={"path": "lease.md"}, headers={"x-deid-agent-token": host.cfg.token})
+        assert r.status == 202
+        await wait_for(lambda: any(e["kind"] == "review" and e["state"] == "failed" for e in host.events))
+        failed = next(e for e in host.events if e["kind"] == "review" and e["state"] == "failed")
+        assert failed["text"].startswith("The model's server did not answer"), failed
+    finally:
+        await client.close()
+
+
 @pytest.fixture
 async def rig(tmp_path):
     folder = tmp_path / "matter"
