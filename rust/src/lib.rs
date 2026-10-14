@@ -7,6 +7,7 @@
 
 pub mod namefold;
 pub mod py;
+pub mod pyre;
 pub mod textmatch;
 pub mod unicode;
 pub mod unicode_tables;

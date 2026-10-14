@@ -106,3 +106,22 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def sre_tables() -> None:
+    """What re's IGNORECASE compares: the simple lower case (_sre.unicode_tolower) and the extra
+    equivalences (re._casefix._EXTRA_CASES: ſ with s, K with k, ...)."""
+    import _sre
+    from re import _casefix
+    w = sys.stdout.write
+    low = [(cp, _sre.unicode_tolower(cp)) for cp in ALL if _sre.unicode_tolower(cp) != cp]
+    w(f"pub static SIMPLE_LOWER: [(u32, u32); {len(low)}] = [" + ", ".join(f"(0x{a:x}, 0x{b:x})" for a, b in low) + "];\n")
+    cased = ranges([cp for cp in ALL if _sre.unicode_iscased(cp)])
+    w(f"pub static SRE_CASED: [(u32, u32); {len(cased)}] = [" + ", ".join(f"(0x{a:x}, 0x{b:x})" for a, b in cased) + "];\n")
+    extra = sorted(_casefix._EXTRA_CASES.items())
+    w(f"pub static EXTRA_CASES: [(u32, &[u32]); {len(extra)}] = [" +
+      ", ".join(f"(0x{k:x}, &[{', '.join(f'0x{x:x}' for x in v)}])" for k, v in extra) + "];\n")
+
+
+if __name__ == "__main__":
+    sre_tables()
