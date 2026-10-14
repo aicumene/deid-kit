@@ -13,6 +13,7 @@ the way models write them, and one on words the document does not have."""
 import json
 import os
 import sys
+import time
 
 pending = {}
 next_id = 1000
@@ -90,6 +91,7 @@ for line in sys.stdin:
         turns += 1
         asked = " ".join(b.get("text") or "" for b in params.get("prompt") or [])
         if "review" in sys.argv[2:] and "Review the document" in asked:
+            time.sleep(0.3)                  # a review takes a while: a second request meets it under way
             source = asked.split('Its text is in the file "', 1)[1].split('"', 1)[0]
             with open(os.path.join(cwd, source), encoding="utf-8") as fh:
                 line = fh.read().split("\n")[2]

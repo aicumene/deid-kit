@@ -130,6 +130,10 @@ def test_the_text_of_a_document(tmp_path):
     (tmp_path / ".legix/text").mkdir(parents=True)
     (tmp_path / ".legix/text/Supply.docx.md").write_text("<!-- bernio-text/1 -->\nSupply.\n")
     assert review.read_text(tmp_path, "Supply.docx")[0] == ".legix/text/Supply.docx.md"
+    (tmp_path / "Lease.pdf").write_bytes(b"%PDF-1.4")                       # a PDF: its text is written beside it too
+    (tmp_path / ".legix/text/Lease.pdf.md").write_text("<!-- bernio-text/1 -->\nLease.\n")
+    assert review.read_text(tmp_path, "Lease.pdf") == (".legix/text/Lease.pdf.md", "<!-- bernio-text/1 -->\nLease.\n")
+    assert not review.writable("Lease.pdf")
     for path in ("../lease.md", "/etc/hosts", ".legix/text/Supply.docx.md", "missing.md", ""):
         assert review.read_text(tmp_path, path) is None, path
 

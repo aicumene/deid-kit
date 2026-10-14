@@ -1246,7 +1246,7 @@ class AgentHost:
         replacement = review._body(ann, "replacing", review.MAX_REPLACEMENT)
         if verdict == "accepted" and (replacement or review._kind(ann) == "edit"):
             if not review.writable(path):
-                why = "a Word document is changed in Word: the decision is kept"
+                why = "a Word or PDF document is changed in its own program: the decision is kept"
             else:
                 read = review.read_text(self.cfg.folder, path)
                 changed = review.apply(read[1], ann, replacement) if read else None
@@ -1295,7 +1295,7 @@ class AgentHost:
                 review.store(self.cfg.folder, path, review.written(path=path, creator=me, how="saved"))
             return web.json_response({"ok": True, "sha": review.sha(text)})
         if not review.writable(path):
-            return web.json_response({"error": "a Word document is changed in Word"}, status=400)
+            return web.json_response({"error": "a Word or PDF document is changed in its own program"}, status=400)
         read = review.read_text(self.cfg.folder, path)
         if read is None:
             return web.json_response({"error": "no such document"}, status=404)

@@ -135,6 +135,18 @@ async def test_a_word_document_keeps_the_decision_and_is_changed_in_word(rig):
     assert (folder / "Supply.docx").read_bytes() == b"PK"
 
 
+async def test_a_pdf_keeps_the_decision_and_is_changed_in_its_own_program(rig):
+    host, call, folder = rig
+    (folder / "Lease.pdf").write_bytes(b"%PDF-1.4")
+    (folder / ".legix/text").mkdir(parents=True)
+    (folder / ".legix/text/Lease.pdf.md").write_text("Notice of three months.\n")
+    _, s = await call("review-suggest", {"path": "Lease.pdf", "start": 10, "end": 15, "text": "six"})
+    status, done = await call("review-decide", {"path": "Lease.pdf", "target": s["id"], "verdict": "accepted"})
+    assert status == 200 and done["applied"] is False and "PDF" in done["why"]
+    assert (folder / ".legix/text/Lease.pdf.md").read_text() == "Notice of three months.\n"
+    assert (await call("review-text", {"path": "Lease.pdf", "text": "x", "sha": ""}))[0] == 400
+
+
 # ── the agents' notes: accepted wording, and feedback ─────────────────────────────────────────────
 async def test_an_agent_s_wording_accepted_and_its_note_judged(rig):
     host, call, folder = rig

@@ -508,7 +508,7 @@ def sha(text: str) -> str:
 
 def writable(path: str) -> bool:
     """A document whose text is the document itself (Markdown, plain text): changes are made in it. A Word
-    document's text is its picture; it is changed in Word."""
+    document's text is its picture, and so is a PDF's; they are changed in their own programs."""
     return Path(path).suffix.lower() in TEXT_SUFFIXES and path.split("/", 1)[0] != NOTES
 
 
