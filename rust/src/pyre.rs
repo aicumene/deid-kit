@@ -7,7 +7,7 @@
 //! `search`, `finditer`, `sub` and `split` with Python's rules for empty matches. Offsets are in
 //! characters, as Python's indices are.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::unicode as u;
 use crate::unicode_tables as t;
@@ -142,7 +142,7 @@ enum Kind {
 enum Node {
     Lit(char, bool),
     Any(bool),
-    Set(Rc<Set>, bool),
+    Set(Arc<Set>, bool),
     Bol(bool),
     Eol(bool),
     BeginText,
@@ -418,7 +418,7 @@ impl Parser<'_> {
                 items.push(Item::Char(lo));
             }
         }
-        Ok(Node::Set(Rc::new(Set { items, negated, ascii: f.ascii }), f.ignorecase))
+        Ok(Node::Set(Arc::new(Set { items, negated, ascii: f.ascii }), f.ignorecase))
     }
 
     fn flags_of(&mut self, mut f: Flags) -> Result<(Flags, bool), String> {
@@ -456,7 +456,7 @@ impl Parser<'_> {
             '[' => self.class(f)?,
             '\\' => match self.escape_char(false)? {
                 Escaped::Char(x) => Node::Lit(x, f.ignorecase),
-                Escaped::Cat(cat, neg) => Node::Set(Rc::new(Set { items: vec![Item::Cat(cat, neg)], negated: false, ascii: f.ascii }), false),
+                Escaped::Cat(cat, neg) => Node::Set(Arc::new(Set { items: vec![Item::Cat(cat, neg)], negated: false, ascii: f.ascii }), false),
                 Escaped::Boundary(neg) => Node::Boundary { ascii: f.ascii, neg },
                 Escaped::BeginText => Node::BeginText,
                 Escaped::EndText => Node::EndText,

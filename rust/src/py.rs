@@ -431,3 +431,118 @@ mod tests {
         assert_eq!(repr_str("a'b\"c"), "'a\\'b\"c'");
     }
 }
+
+/// `json.dumps(value)` with Python's defaults: `ensure_ascii=True` (every character past ASCII as `\uXXXX`,
+/// a pair of them past the BMP) and the `", "` / `": "` separators.
+pub fn dumps_ascii(value: &serde_json::Value) -> String {
+    let text = dumps(value);
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if (c as u32) < 0x80 {
+            out.push(c);
+        } else {
+            let mut buf = [0u16; 2];
+            for unit in c.encode_utf16(&mut buf) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
+// ── paths, as os.path.realpath(strict=False) resolves them ──────────────────────────────────────────
+
+use std::path::{Component, Path, PathBuf};
+
+/// `os.path.realpath(path)`: every link resolved, `..` taken after the real path so far; what does not
+/// exist is kept as written. A link loop stops where it was found.
+pub fn realpath(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(path)
+    };
+    let mut seen = std::collections::HashMap::new();
+    let (resolved, _) = join_real(PathBuf::from("/"), &abs, &mut seen, 0);
+    resolved
+}
+
+fn join_real(mut path: PathBuf, rest: &Path, seen: &mut std::collections::HashMap<PathBuf, Option<PathBuf>>,
+             depth: usize) -> (PathBuf, bool) {
+    let parts: Vec<Component> = rest.components().collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
+        i += 1;
+        match part {
+            Component::RootDir => path = PathBuf::from("/"),
+            Component::CurDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                if path.file_name().is_some() {
+                    path.pop();
+                }
+            }
+            Component::Normal(name) => {
+                let newpath = path.join(name);
+                let is_link = std::fs::symlink_metadata(&newpath).is_ok_and(|m| m.file_type().is_symlink());
+                if !is_link {
+                    path = newpath;
+                    continue;
+                }
+                if let Some(known) = seen.get(&newpath) {
+                    match known {
+                        Some(real) => {
+                            path = real.clone();
+                            continue;
+                        }
+                        None => {
+                            // a loop: the rest as it is written
+                            let mut out = newpath;
+                            for p in &parts[i..] {
+                                out.push(p.as_os_str());
+                            }
+                            return (out, false);
+                        }
+                    }
+                }
+                if depth > 64 {
+                    return (newpath, false);
+                }
+                seen.insert(newpath.clone(), None);
+                let target = match std::fs::read_link(&newpath) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        path = newpath;
+                        continue;
+                    }
+                };
+                let (real, ok) = join_real(path.clone(), &target, seen, depth + 1);
+                if !ok {
+                    let mut out = real;
+                    for p in &parts[i..] {
+                        out.push(p.as_os_str());
+                    }
+                    return (out, false);
+                }
+                seen.insert(newpath, Some(real.clone()));
+                path = real;
+            }
+        }
+    }
+    (path, true)
+}
+
+/// `Path(text).expanduser()`.
+pub fn expanduser(text: &str) -> PathBuf {
+    if text == "~" || text.starts_with("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut p = PathBuf::from(home);
+            if text.len() > 2 {
+                p.push(&text[2..]);
+            }
+            return p;
+        }
+    }
+    PathBuf::from(text)
+}
+

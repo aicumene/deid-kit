@@ -5,9 +5,18 @@
 //! text rules (`unicode`, `py`) are taken from Python's Unicode data, so a vault key made here is the key
 //! the Python vault made.
 
+pub mod address;
+pub mod detect;
+pub mod gateway;
+pub mod log;
 pub mod namefold;
+pub mod odict;
+pub mod patterns;
 pub mod py;
 pub mod pyre;
+pub mod seeds;
+pub mod store;
 pub mod textmatch;
 pub mod unicode;
 pub mod unicode_tables;
+pub mod vault;
