@@ -203,7 +203,8 @@ class AcpAgent:
             line = await self.proc.stderr.readline()
             if not line:
                 break
-            log.debug("agent stderr: %s", line.decode("utf-8", "replace").rstrip()[:300])
+            # to the log (the desktop app's Console shows it): the agent's errors are there
+            log.info("agent stderr: %s", line.decode("utf-8", "replace").rstrip()[:300])
 
 
 def agent_env(*, base_url: str, scope: str, api_key: str | None, extra: dict | None = None) -> dict:

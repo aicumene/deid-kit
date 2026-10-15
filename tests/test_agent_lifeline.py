@@ -66,7 +66,7 @@ def start(deid_agent: list[str], tmp_path: Path, *flags: str):
     """deid-agent over a folder, its agent the scripted one under a shell that first starts a grandchild (a
     sleep): the agent's and the grandchild's numbers are written down. The secrets go in on stdin, left open."""
     (tmp_path / "matter").mkdir()
-    script = (f"echo $$ > {shlex.quote(str(tmp_path / 'agent.pid'))}; sleep 300 & "
+    script = (f"echo $$ > {shlex.quote(str(tmp_path / 'agent.pid'))}; echo 'the agent says: oops' >&2; sleep 300 & "
               f"echo $! > {shlex.quote(str(tmp_path / 'grandchild.pid'))}; exec {shlex.quote(sys.executable)} "
               f"{shlex.quote(str(FAKE))}")
     port = free_port()
@@ -77,7 +77,8 @@ def start(deid_agent: list[str], tmp_path: Path, *flags: str):
          "--vault", str(tmp_path / "vault.sqlite"), "--audit", str(tmp_path / "audit.jsonl"), "--usage-log", "",
          "--dev-login", "--no-guard", "--secrets-stdin", *flags,
          "--agent-command", shlex.join(["/bin/sh", "-c", script])],
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, cwd=tmp_path)
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=open(tmp_path / "deid-agent.log", "wb"), env=env,
+        cwd=tmp_path)
     proc.stdin.write(json.dumps({"token": "lifeline-test-token", "api_key": None}).encode() + b"\n")
     proc.stdin.flush()
     until(lambda: listening(port), 30, "deid-agent did not listen")
@@ -109,6 +110,10 @@ def test_with_a_lifeline_deid_agent_goes_when_its_stdin_closes(deid_agent, tmp_p
     try:
         proc.stdin.close()                    # as the system does when the program that started it is killed
         gone(proc, port, agent, grandchild)
+        log = (tmp_path / "deid-agent.log").read_text()
+        # what the agent says on stderr is in deid-agent's log (the desktop app's Console shows it), and why it stopped
+        assert "INFO agent stderr: the agent says: oops" in log, log
+        assert "its stdin closed" in log, log
     finally:
         stop_leftovers(proc, agent, grandchild)
 

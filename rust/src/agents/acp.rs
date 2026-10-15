@@ -108,9 +108,15 @@ impl AcpAgent {
         *self.child.borrow_mut() = Some(child);
         let me = self.clone();
         let reader = tokio::task::spawn_local(async move { me.read(stdout).await });
+        // what the agent says on stderr goes to the log (the desktop app's Console shows it): its errors are there
         let drain = tokio::task::spawn_local(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(_line)) = lines.next_line().await {}
+            let mut reader = BufReader::new(stderr);
+            let mut line = Vec::new();
+            while reader.read_until(b'\n', &mut line).await.is_ok_and(|n| n > 0) {
+                let text = String::from_utf8_lossy(&line);
+                crate::log::info(&format!("agent stderr: {}", text.trim_end().chars().take(300).collect::<String>()));
+                line.clear();
+            }
         });
         self.tasks.borrow_mut().extend([reader, drain]);
         let info = self.request("initialize", json!({
