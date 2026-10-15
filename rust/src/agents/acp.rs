@@ -93,7 +93,10 @@ impl AcpAgent {
         let mut cmd = Command::new(&program);
         cmd.args(&self.command[1.min(self.command.len())..]).current_dir(&self.cwd).env_clear()
             .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(false);
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(false)
+            // a process group of its own: what the agent starts (Claude Code under its adapter, the tools and MCP
+            // servers it runs) is stopped with it, and a terminal's Ctrl-C reaches deid-agent, which stops them
+            .process_group(0);
         let mut child = cmd.spawn().map_err(|e| {
             // asyncio names the program when it is not found, the folder when that is what is missing
             let missing_cwd = !std::path::Path::new(&self.cwd).is_dir();
@@ -159,16 +162,22 @@ impl AcpAgent {
         self.send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}})).await
     }
 
-    /// Terminate the process (killed after 5 s), and stop reading it.
+    /// Terminate the process and all it started, its process group (killed after 5 s), and stop reading it. The
+    /// group is signalled only while its leader is not yet reaped, when its number cannot belong to another group;
+    /// what is left of it once the leader is gone is killed at once.
     pub async fn stop(&self) {
         let child = self.child.borrow_mut().take();
         if let Some(mut c) = child {
             if matches!(c.try_wait(), Ok(None)) {
                 if let Some(pid) = c.id() {
-                    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                }
-                if tokio::time::timeout(Duration::from_secs(5), c.wait()).await.is_err() {
-                    let _ = c.kill().await;
+                    let group = -(pid as i32);
+                    unsafe { libc::kill(group, libc::SIGTERM) };
+                    if tokio::time::timeout(Duration::from_secs(5), c.wait()).await.is_err() {
+                        unsafe { libc::kill(group, libc::SIGKILL) };
+                        let _ = c.wait().await;
+                    } else {
+                        unsafe { libc::kill(group, libc::SIGKILL) };
+                    }
                 }
             }
             *self.child.borrow_mut() = Some(c);

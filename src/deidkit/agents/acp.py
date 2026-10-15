@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -31,6 +32,13 @@ PROTOCOL_VERSION = 1
 Update = dict[str, Any]
 PermissionDecider = Callable[[dict], Awaitable[dict]]
 
+
+
+def _signal_group(group: int, sig: int) -> None:
+    try:
+        os.killpg(group, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 class AcpError(RuntimeError):
     def __init__(self, error: dict) -> None:
@@ -61,7 +69,10 @@ class AcpAgent:
         self.proc = await asyncio.create_subprocess_exec(
             *self.command, cwd=self.cwd, env=self.env, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            limit=64 * 1024 * 1024)
+            limit=64 * 1024 * 1024,
+            # a process group of its own: what the agent starts (Claude Code under its adapter, the tools and
+            # MCP servers it runs) is stopped with it, and a terminal's Ctrl-C reaches deid-agent, which stops them
+            process_group=0)
         self._reader = asyncio.create_task(self._read())
         self._stderr = asyncio.create_task(self._drain_stderr())
         self.agent_info = await self.request("initialize", {
@@ -108,12 +119,19 @@ class AcpAgent:
                           "params": {"sessionId": session_id}})
 
     async def stop(self) -> None:
+        """Terminate the process and all it started, its process group (killed after 5 s). The group is signalled
+        only while its leader is not yet reaped, when its number cannot belong to another group; what is left of
+        it once the leader is gone is killed at once."""
         if self.proc and self.proc.returncode is None:
-            self.proc.terminate()
+            group = self.proc.pid
+            _signal_group(group, signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.proc.wait(), 5)
             except asyncio.TimeoutError:
-                self.proc.kill()
+                _signal_group(group, signal.SIGKILL)
+                await self.proc.wait()
+            else:
+                _signal_group(group, signal.SIGKILL)
         for task in (self._reader, self._stderr):
             if task:
                 task.cancel()

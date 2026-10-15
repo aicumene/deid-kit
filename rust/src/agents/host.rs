@@ -2248,12 +2248,15 @@ impl AgentHost {
     }
 
     /// Every agent stopped and every confined Codex's folder removed: the server is going away.
+    /// The agents stopped, all at once (each may take its 5 s), and Codex's folders dropped.
     pub async fn cleanup(&self) {
         let seats: Vec<(String, Option<Rc<AcpAgent>>)> = self.st.borrow().seats.iter().map(|(n, s)| (n.clone(), s.agent.clone())).collect();
-        for (name, agent) in seats {
-            if let Some(a) = agent {
-                a.stop().await;
-            }
+        let stopping: Vec<_> = seats.iter().filter_map(|(_, a)| a.clone())
+            .map(|a| tokio::task::spawn_local(async move { a.stop().await })).collect();
+        for s in stopping {
+            let _ = s.await;
+        }
+        for (name, _) in seats {
             self.drop_codex_dir(&name);
         }
     }

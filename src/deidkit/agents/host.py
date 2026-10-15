@@ -1486,9 +1486,9 @@ class AgentHost:
             asyncio.create_task(self.start_agent())
 
         async def cleanup(app):
+            # the agents stopped all at once (each may take its 5 s)
+            await asyncio.gather(*(seat.agent.stop() for seat in self.seats.values() if seat.agent))
             for seat in self.seats.values():
-                if seat.agent:
-                    await seat.agent.stop()
                 self._drop_codex_dir(seat)
             await self.proxy._stop(app)
 

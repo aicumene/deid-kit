@@ -22,7 +22,9 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sys
+import threading
 from pathlib import Path
 
 from aiohttp import web
@@ -171,6 +173,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--secrets-stdin", action="store_true",
                     help='read the page token and the key as one JSON line on stdin '
                          '({"token": ..., "api_key": ...}) instead of the environment')
+    ap.add_argument("--lifeline", action="store_true",
+                    help="keep reading stdin (after the secrets); when it closes, whoever started deid-agent is "
+                         "gone (even killed): stop the agents and exit")
     ap.add_argument("--dev-login", action="store_true",
                     help="allow the machine's own Claude sign-in when no API key is set")
     ap.add_argument("--subagents", metavar="HOSTS",
@@ -248,8 +253,23 @@ def main(argv: list[str] | None = None) -> None:
     host = AgentHost(cfg, proxy)
     # A token handed over by the program that opens the page is not printed: output may go to a log.
     url = f"http://127.0.0.1:{args.port}/" + ("" if token else f"#t={cfg.token}")
-    web.run_app(host.app(), host="127.0.0.1", port=args.port,
+    app = host.app()
+    if args.lifeline:
+        app.on_startup.append(_watch_lifeline)
+    web.run_app(app, host="127.0.0.1", port=args.port,
                 print=lambda _: print(f"deid-agent: {url}", flush=True))
+
+
+async def _watch_lifeline(app) -> None:
+    """``--lifeline``: stdin stays open as long as the program that started deid-agent lives — the system closes it
+    when that program ends, even killed (the desktop app, LegalAiz 14.10: a killed app left deid-agent and its
+    agents running, holding the port). On its end, the same way out as Ctrl-C: the agents are stopped."""
+    def watch() -> None:
+        while sys.stdin.read(256):
+            pass
+        log.info("the program that started deid-agent is gone (its stdin closed): stopping the agents")
+        os.kill(os.getpid(), signal.SIGINT)
+    threading.Thread(target=watch, name="lifeline", daemon=True).start()
 
 
 if __name__ == "__main__":

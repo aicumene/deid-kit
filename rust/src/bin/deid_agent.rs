@@ -61,6 +61,8 @@ const OPTS: &[Opt] = &[
     opt("--upstream", "https://api.anthropic.com", "where the agent's model requests go"),
     opt("--api-key-env", "ANTHROPIC_API_KEY", "environment variable holding the organization's key"),
     flag("--secrets-stdin", "read the page token and the key as one JSON line on stdin"),
+    flag("--lifeline", "keep reading stdin (after the secrets); when it closes, whoever started deid-agent is gone \
+(even killed): stop the agents and exit"),
     flag("--dev-login", "allow the machine's own Claude sign-in when no API key is set"),
     none("--subagents", "HOSTS", "sub-agents on the organization's own model servers (matteragent's hosts file)"),
     none("--subagents-command", "", "what starts the sub-agents' MCP server (default: matteragent-mcp on PATH)"),
@@ -90,6 +92,28 @@ fn read_secrets() -> Value {
         Ok(v @ Value::Object(_)) => v,
         _ => die("deid-agent: --secrets-stdin expects one JSON line with token and api_key"),
     }
+}
+
+/// `--lifeline`: stdin stays open as long as the program that started deid-agent lives — the system closes it when
+/// that program ends, even killed (the desktop app, LegalAiz 14.10: a killed app left deid-agent and its agents
+/// running, holding the port). Read on a thread of its own, through the same buffered stdin the secrets came by.
+fn watch_lifeline() -> tokio::sync::oneshot::Receiver<()> {
+    use std::io::Read;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(());
+    });
+    rx
 }
 
 fn json_object(text: &str, option: &str) -> Value {
@@ -264,6 +288,7 @@ fn main() {
         ..ProxyConfig::default()
     };
     let url = format!("http://127.0.0.1:{port}/{}", if token.is_empty() { format!("#t={}", cfg.token) } else { String::new() });
+    let lifeline = args.on("--lifeline");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("the runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
@@ -282,9 +307,13 @@ fn main() {
         tokio::task::spawn_local(http::serve(listener, handler));
         tokio::task::spawn_local(host.clone().start_agent());
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM");
+        let gone = lifeline.then(watch_lifeline);
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
+            _ = async { match gone { Some(rx) => { let _ = rx.await; } None => std::future::pending().await } } => {
+                log::info("the program that started deid-agent is gone (its stdin closed): stopping the agents");
+            }
         }
         host.cleanup().await;
     });
