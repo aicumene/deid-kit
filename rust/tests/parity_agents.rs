@@ -153,6 +153,21 @@ fn the_agent_helpers_are_pythons() {
         let p = s(&c["path"]);
         d.eq(format!("text_source {p:?}"), &json!([c["source"], c["writable"]]), &json!([review::text_source(p), review::writable(p)]));
     }
+    for c in v["find_quotes"].as_array().unwrap() {
+        let seeds = deidkit::seeds::InMemorySeedSource::default();
+        for e in c["seeds"].as_array().unwrap() {
+            seeds.add_entity("q", deidkit::seeds::SeedEntity {
+                r#type: s(&e[0]).into(), name: s(&e[1]).into(), identifier: String::new(), identifier_type: String::new(),
+                jurisdiction_country: String::new(), role: String::new(), attributes: None, relationships: None, id: Value::Null });
+        }
+        let engine = deidkit::proxy::engine::ScopeEngine::new(
+            std::rc::Rc::new(deidkit::store::InMemoryTokenStore::new()), "q", Some(std::rc::Rc::new(seeds)),
+            Some(std::rc::Rc::new(deidkit::patterns::RegexDetector::default())), None);
+        let quotes: Vec<String> = c["quotes"].as_array().unwrap().iter().map(|q| s(q).to_string()).collect();
+        let got: Vec<Value> = review::find_quotes(s(&c["text"]), &quotes, Some(&engine)).into_iter()
+            .map(|f| f.map_or(Value::Null, |(a, b)| json!([a, b]))).collect();
+        d.eq(format!("find_quotes {:?} in {:?}", c["quotes"], c["text"]), &c["found"], &json!(got));
+    }
     for c in v["view"].as_array().unwrap() {
         let folder = Path::new(s(&c["folder"]));
         d.eq(format!("view {}", c["folder"]), &c["view"], &review::view(folder, s(&c["path"]), s(&c["text"])));

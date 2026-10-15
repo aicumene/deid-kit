@@ -1384,7 +1384,8 @@ class AgentHost:
             return
         model = self._model_name()
         creator = {"type": "Software", "name": agent, **({"model": model} if model else {})}
-        kept = review.keep(self.cfg.folder, path, read[1], notes, creator=creator, run=run)
+        found = await review.find_quotes(read[1], [n["quote"] for n in notes], self.proxy.engine(self.cfg.scope))
+        kept = review.keep(self.cfg.folder, path, read[1], notes, creator=creator, run=run, found=found)
         self.emit({"kind": "review", "state": "done", "path": path, "run": run, "agent": agent, "model": model,
                    "kept": len(kept["kept"]), "refused": kept["refused"], **({"cut": True} if cut else {})})
 

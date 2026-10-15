@@ -250,6 +250,12 @@ async def scenario(port, s: Stream, log, folder: Path, fake: FakeModel, multi: b
         await s.until(kind("status", status="ready"), after=mark, timeout=30)
         await asyncio.sleep(0.3)
         await call("reviewer unknown", "POST", "/deid-agent/api/review", {"path": "lease.md", "agent": "Nobody"})
+    mark = len(s.events)
+    await call("review of the deal", "POST", "/deid-agent/api/review", {"path": "deal.md"})
+    await s.until(lambda e: e.get("kind") == "review" and e.get("state") in ("done", "failed"), after=mark, timeout=30)
+    await s.until(kind("files"), after=mark)
+    await asyncio.sleep(0.3)
+    await call("view of the deal", "GET", "/deid-agent/api/review?path=deal.md")
     await call("review of nothing", "POST", "/deid-agent/api/review", {"path": "missing.md"})
     await call("review of a word file", "GET", "/deid-agent/api/review?path=deal.docx")
     view = await call("view", "GET", "/deid-agent/api/review?path=lease.md")
@@ -260,8 +266,10 @@ async def scenario(port, s: Stream, log, folder: Path, fake: FakeModel, multi: b
     await call("suggest stale", "POST", "/deid-agent/api/review-suggest", {"path": "lease.md", "start": 0, "end": 1, "text": "X", "sha": "0"})
     view = await call("view 2", "GET", "/deid-agent/api/review?path=lease.md")
     notes = view["body"].get("notes", []) if isinstance(view["body"], dict) else []
-    edit = next((n for n in notes if n["kind"] == "edit"), None)
-    risk = next((n for n in notes if n["kind"] == "risk"), None)
+    # notes on one quote by two reviewers come in a random order (their files' names): pick by who wrote them
+    by_who = sorted(notes, key=lambda n: (json.dumps(n.get("creator"), sort_keys=True), n.get("start") or 0))
+    edit = next((n for n in by_who if n["kind"] == "edit"), None)
+    risk = next((n for n in by_who if n["kind"] == "risk"), None)
     if edit:
         await call("accept edit", "POST", "/deid-agent/api/review-decide", {"path": "lease.md", "target": edit["id"], "verdict": "accepted"})
     if risk:
@@ -298,6 +306,9 @@ def make_folder(base: Path) -> Path:
     (folder / "docs").mkdir(parents=True)
     (folder / "letter.md").write_text("Dear Ada Brenner,\nHarrowgate Freight Ltd (\"HFL\") writes.\n")
     (folder / "lease.md").write_text(LEASE)
+    # a party called by its short name: a quote naming it in full is found in tokens
+    (folder / "deal.md").write_text('This agreement is between HARROWGATE FREIGHT LTD ("HFL") and Ada Brenner.\n\n'
+                                    "HFL shall deliver the goods by 1 May.\n")
     (folder / "deal.docx").write_bytes(b"PK\x03\x04 not really")
     (folder / ".legix" / "text").mkdir(parents=True)
     (folder / ".legix" / "text" / "deal.docx.md").write_text("The deal between HFL and Ada Brenner.\n")
@@ -413,6 +424,15 @@ def normalise(v, base: Path):
     API answers and the events (in their order), one seen only in files or records left as <ID>; the markup
     files (named by random ids) and the dataset's records (in the order of those names) as sorted lists."""
     v = dict(v)
+    # notes on the same words with the same importance (two reviewers on one quote) come in the order of
+    # their files' random names, in both programs: put them in one order before the ids are named
+    for step in v["api"]:
+        body = step[1]["body"] if isinstance(step[1], dict) else None
+        if isinstance(body, dict) and isinstance(body.get("notes"), list):
+            body["notes"] = sorted(body["notes"], key=lambda n: (n.get("start") is None, n.get("start") or 0,
+                                                                 -(n.get("importance") or 0),
+                                                                 json.dumps(n.get("creator"), sort_keys=True),
+                                                                 n.get("kind", ""), n.get("note", ""), n.get("quote", "")))
     # the markup files are named by their random ids: kept as (folder, contents), the names left out
     v["markup"] = [[k.rsplit("/", 1)[0], x] for k, x in v["files"].items() if k.startswith(".legix/")]
     v["files"] = {k: x for k, x in v["files"].items() if not k.startswith(".legix/")}

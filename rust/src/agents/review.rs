@@ -176,30 +176,44 @@ pub fn read_text(folder: &Path, path: &str) -> Option<(String, String)> {
 
 // ── what is de-identified ─────────────────────────────────────────────────────────────────────────
 
-/// Where each token of `tokenised` stands in `original`: `{start, end, type, token}`.
-pub fn deid_spans(original: &str, tokenised: &str, surfaces: &ODict<Vec<String>>, mapping: &ODict<String>) -> Vec<Value> {
-    let (o, t) = (chars(original), chars(tokenised));
+/// A token placed by [`walk`]: in the tokenised text it is `start..end`, the literal piece before it
+/// `after..start`; in the original the piece begins at `piece`, the token's words are `at..to`.
+struct Placed {
+    after: usize,
+    start: usize,
+    end: usize,
+    piece: usize,
+    at: usize,
+    to: usize,
+    token: String,
+}
+
+/// The tokenised text walked against the original (review.py `_walk`): the literal piece before a token
+/// matched in the original (found again further on when the walk lost step), and the token takes the
+/// recorded surface that stands there, else what lies up to the next literal piece.
+fn walk(o: &[char], t: &[char], surfaces: &ODict<Vec<String>>, mapping: &ODict<String>) -> Vec<Placed> {
     let mut out = Vec::new();
     let (mut at, mut last) = (0usize, 0usize);
-    let tokens = crate::proxy::spelling::token().finditer(&t);
+    let tokens = crate::proxy::spelling::token().finditer(t);
     for (i, m) in tokens.iter().enumerate() {
         let token = st(&t[m.start..m.end]);
         if mapping.get(&token).is_none() && surfaces.get(&token).is_none() {
             continue;
         }
         let piece = &t[last.min(m.start)..m.start];
-        if starts_at(&o, piece, at) {
-            at += piece.len();
+        let begins = if starts_at(o, piece, at) {
+            at
         } else {
-            let found = if piece.is_empty() { Some(at) } else { find_in(&o, piece, at, o.len()) };
+            let found = if piece.is_empty() { Some(at) } else { find_in(o, piece, at, o.len()) };
             match found {
-                Some(f) => at = f + piece.len(),
+                Some(f) => f,
                 None => {
                     last = m.end;
                     continue;
                 }
             }
-        }
+        };
+        at = begins + piece.len();
         let mut candidates: Vec<String> = Vec::new();
         for s in surfaces.get(&token).cloned().unwrap_or_default().into_iter().chain(mapping.get(&token).cloned()) {
             if !s.is_empty() && !candidates.contains(&s) {
@@ -207,26 +221,96 @@ pub fn deid_spans(original: &str, tokenised: &str, surfaces: &ODict<Vec<String>>
             }
         }
         candidates.sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
-        let mut surface: Option<Vec<char>> = candidates.iter().map(|s| chars(s)).find(|s| starts_at(&o, s, at));
+        let mut surface: Option<usize> = candidates.iter().map(|s| chars(s)).find(|s| starts_at(o, s, at)).map(|s| s.len());
         if surface.is_none() {
             let nxt = tokens.get(i + 1).map_or(t.len(), |n| n.start);
             let follow: Vec<char> = t[m.end..nxt.max(m.end)].iter().take(40).copied().collect();
-            let end = if follow.is_empty() { Some(o.len()) } else { find_in(&o, &follow, at, o.len()) };
+            let end = if follow.is_empty() { Some(o.len()) } else { find_in(o, &follow, at, o.len()) };
             match end {
-                Some(e) if e > at => surface = Some(o[at..e].to_vec()),
+                Some(e) if e > at => surface = Some(e - at),
                 _ => {
                     last = m.end;
                     continue;
                 }
             }
         }
-        let surface = surface.unwrap();
-        let kind = token.rsplit_once('_').map_or(token.as_str(), |(k, _)| k).to_string();
-        out.push(json!({"start": at, "end": at + surface.len(), "type": kind, "token": token}));
-        at += surface.len();
+        let len = surface.unwrap();
+        out.push(Placed { after: last.min(m.start), start: m.start, end: m.end, piece: begins, at, to: at + len, token });
+        at += len;
         last = m.end;
     }
     out
+}
+
+/// Where each token of `tokenised` stands in `original`: `{start, end, type, token}`.
+pub fn deid_spans(original: &str, tokenised: &str, surfaces: &ODict<Vec<String>>, mapping: &ODict<String>) -> Vec<Value> {
+    walk(&chars(original), &chars(tokenised), surfaces, mapping).into_iter().map(|p| {
+        let kind = p.token.rsplit_once('_').map_or(p.token.as_str(), |(k, _)| k).to_string();
+        json!({"start": p.at, "end": p.to, "type": kind, "token": p.token})
+    }).collect()
+}
+
+/// The tokenised text in pieces with their places in the original: `(t0, t1, o0, o1, token)` — a literal
+/// piece (the same characters) or a token and the words it stands for (review.py `_alignment`).
+fn alignment(o: &[char], t: &[char], surfaces: &ODict<Vec<String>>, mapping: &ODict<String>) -> Vec<(usize, usize, usize, usize, bool)> {
+    let mut out = Vec::new();
+    let (mut tail_t, mut tail_o) = (0usize, 0usize);
+    for p in walk(o, t, surfaces, mapping) {
+        out.push((p.after, p.start, p.piece, p.piece + p.start - p.after, false));
+        out.push((p.start, p.end, p.at, p.to, true));
+        (tail_t, tail_o) = (p.end, p.to);
+    }
+    let tail = &t[tail_t..];
+    let found = if starts_at(o, tail, tail_o) { Some(tail_o) } else { find_in(o, tail, tail_o, o.len()) };
+    if let Some(f) = found {
+        out.push((tail_t, t.len(), f, f + tail.len(), false));
+    }
+    out.retain(|s| s.0 < s.1);
+    out
+}
+
+/// `a..b` of the tokenised text as a span of the original, a token taken whole; None — an end falls where
+/// the walk placed nothing.
+fn to_original(pieces: &[(usize, usize, usize, usize, bool)], a: usize, b: usize) -> Option<(usize, usize)> {
+    let (mut start, mut end) = (None, None);
+    for &(t0, t1, o0, o1, token) in pieces {
+        if start.is_none() && t0 <= a && a < t1 {
+            start = Some(if token { o0 } else { o0 + (a - t0) });
+        }
+        if t0 < b && b <= t1 {
+            end = Some(if token { o1 } else { o0 + (b - t0) });
+        }
+    }
+    match (start, end) {
+        (Some(s), Some(e)) if s < e => Some((s, e)),
+        _ => None,
+    }
+}
+
+/// Where each quote is in `text` ([`Folded::find`]), or None. A quote not found as written is looked up
+/// again in tokens with the scope's `engine`: the quote and the text tokenised, every spelling of a party is
+/// its one token — the model saw "ORG_…" where the document says "HFL", and the proxy gave the quote back
+/// "Harrowgate Freight Ltd". Found there, it is the document's own words at that place (review.py `find_quotes`).
+pub fn find_quotes(text: &str, quotes: &[String], engine: Option<&ScopeEngine>) -> Vec<Option<(usize, usize)>> {
+    let folded = Folded::of(text);
+    let mut found: Vec<Option<(usize, usize)>> = quotes.iter().map(|q| if q.is_empty() { None } else { folded.find(q, None) }).collect();
+    let missing: Vec<usize> = (0..quotes.len()).filter(|&i| !quotes[i].is_empty() && found[i].is_none()).collect();
+    let Some(engine) = engine.filter(|_| !missing.is_empty()) else { return found };
+    let mut texts = vec![text.to_string()];
+    texts.extend(missing.iter().map(|&i| quotes[i].clone()));
+    let Ok(reds) = engine.tokenize_all(&texts) else { return found };
+    let doc = &reds[0];
+    let pieces = alignment(&folded.text, &chars(&doc.text), &doc.surfaces, &doc.mapping);
+    let tokenised = Folded::of(&doc.text);
+    for (&i, red) in missing.iter().zip(&reds[1..]) {
+        if red.text == quotes[i] {
+            continue;
+        }
+        if let Some((a, b)) = tokenised.find(&red.text, None) {
+            found[i] = to_original(&pieces, a, b);
+        }
+    }
+    found
 }
 
 // ── norms ─────────────────────────────────────────────────────────────────────────────────────────
@@ -891,12 +975,17 @@ pub fn view(folder: &Path, path: &str, text: &str) -> Value {
 }
 
 /// Keep the notes whose quotes are in the text; say of the others why not.
-pub fn keep(folder: &Path, path: &str, text: &str, notes: &[Value], creator: &Value, run: &str) -> std::io::Result<Value> {
+/// `found`: where each note's quote is ([`find_quotes`], which can look in tokens); else looked up as written.
+pub fn keep(folder: &Path, path: &str, text: &str, notes: &[Value], creator: &Value, run: &str,
+            found: Option<&[Option<(usize, usize)>]>) -> std::io::Result<Value> {
     let folded = Folded::of(text);
     let (mut kept, mut refused) = (Vec::new(), Vec::new());
-    for note in notes {
+    for (n, note) in notes.iter().enumerate() {
         let quote = note["quote"].as_str().unwrap_or("");
-        let found = if quote.is_empty() { None } else { folded.find(quote, None) };
+        let found = match found {
+            Some(f) => f.get(n).copied().flatten(),
+            None => if quote.is_empty() { None } else { folded.find(quote, None) },
+        };
         let Some((a, b)) = found else {
             refused.push(json!({"quote": py::take(quote, 120), "why": if quote.is_empty() { "no quote" } else { "not in the document" }}));
             continue;

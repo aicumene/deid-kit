@@ -8,7 +8,8 @@ answer: the tests that switch agents tell them apart by it. A ``session/cancel``
 next step with ``cancelled``. With ``echo-prompt`` among its arguments it also says which turn of its
 session this is and the text blocks of the prompt it was given. With ``review`` among them it answers a
 review task (deidkit.agents.review) with notes: one on the document's third line, its apostrophes curled
-the way models write them, and one on words the document does not have."""
+the way models write them, one on words the document does not have, and — when the document calls a party
+"HFL" — one on a line of it with the party named in full, as a quote comes back through the proxy."""
 
 import json
 import os
@@ -108,6 +109,12 @@ for line in sys.stdin:
                  "suggestion": "The Tenant may not break the lease"},
                 {"quote": "Words this document never had.", "kind": "question", "aspect": "payment",
                  "importance": 2, "note": "Invented."}]}
+            with open(os.path.join(cwd, source), encoding="utf-8") as fh:
+                short = next((l for l in fh.read().split("\n") if "HFL" in l and '("HFL")' not in l), None)
+            if short:
+                # as a model's quote comes back through the proxy: the party by the name the vault knows it by
+                notes["notes"].append({"quote": short.replace("HFL", "Harrowgate Freight Ltd"), "kind": "point",
+                                       "aspect": "parties", "importance": 3, "note": "Named in full."})
             update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "I read it {first}. "}})
             update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": json.dumps(notes)}})
             send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})

@@ -322,6 +322,55 @@ def view_folder(rng, out: Path, n: int, text: str):
             "view": jsonable(review.view(folder, path, text)), "records": jsonable(review.records(folder))}
 
 
+PARTIES = [("company", "Harrowgate Freight Ltd", "HFL"), ("individual", "Tobias Wren", "TW"),
+           ("company", "Meridian Holdings Ltd", "Meridian"), ("individual", "Lena Voss", "LV")]
+CLAUSES = ["{a} shall deliver the goods to {b} by 1 May.", "{a} may appoint three directors and {b} may appoint two.",
+           "Notices to {a} go to its registered office.", "A quorum is three directors, one appointed by {b}.",
+           "The shares are held as to 6,500 by {a} and 3,500 by {b}.", "Nothing here names anyone at all.",
+           "{a} and {b} agree that clause 4 applies.", "Payment is due within 30 days of the invoice."]
+
+
+def spelling(rng, party, defined):
+    kind, name, short = party
+    return rng.choice([name, name.upper(), short if defined else name, name.title()])
+
+
+def quote_case(rng):
+    parties = rng.sample(PARTIES, rng.randrange(1, 4))
+    seeds = [[k, n] for k, n, _ in parties if rng.random() < 0.85]
+    lines = ["This agreement is between " + " and ".join(f'{n.upper()} ("{s}")' for _, n, s in parties) + "."]
+    for _ in range(rng.randrange(2, 9)):
+        a, b = rng.choice(parties), rng.choice(parties)
+        lines.append(rng.choice(CLAUSES).format(a=spelling(rng, a, True), b=spelling(rng, b, True)))
+    text = rng.choice(["\n\n", "\n", " "]).join(lines) + "\n"
+    quotes = []
+    for _ in range(rng.randrange(1, 7)):
+        k = rng.randrange(6)
+        if k == 0:                      # a clause of it, the parties spelled anew
+            a, b = rng.choice(parties), rng.choice(parties)
+            quotes.append(rng.choice(CLAUSES).format(a=spelling(rng, a, False), b=spelling(rng, b, False)))
+        elif k == 1:                    # a line of it with every short name spelled out
+            line = rng.choice(lines[1:])
+            for _, n, sh in parties:
+                line = line.replace(sh, rng.choice([n, n.upper()]))
+            quotes.append(line)
+        elif k == 2:                    # with an ellipsis
+            line = rng.choice(lines[1:])
+            cut = len(line) // 2
+            q = line[:max(8, cut - 4)] + " ... " + line[cut + 4:]
+            for _, n, sh in parties:
+                q = q.replace(sh, n)
+            quotes.append(q)
+        elif k == 3:
+            quotes.append(rng.choice(lines))          # as written
+        elif k == 4:
+            quotes.append(rng.choice(["", "Words it never had.", "HARROWGATE FREIGHT LTD shall collect the goods."]))
+        else:
+            line = rng.choice(lines)
+            quotes.append(line[rng.randrange(len(line) // 2):])
+    return seeds, text, quotes
+
+
 def main():
     out = Path(sys.argv[1])
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1
@@ -491,6 +540,21 @@ def main():
                    (("lease.md", "lease.md"), ("deal.docx", ".legix/text/deal.docx.md"), ("{source}.md", "{path}"))]
     v["text_source"] = [{"path": p, "source": review.text_source(p), "writable": review.writable(p)} for p in
                         ("a.md", "A.MD", "b.docx", ".legix/x.md", "c.txt", "d.", ".md", "dir/e.markdown", "f.text", "g")]
+
+    # quotes found as written, or in tokens
+    fq = []
+    for _ in range(400):
+        seeds_l, text, quotes = quote_case(rng)
+        src = InMemorySeedSource()
+        for kind, name in seeds_l:
+            src.add_entity("q", SeedEntity(kind, name))
+        engine = ScopeEngine(InMemoryTokenStore(), "q", seeds=src, detector=RegexDetector())
+        found = asyncio.run(review.find_quotes(text, quotes, engine))
+        fq.append({"seeds": seeds_l, "text": text, "quotes": quotes, "found": [list(f) if f else None for f in found]})
+    v["find_quotes"] = fq
+    print("find_quotes: %d quotes, %d found in tokens" % (
+        sum(len(c["quotes"]) for c in fq),
+        sum(1 for c in fq for q, f in zip(c["quotes"], c["found"]) if f and review.Folded.of(c["text"]).find(q) is None)))
 
     # the markup of a document
     v["view"] = [view_folder(rng, out, i, doc(rng, rng.randrange(5, 50))) for i in range(60)]

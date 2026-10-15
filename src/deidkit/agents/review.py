@@ -11,7 +11,9 @@ W3C Web Annotation model the markup is kept in.
 - **Norms.** :mod:`deidkit.agents.cite` — the server's extraction, without its knowledge base.
 - **Notes.** An agent reviews the document and answers with notes, each on a verbatim quote. The quote
   is looked up in the text by code — a note whose quote is not in the document is not kept, whatever
-  the model says. A kept note is one annotation a file, ``.legix/markup/<path>/<id>.json``: the matter's
+  the model says. A quote not found as it is written is looked up again in tokens (:func:`find_quotes`):
+  the model saw a token where the document has a party's short name ("HFL", "DW", another case), and the
+  proxy gave it back the full one. A kept note is one annotation a file, ``.legix/markup/<path>/<id>.json``: the matter's
   notes folder, which leGix versions, signs and syncs with the documents. Nothing in such a file is
   trusted on reading: the quote is looked up in the text again, so a note shows where its words are now,
   or that they are gone.
@@ -110,16 +112,16 @@ def read_text(folder: Path, path: str) -> tuple[str, str] | None:
 
 
 # ── what is de-identified ─────────────────────────────────────────────────────────────────────────
-def deid_spans(original: str, tokenised: str, surfaces: dict[str, list[str]],
-               mapping: dict[str, str]) -> list[dict]:
-    """Where each token of ``tokenised`` stands in ``original``: ``{start, end, type, token}``.
+def _walk(original: str, tokenised: str, surfaces: dict[str, list[str]], mapping: dict[str, str]):
+    """The tokenised text walked against the original. For each token placed: ``(after, start, end, piece,
+    at, to, token)`` — in the tokenised text the token is ``[start, end)`` and the literal piece before it
+    ``[after, start)``; in the original the piece begins at ``piece`` and the token's words are ``[at, to)``.
 
     The tokenised text is the original with surfaces put in tokens' places; what lies between tokens is
     the original's own. So the two are walked together: the literal piece before a token is matched in
     the original, and the token takes the surface — one the engine recorded for it in this text — that
     stands there. Should the walk lose step (a piece not where it was expected), it finds the piece again
     further on, so one odd place does not cost the rest of the document."""
-    out: list[dict] = []
     at = 0                                         # in the original
     last = 0                                       # in the tokenised text
     tokens = list(TOKEN.finditer(tokenised))
@@ -129,13 +131,14 @@ def deid_spans(original: str, tokenised: str, surfaces: dict[str, list[str]],
             continue                               # a token-like word of the document itself
         piece = tokenised[last:m.start()]
         if original.startswith(piece, at):
-            at += len(piece)
+            begins = at
         else:
             found = original.find(piece, at) if piece else at
             if found < 0:
                 last = m.end()
                 continue
-            at = found + len(piece)
+            begins = found
+        at = begins + len(piece)
         candidates = sorted({*surfaces.get(token, []), mapping.get(token, "")} - {""}, key=len, reverse=True)
         surface = next((s for s in candidates if original.startswith(s, at)), None)
         if surface is None:
@@ -147,10 +150,73 @@ def deid_spans(original: str, tokenised: str, surfaces: dict[str, list[str]],
                 last = m.end()
                 continue
             surface = original[at:end]
-        out.append({"start": at, "end": at + len(surface), "type": token.rsplit("_", 1)[0], "token": token})
+        yield last, m.start(), m.end(), begins, at, at + len(surface), token
         at += len(surface)
         last = m.end()
-    return out
+
+
+def deid_spans(original: str, tokenised: str, surfaces: dict[str, list[str]],
+               mapping: dict[str, str]) -> list[dict]:
+    """Where each token of ``tokenised`` stands in ``original``: ``{start, end, type, token}``."""
+    return [{"start": at, "end": to, "type": token.rsplit("_", 1)[0], "token": token}
+            for _, _, _, _, at, to, token in _walk(original, tokenised, surfaces, mapping)]
+
+
+def _alignment(original: str, tokenised: str, surfaces: dict[str, list[str]],
+               mapping: dict[str, str]) -> list[tuple[int, int, int, int, bool]]:
+    """The tokenised text in pieces, each with its place in the original: ``(t0, t1, o0, o1, token)`` — a
+    literal piece (the same characters) or a token and the words it stands for. What the walk could not
+    place is in no piece."""
+    out: list[tuple[int, int, int, int, bool]] = []
+    tail_t = tail_o = 0
+    for after, start, end, piece, at, to, _ in _walk(original, tokenised, surfaces, mapping):
+        out.append((after, start, piece, piece + start - after, False))
+        out.append((start, end, at, to, True))
+        tail_t, tail_o = end, to
+    tail = tokenised[tail_t:]
+    found = tail_o if original.startswith(tail, tail_o) else original.find(tail, tail_o)
+    if found >= 0:
+        out.append((tail_t, len(tokenised), found, found + len(tail), False))
+    return [seg for seg in out if seg[0] < seg[1]]
+
+
+def _to_original(pieces: list[tuple[int, int, int, int, bool]], a: int, b: int) -> tuple[int, int] | None:
+    """``[a, b)`` of the tokenised text as a span of the original: a token taken whole; None — an end falls
+    where the walk placed nothing."""
+    start = end = None
+    for t0, t1, o0, o1, token in pieces:
+        if start is None and t0 <= a < t1:
+            start = o0 if token else o0 + (a - t0)
+        if t0 < b <= t1:
+            end = o1 if token else o0 + (b - t0)
+    return (start, end) if start is not None and end is not None and start < end else None
+
+
+async def find_quotes(text: str, quotes: list[str], engine=None) -> list[tuple[int, int] | None]:
+    """Where each quote is in ``text`` (:meth:`Folded.find`), or None. A quote with a name in it that is not
+    found as written is looked up again in tokens, with the scope's ``engine``: the quote and the text
+    tokenised, every spelling of a party is its one token — the model saw "ORG_…" where the document says
+    "HFL", and the proxy gave the quote back "Harrowgate Freight Ltd". Found there, it is the document's own
+    words at that place."""
+    folded = Folded.of(text)
+    found = [folded.find(q) if q else None for q in quotes]
+    missing = [i for i, q in enumerate(quotes) if q and found[i] is None]
+    if not missing or engine is None:
+        return found
+    try:
+        reds = await engine.tokenize_all([text, *(quotes[i] for i in missing)])
+    except Exception:                              # noqa: BLE001 — the vault did not settle: as written only
+        return found
+    doc = reds[0]
+    pieces = _alignment(text, doc.text, doc.surfaces or {}, doc.mapping or {})
+    tokenised = Folded.of(doc.text)
+    for i, red in zip(missing, reds[1:]):
+        if red.text == quotes[i]:
+            continue                               # no name in it: tokens change nothing
+        hit = tokenised.find(red.text)
+        if hit:
+            found[i] = _to_original(pieces, *hit)
+    return found
 
 
 # ── norms ─────────────────────────────────────────────────────────────────────────────────────────
@@ -647,16 +713,21 @@ def view(folder: Path, path: str, text: str) -> dict:
             "written": sorted(authors, key=lambda a: a["at"])}
 
 
-def keep(folder: Path, path: str, text: str, notes: list[dict], *, creator: dict, run: str) -> dict:
-    """Keep the notes whose quotes are in the text; say of the others why not."""
+def keep(folder: Path, path: str, text: str, notes: list[dict], *, creator: dict, run: str,
+         found: list[tuple[int, int] | None] | None = None) -> dict:
+    """Keep the notes whose quotes are in the text; say of the others why not. ``found``: where each
+    note's quote is (:func:`find_quotes`, which can look in tokens); else looked up as written."""
     folded = Folded.of(text)
     kept, refused = [], []
-    for note in notes:
-        found = folded.find(note["quote"]) if note["quote"] else None
-        if found is None:
+    for n, note in enumerate(notes):
+        if found is not None:
+            where = found[n]
+        else:
+            where = folded.find(note["quote"]) if note["quote"] else None
+        if where is None:
             refused.append({"quote": note["quote"][:120], "why": "not in the document" if note["quote"] else "no quote"})
             continue
-        ann = annotation(note, path=path, text=text, start=found[0], end=found[1], creator=creator, run=run)
+        ann = annotation(note, path=path, text=text, start=where[0], end=where[1], creator=creator, run=run)
         store(folder, path, ann)
         kept.append(ann["id"])
     return {"kept": kept, "refused": refused}

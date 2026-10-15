@@ -2142,7 +2142,9 @@ impl AgentHost {
         if !model.is_empty() {
             creator["model"] = json!(model);
         }
-        let kept = match review::keep(&self.cfg.folder, &path, &text, &notes, &creator, &run) {
+        let quotes: Vec<String> = notes.iter().map(|n| n["quote"].as_str().unwrap_or("").to_string()).collect();
+        let found = review::find_quotes(&text, &quotes, Some(&self.proxy.engine(&self.cfg.scope)));
+        let kept = match review::keep(&self.cfg.folder, &path, &text, &notes, &creator, &run, Some(&found)) {
             Ok(k) => k,
             Err(e) => {
                 log::error(&format!("the review's notes were not kept: {e}"));

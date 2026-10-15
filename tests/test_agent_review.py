@@ -128,6 +128,39 @@ def test_notes_are_read_from_whatever_the_agent_said_around_them():
     assert review.parse_notes('{"notes": "none"}') is None
 
 
+# ── a quote that names a party otherwise than the document ───────────────────────────────────────
+async def test_a_quote_naming_a_party_otherwise_than_the_document_is_found_by_its_tokens(tmp_path):
+    """The model saw a token where the document says "HFL"; the proxy gave its quote back "Harrowgate Freight
+    Ltd". Looked up again in tokens, the quote is found, and the note stands on the document's own words."""
+    from deidkit.proxy.engine import ScopeEngine
+    from deidkit.seeds import InMemorySeedSource, SeedEntity
+    seeds = InMemorySeedSource()
+    seeds.add_entity("m", SeedEntity("company", "Harrowgate Freight Ltd"))
+    seeds.add_entity("m", SeedEntity("individual", "Tobias Wren"))
+    engine = ScopeEngine(InMemoryTokenStore(), "m", seeds=seeds, detector=RegexDetector())
+    text = ('This agreement is between HARROWGATE FREIGHT LTD ("HFL") and TOBIAS WREN ("TW").\n\n'
+            "HFL shall deliver the goods to TW by 1 May.\n\nNotices to Harrowgate Freight Ltd go to its office.\n")
+    quotes = ["Harrowgate Freight Ltd shall deliver the goods to Tobias Wren by 1 May.",   # the full names back
+              "HFL shall deliver the goods",                                               # as it is written
+              "Notices to HFL go to its office.",                                          # the other way round
+              "HARROWGATE FREIGHT LTD shall deliver ... by 1 May.",                        # with an ellipsis
+              "Harrowgate Freight Ltd shall collect the goods",                            # not in it
+              ""]
+    found = await review.find_quotes(text, quotes, engine)
+    assert [text[f[0]:f[1]] if f else None for f in found] == [
+        "HFL shall deliver the goods to TW by 1 May.", "HFL shall deliver the goods",
+        "Notices to Harrowgate Freight Ltd go to its office.", "HFL shall deliver the goods to TW by 1 May.", None, None]
+    # without the engine, as written only
+    assert await review.find_quotes(text, quotes) == [None, found[1], None, None, None, None]
+    notes = review.parse_notes(json.dumps({"notes": [{"quote": q, "kind": "point", "note": "n"} for q in quotes[:5]]}))
+    kept = review.keep(tmp_path, "deal.md", text, notes, creator={"type": "Software", "name": "MatterAgent"}, run="r",
+                       found=found[:5])
+    assert len(kept["kept"]) == 4 and [r["why"] for r in kept["refused"]] == ["not in the document"]
+    exact = sorted(n["quote"] for n in review.load(tmp_path, "deal.md", text))
+    assert exact == sorted(["HFL shall deliver the goods to TW by 1 May.", "HFL shall deliver the goods",
+                            "Notices to Harrowgate Freight Ltd go to its office.", "HFL shall deliver the goods to TW by 1 May."])
+
+
 # ── the text, and what is kept ────────────────────────────────────────────────────────────────────
 def test_the_text_of_a_document(tmp_path):
     (tmp_path / "lease.md").write_text(LEASE)
