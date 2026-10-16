@@ -225,6 +225,12 @@ fn main() {
     cfg.subagents_command = shlex_split(&sub_cmd).unwrap_or_else(|_| die("deid-agent: --subagents-command: No closing quotation"));
     cfg.subagents_timeout = timeout;
     cfg.claude_confine = !args.on("--claude-unconfined");
+    // the launcher of a confined Claude Code's shell commands, beside this program (the app's agent runtime)
+    cfg.claude_shell = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("agent-shell")))
+        .filter(|l| l.is_file());
+    if cfg.claude_confine && cfg.claude_shell.is_none() && confine::supported() {
+        log::warning("agent-shell is not beside deid-agent: Claude Code runs with only its shell commands sandboxed");
+    }
     // agent-guard: given, else $DEID_AGENT_GUARD, else the one beside this program (the app's agent runtime
     // carries both in bin/ — what the Python runtime's wrapper said in $DEID_AGENT_GUARD), else on PATH
     let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("agent-guard")))
@@ -304,7 +310,8 @@ fn main() {
             let h = h.clone();
             Box::pin(async move { h.handle(req).await })
         });
-        tokio::task::spawn_local(http::serve(listener, handler));
+        let tunnels = Rc::new(confine::SIGN_IN.iter().map(|h| format!("{h}:443")).collect::<Vec<_>>());
+        tokio::task::spawn_local(http::serve_with_tunnels(listener, handler, tunnels));
         tokio::task::spawn_local(host.clone().start_agent());
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM");
         let gone = lifeline.then(watch_lifeline);

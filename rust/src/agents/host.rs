@@ -114,6 +114,9 @@ pub struct HostConfig {
     pub subagents_command: Vec<String>,
     pub subagents_timeout: f64,
     pub claude_confine: bool,
+    /// The launcher of a confined Claude Code's shell commands (`agent-shell`, beside deid-agent): with it Claude
+    /// Code is confined whole; without it only its shell commands are, in its own sandbox.
+    pub claude_shell: Option<PathBuf>,
     pub guard: Vec<String>,
     pub guard_log: Option<PathBuf>,
     pub person: String,
@@ -125,7 +128,7 @@ impl HostConfig {
                      claude_executable: None, codex_executable: None, codex_confine: true, codex_home: None, port: 8790,
                      token: py::token_urlsafe(24), agent_key: format!("deid-agent-{}", py::token_urlsafe(24)),
                      usage_log: None, agents: Vec::new(), style: None, session_meta: None, subagents: None,
-                     subagents_command: Vec::new(), subagents_timeout: 900.0, claude_confine: true, guard: Vec::new(),
+                     subagents_command: Vec::new(), subagents_timeout: 900.0, claude_confine: true, claude_shell: None, guard: Vec::new(),
                      guard_log: None,
                      person: std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "person".into()) }
     }
@@ -875,11 +878,12 @@ pub struct Seat {
     pub context: Option<Value>,
     pub seen: usize,
     pub codex_dir: Option<PathBuf>,
+    pub claude_dir: Option<PathBuf>,
 }
 
 impl Seat {
     fn new(choice: AgentChoice) -> Seat {
-        Seat { choice, agent: None, session_id: None, models: None, context: None, seen: 0, codex_dir: None }
+        Seat { choice, agent: None, session_id: None, models: None, context: None, seen: 0, codex_dir: None, claude_dir: None }
     }
 
     pub fn alive(&self) -> bool {
@@ -1252,9 +1256,14 @@ impl AgentHost {
                     let made = dir.as_ref().ok_or_else(|| confine::ConfinementUnavailable("no folder for its profile".into()))
                         .and_then(|d| confine::confined_codex(&self.cfg.folder.to_string_lossy(), self.cfg.codex_executable.as_deref(), d,
                                                               Some(&home.to_string_lossy()), &extra_read, &codex_args,
-                                                              auth.as_ref().map(|a| a.to_string_lossy().into_owned()).as_deref()));
+                                                              auth.as_ref().map(|a| a.to_string_lossy().into_owned()).as_deref(),
+                                                              &self.agent_network(server.as_ref())));
                     match made {
-                        Ok(w) => set(&mut extra, w.to_string_lossy().into_owned()),
+                        Ok(w) => {
+                            set(&mut extra, w.to_string_lossy().into_owned());
+                            extra.extend(confine::proxy_env(self.cfg.port));
+                            extra.extend(confine::tools_env(&home.join("tmp").to_string_lossy()));
+                        }
                         Err(e) => {
                             self.drop_codex_dir(&choice.name);
                             return self.fail(format!("Codex was not started: {}.", e.0));
@@ -1268,6 +1277,26 @@ impl AgentHost {
                 };
                 if server.is_some() && choice.claude() {
                     extra.push(("MCP_TOOL_TIMEOUT".into(), ((self.cfg.subagents_timeout * 1000.0) as i64).to_string()));
+                }
+                if choice.claude() && self.whole_claude() {
+                    match self.confine_claude(&choice, server.as_ref()) {
+                        Ok(c) => {
+                            let s = |p: &Path| p.to_string_lossy().into_owned();
+                            extra.retain(|(k, _)| k != "CLAUDE_CODE_EXECUTABLE");
+                            extra.extend([("CLAUDE_CODE_EXECUTABLE".to_string(), s(&c.executable)),
+                                          ("CLAUDE_CODE_SHELL".to_string(), s(&c.shell)),
+                                          ("TMPDIR".to_string(), format!("{}/", s(&c.temp))),
+                                          ("CLAUDE_CODE_TMPDIR".to_string(), s(&c.temp)),
+                                          // the person's claude.ai connectors (mail, drives) are not the matter's
+                                          ("ENABLE_CLAUDEAI_MCP_SERVERS".to_string(), "false".to_string())]);
+                            extra.extend(confine::proxy_env(self.cfg.port));
+                            extra.extend(confine::tools_env(&s(&c.temp)));
+                        }
+                        Err(e) => {
+                            self.drop_claude_dir(&choice.name);
+                            return self.fail(format!("Claude Code was not started: {}.", e.0));
+                        }
+                    }
                 }
             }
             let env = acp::agent_env(&base_url, &self.cfg.scope, if lend { Some(&self.cfg.agent_key) } else { None }, &extra);
@@ -1294,7 +1323,13 @@ impl AgentHost {
                 meta = Some(with_subagents(meta.as_ref()));
             }
             if choice.claude() {
-                let settings = claude_settings(&self.cfg.folder, self.cfg.claude_confine, &self.cfg.guard, self.cfg.guard_log.as_deref());
+                let whole = self.whole_claude();
+                let mut settings = claude_settings(&self.cfg.folder, self.cfg.claude_confine && !whole, &self.cfg.guard,
+                                                   self.cfg.guard_log.as_deref());
+                if whole {
+                    // its own command sandbox cannot start inside the profile it runs under: the launcher stands for it
+                    settings.insert("sandbox".into(), json!({"enabled": false}));
+                }
                 match with_claude_settings(meta.as_ref(), &settings, &self.cfg.folder) {
                     Ok(m) => meta = Some(m),
                     Err(e) => return self.fail(format!("Claude Code was not started: its settings: {e}")),
@@ -2247,6 +2282,45 @@ impl AgentHost {
         }
     }
 
+    fn drop_claude_dir(&self, name: &str) {
+        let dir = self.st.borrow_mut().seats.iter_mut().find(|(n, _)| n == name).and_then(|(_, s)| s.claude_dir.take());
+        if let Some(d) = dir {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Claude Code confined whole (`agents::confine`): asked for, the launcher at hand, and Seatbelt here.
+    pub fn whole_claude(&self) -> bool {
+        self.cfg.claude_confine && self.cfg.claude_shell.is_some() && confine::supported()
+    }
+
+    /// The network of a confined agent: deid-agent's port, and the sub-agents' servers when it has them.
+    fn agent_network(&self, server: Option<&(String, Vec<String>)>) -> Vec<String> {
+        let servers = match (&self.cfg.subagents, server) {
+            (Some(hosts), Some(_)) => confine::server_addresses(hosts),
+            _ => Vec::new(),
+        };
+        confine::network(self.cfg.port, &servers)
+    }
+
+    /// Claude Code laid out confined for `choice`, in a folder made anew for this start.
+    fn confine_claude(&self, choice: &AgentChoice, server: Option<&(String, Vec<String>)>)
+                      -> Result<confine::ConfinedClaude, confine::ConfinementUnavailable> {
+        self.drop_claude_dir(&choice.name);
+        let dir = make_temp_dir("deid-claude-").ok_or_else(|| confine::ConfinementUnavailable("no folder for its profile".into()))?;
+        self.st.borrow_mut().seat_of(&choice.name, choice.clone()).claude_dir = Some(dir.clone());
+        // agent-guard runs as Claude Code's hook: its program, the person's policy for it, this matter's journal
+        let mut read: Vec<String> = self.cfg.guard.clone();
+        if !self.cfg.guard.is_empty() {
+            read.push(py::expanduser("~/.agent-guard/environment.json").to_string_lossy().into_owned());
+        }
+        read.extend(server.map(|s| self.subagent_paths(s)).unwrap_or_default());
+        let write: Vec<String> = self.cfg.guard_log.iter().map(|l| l.to_string_lossy().into_owned()).collect();
+        let launcher = self.cfg.claude_shell.as_deref().ok_or_else(|| confine::ConfinementUnavailable("no launcher".into()))?;
+        confine::confined_claude("~", &self.cfg.folder.to_string_lossy(), self.cfg.claude_executable.as_deref(), launcher, &dir,
+                                 &self.agent_network(server), &read, &write)
+    }
+
     /// Every agent stopped and every confined Codex's folder removed: the server is going away.
     /// The agents stopped, all at once (each may take its 5 s), and Codex's folders dropped.
     pub async fn cleanup(&self) {
@@ -2258,6 +2332,7 @@ impl AgentHost {
         }
         for (name, _) in seats {
             self.drop_codex_dir(&name);
+            self.drop_claude_dir(&name);
         }
     }
 }

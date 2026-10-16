@@ -39,5 +39,9 @@ name = "deid-proxy"
 path = "src/bin/deid_proxy.rs"
 
 [[bin]]
+name = "agent-shell"
+path = "src/bin/agent_shell.rs"
+
+[[bin]]
 name = "deid-agent"
 path = "src/bin/deid_agent.rs"

@@ -114,27 +114,46 @@ enable_request_compression = false
   is sent as the session's `_meta`; the Claude adapter reads `claudeCode.options`, e.g.
   `{"tools": ["Read", "Write", "Edit", "Bash"], "strictMcpConfig": true}`: only the tools a matter
   needs, and no MCP servers of the person's own (claude.ai connectors included).
-- **Claude Code's shell held by the kernel.** deid-agent adds its own settings to the session's
-  (`claudeCode.options.settings`, which the adapter passes on as `--settings`: the flag tier, which
-  the person's or the folder's settings files cannot loosen). They turn on Claude Code's Bash sandbox:
+- **Claude Code held by the kernel, whole (macOS, 16.10.2026).** deid-agent starts Claude Code under a
+  Seatbelt profile of its own (`agents::confine`), as it does Codex; its tools (Read, Write, Edit, Grep)
+  and everything it starts run there:
+  - the matter folder open, `/Users`, `/Volumes`, the shared temp folders and the folder's neighbours
+    closed; Claude Code's install, its settings (read only) and this session's transcript, lock and
+    temp folder open; the person's sign-in in the login keychain, which Claude Code reads with
+    `/usr/bin/security`;
+  - closed for writing, so nothing written now runs later outside any sandbox: `~/.claude.json`,
+    `~/.claude/settings.json`, and in the matter folder `.git`, `.claude`, `.codex` and `.mcp.json`;
+  - the network: deid-agent alone, on its port. Its https goes through deid-agent (`HTTPS_PROXY`),
+    which opens a tunnel only to the sign-in (`platform.claude.com`, `auth.openai.com`) and refuses
+    every other host in its log; no name can even be looked up. The person's claude.ai connectors
+    are off (`ENABLE_CLAUDEAI_MCP_SERVERS=false`).
+
+  Its shell commands go further. macOS starts no second sandbox inside a first, so Claude Code's own
+  command sandbox cannot run there (deid-agent turns it off in the flag-tier settings). Claude Code's
+  shell is instead `agent-shell`, beside deid-agent, copied into the session as `bin/zsh`: the one
+  program Claude Code's profile lets start outside it, and it puts each command at once into the
+  stricter profile beside it — the matter folder and the session's temp folder, no keychain, no
+  network at all, not even deid-agent. git runs without the person's `~/.gitconfig`, and Apple's
+  `/usr/bin/git` keeps its cache in the session's temp folder (`xcrun_db`). The person is still asked
+  before each command. `--claude-unconfined` leaves Claude Code as it is. Without `agent-shell` beside
+  deid-agent, or off macOS, only the shell commands are held, by Claude Code's own sandbox:
   - no network at all (`network.allowedDomains: []`, `strictAllowlist`);
   - `/Users`, `/Volumes` and other homes closed to reading, the matter folder open again;
   - writes to the folder and a temp folder only;
   - no command outside the sandbox (`allowUnsandboxedCommands: false`), and no start without it
     (`failIfUnavailable`).
 
-  Without it, an approved command runs with the person's rights on the whole disk and the network.
-  The host's own check, a path outside the folder refused without asking, reads only what a command
-  line spells out. The person is still asked before each command. `--claude-unconfined` turns the
-  sandbox off. Seen 12.10.2026 on Claude Code 2.1.293: the Bash tool gains its sandbox parameter
-  `allowed_domains` only with these settings, and `ls` runs in the sandbox.
+  Measured on Claude Code 2.1.293 and macOS 26.6: tests/confine_claude.rs tries each boundary under
+  the kernel, and a run through deid-agent read, ran `ls` and `git status` and edited a file.
 - **agent-guard on every call.** With `--guard PATH` (by default `$DEID_AGENT_GUARD`, which the
   desktop's runtime sets to its own, or `agent-guard` on PATH), deid-agent hooks agent-guard to
   Claude Code's request and to each tool call, before and after. It decides a call before it runs:
   allow, ask (the person's card), or deny. It journals the call in `<the audit's folder>/guard/<scope>.jsonl`,
-  sealed line to line, under the person's home, where the sandboxed commands cannot read. On allow it
+  sealed line to line, under the person's home, where the sandboxed commands cannot read (Claude Code's
+  own profile opens this matter's journal and the files beside it named after it). On allow it
   prints nothing, so Claude Code's own permission flow still asks the person. `--no-guard` leaves it
-  out. Codex is confined by deid-agent's own Seatbelt profile instead, and matteragent has no shell.
+  out. Codex is confined by deid-agent's own Seatbelt profile too (its network as Claude Code's), and
+  matteragent has no shell.
 - **More than one agent.** `--agent NAME=COMMAND`, repeated, lists the agents the page offers,
   instead of `--agent-command`; the first that can start works first. `--agent-upstream NAME=URL`
   sends that agent's model requests to a server of the organization's own (the Messages API) and

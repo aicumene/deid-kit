@@ -167,22 +167,58 @@ pub const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// Serve `handler` on `listener` until the task is dropped; each connection a task of the current thread.
 pub async fn serve(listener: TcpListener, handler: Handler) {
+    serve_with_tunnels(listener, handler, Rc::new(Vec::new())).await
+}
+
+/// Where a CONNECT may open a tunnel to, as `host:port`; a CONNECT anywhere else is refused.
+pub type Tunnels = Rc<Vec<String>>;
+
+/// `serve`, and a CONNECT to one of `tunnels` answered with a tunnel to it: what a confined agent's https goes
+/// through (`agents::confine`) — its sign-in — the bytes passed as they are, not read.
+pub async fn serve_with_tunnels(listener: TcpListener, handler: Handler, tunnels: Tunnels) {
     loop {
         let Ok((tcp, _)) = listener.accept().await else { continue };
         let _ = tcp.set_nodelay(true);
-        let handler = handler.clone();
+        let (handler, tunnels) = (handler.clone(), tunnels.clone());
         tokio::task::spawn_local(async move {
             let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
-                let handler = handler.clone();
-                async move { Ok::<_, Infallible>(answer(handler, req).await) }
+                let (handler, tunnels) = (handler.clone(), tunnels.clone());
+                async move { Ok::<_, Infallible>(answer(handler, &tunnels, req).await) }
             });
             let _ = hyper::server::conn::http1::Builder::new().keep_alive(true)
-                .serve_connection(TokioIo::new(tcp), svc).await;
+                .serve_connection(TokioIo::new(tcp), svc).with_upgrades().await;
         });
     }
 }
 
-async fn answer(handler: Handler, req: hyper::Request<Incoming>) -> hyper::Response<OutBody> {
+/// A CONNECT: a tunnel to one of `tunnels`, any other refused — and said so in the log.
+async fn tunnel(tunnels: &[String], req: hyper::Request<Incoming>) -> hyper::Response<OutBody> {
+    let Some((host, port)) = req.uri().authority().map(|a| (a.host().to_ascii_lowercase(), a.port_u16().unwrap_or(443))) else {
+        return build(Response::text(400, "CONNECT names host:port"));
+    };
+    if !tunnels.iter().any(|t| t.eq_ignore_ascii_case(&format!("{host}:{port}"))) {
+        crate::log::warning(&format!("refused an agent's connection to {host}:{port}: it reaches only deid-agent and its sign-in"));
+        return build(Response::text(403, &format!("deid-agent opens no connection to {host}:{port}")));
+    }
+    let upstream = match tokio::time::timeout(Duration::from_secs(15), TcpStream::connect((host.as_str(), port))).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return build(Response::text(502, &format!("{host}:{port}: {e}"))),
+        Err(_) => return build(Response::text(504, &format!("{host}:{port}: no answer"))),
+    };
+    crate::log::info(&format!("a tunnel to {host}:{port}"));
+    tokio::task::spawn_local(async move {
+        if let Ok(agent) = hyper::upgrade::on(req).await {
+            let (mut agent, mut upstream) = (TokioIo::new(agent), upstream);
+            let _ = tokio::io::copy_bidirectional(&mut agent, &mut upstream).await;
+        }
+    });
+    build(Response::full(200, Vec::new(), Bytes::new()))
+}
+
+async fn answer(handler: Handler, tunnels: &[String], req: hyper::Request<Incoming>) -> hyper::Response<OutBody> {
+    if req.method() == hyper::Method::CONNECT {
+        return tunnel(tunnels, req).await;
+    }
     let (parts, body) = req.into_parts();
     let headers: Headers = parts.headers.iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect();
     let path = parts.uri.path().to_string();
