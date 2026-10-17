@@ -135,8 +135,17 @@ enable_request_compression = false
   stricter profile beside it — the matter folder and the session's temp folder, no keychain, no
   network at all, not even deid-agent. git runs without the person's `~/.gitconfig`, and Apple's
   `/usr/bin/git` keeps its cache in the session's temp folder (`xcrun_db`). The person is still asked
-  before each command. `--claude-unconfined` leaves Claude Code as it is. Without `agent-shell` beside
-  deid-agent, or off macOS, only the shell commands are held, by Claude Code's own sandbox:
+  before each command. `--claude-unconfined` leaves Claude Code as it is.
+
+  Before Claude Code starts, deid-agent tries its profile with the environment it will have: Claude
+  Code starts in it (`--version`), reads the person's sign-in in it when it reads it outside
+  (`auth status`), and its shell commands start through the launcher. What an older macOS, a newer
+  Claude Code or an install the profile does not reach would break shows there; Claude Code then
+  starts as below, and the page says why. deid-agent makes Claude Code's folders under `~/.claude`
+  first (inside its profile it may write in them, not make them), and takes macOS's quarantine off
+  its copy of the launcher: copied out of an app from a downloaded disk image, macOS kills it at its
+  start. Without `agent-shell` beside deid-agent, or off macOS, or when the check fails, only the
+  shell commands are held, by Claude Code's own sandbox:
   - no network at all (`network.allowedDomains: []`, `strictAllowlist`);
   - `/Users`, `/Volumes` and other homes closed to reading, the matter folder open again;
   - writes to the folder and a temp folder only;

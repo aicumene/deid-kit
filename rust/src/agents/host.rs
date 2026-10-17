@@ -1220,6 +1220,8 @@ impl AgentHost {
             }
             let base_url = format!("http://127.0.0.1:{}", self.cfg.port);
             let mut extra: Vec<(String, String)>;
+            // Claude Code confined whole, and what it starts with if its check fails
+            let (mut confined, mut legacy): (Option<confine::ConfinedClaude>, Vec<(String, String)>) = (None, Vec::new());
             if choice.codex() {
                 let home = self.cfg.codex_home.clone().unwrap_or_else(|| {
                     static SAFE: OnceLock<Regex> = OnceLock::new();
@@ -1279,6 +1281,7 @@ impl AgentHost {
                     extra.push(("MCP_TOOL_TIMEOUT".into(), ((self.cfg.subagents_timeout * 1000.0) as i64).to_string()));
                 }
                 if choice.claude() && self.whole_claude() {
+                    legacy = extra.clone();
                     match self.confine_claude(&choice, server.as_ref()) {
                         Ok(c) => {
                             let s = |p: &Path| p.to_string_lossy().into_owned();
@@ -1291,6 +1294,7 @@ impl AgentHost {
                                           ("ENABLE_CLAUDEAI_MCP_SERVERS".to_string(), "false".to_string())]);
                             extra.extend(confine::proxy_env(self.cfg.port));
                             extra.extend(confine::tools_env(&s(&c.temp)));
+                            confined = Some(c);
                         }
                         Err(e) => {
                             self.drop_claude_dir(&choice.name);
@@ -1299,7 +1303,20 @@ impl AgentHost {
                     }
                 }
             }
-            let env = acp::agent_env(&base_url, &self.cfg.scope, if lend { Some(&self.cfg.agent_key) } else { None }, &extra);
+            let key = if lend { Some(self.cfg.agent_key.as_str()) } else { None };
+            let mut env = acp::agent_env(&base_url, &self.cfg.scope, key, &extra);
+            if let Some(c) = &confined {
+                // tried first: what its profile would break shows here, and Claude Code then starts as before 0.1.38
+                if let Err(why) = confine::check_claude(c, &self.cfg.folder, &env, !lend).await {
+                    log::warning(&format!("Claude Code is not confined whole: {why}; only its shell commands are, in its own sandbox"));
+                    self.emit(json!({"kind": "notice", "text": format!(
+                        "Claude Code started with only its shell commands in a sandbox, not the whole of it: {why}.")}));
+                    self.drop_claude_dir(&choice.name);
+                    confined = None;
+                    env = acp::agent_env(&base_url, &self.cfg.scope, key, &legacy);
+                }
+            }
+            let whole = confined.is_some();
             let (w1, w2) = (Rc::downgrade(&self), Rc::downgrade(&self));
             let (n1, n2) = (choice.name.clone(), choice.name.clone());
             let agent = AcpAgent::new(command, env, self.cfg.folder.to_string_lossy().into_owned(),
@@ -1323,7 +1340,6 @@ impl AgentHost {
                 meta = Some(with_subagents(meta.as_ref()));
             }
             if choice.claude() {
-                let whole = self.whole_claude();
                 let mut settings = claude_settings(&self.cfg.folder, self.cfg.claude_confine && !whole, &self.cfg.guard,
                                                    self.cfg.guard_log.as_deref());
                 if whole {

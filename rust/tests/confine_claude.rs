@@ -21,6 +21,7 @@ struct Case {
     session: PathBuf,
     port: u16,
     elsewhere: u16,
+    confined: confine::ConfinedClaude,
     _listeners: (TcpListener, TcpListener),
 }
 
@@ -35,11 +36,20 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+/// A Claude Code that starts and is signed in: what the profile is tried with before the real one starts.
+const CLAUDE: &str = "#!/bin/sh\ncase \"$1\" in --version) echo '9.9.9 (Claude Code)';; auth) echo '{\"loggedIn\": true}';; esac\n";
+
 fn case(name: &str) -> Case {
-    case_writing(name, &[])
+    case_full(name, &[], CLAUDE, false)
 }
 
 fn case_writing(name: &str, journals: &[&str]) -> Case {
+    case_full(name, journals, CLAUDE, false)
+}
+
+/// A case with a Claude Code of `script` (`OTHER` in it is the other matter), and the launcher copied from a
+/// quarantined file when `quarantined`, as in an app from a downloaded disk image.
+fn case_full(name: &str, journals: &[&str], script: &str, quarantined: bool) -> Case {
     let base = std::env::temp_dir().join(format!("deid-confine-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let base = {
@@ -55,15 +65,25 @@ fn case_writing(name: &str, journals: &[&str]) -> Case {
     std::fs::create_dir_all(home.join("Library/Keychains")).unwrap();
     write(&matter.join("contract.txt"), "Delivery: 30 days.\n");
     write(&other.join("notes.txt"), "Matter B's notes.\n");
-    write(&base.join("install/versions/9.9.9"), "#!/bin/sh\n");
+    let claude = base.join("install/versions/9.9.9");
+    write(&claude, &script.replace("OTHER", &s(&other)));
+    std::fs::set_permissions(&claude, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut launcher = PathBuf::from(env!("CARGO_BIN_EXE_agent-shell"));
+    if quarantined {
+        let copy = base.join("app/agent-shell");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::copy(&launcher, &copy).unwrap();
+        assert!(Command::new("/usr/bin/xattr").args(["-w", "com.apple.quarantine", "0081;6ad2c0ba;Telegram;"]).arg(&copy)
+            .status().unwrap().success());
+        launcher = copy;
+    }
     let (a, b) = (TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap());
     let (port, elsewhere) = (a.local_addr().unwrap().port(), b.local_addr().unwrap().port());
-    confine::confined_claude(&home.to_string_lossy(), &matter.to_string_lossy(),
-                             Some(&base.join("install/versions/9.9.9").to_string_lossy()),
-                             Path::new(env!("CARGO_BIN_EXE_agent-shell")), &session, &confine::network(port, &[]), &[],
-                             &journals.iter().map(|w| s(&base.join(w))).collect::<Vec<_>>())
+    let confined = confine::confined_claude(&home.to_string_lossy(), &matter.to_string_lossy(), Some(&s(&claude)), &launcher,
+                                            &session, &confine::network(port, &[]), &[],
+                                            &journals.iter().map(|w| s(&base.join(w))).collect::<Vec<_>>())
         .expect("laid out");
-    Case { base, home, matter, other, session, port, elsewhere, _listeners: (a, b) }
+    Case { base, home, matter, other, session, port, elsewhere, confined, _listeners: (a, b) }
 }
 
 /// `program args…` under Claude Code's own profile: did it succeed?
@@ -206,4 +226,61 @@ fn agent_guard_keeps_this_matters_journal_and_its_side_files_but_not_another_mat
     assert!(sh(format!("echo '{{}}' > '{guard}/case-a.resmon' && echo '{{}}' > '{guard}/case-a.dedup.json'")));
     assert!(!sh(format!("cat '{guard}/case-b.jsonl'")));
     assert!(!sh(format!("echo x > '{guard}/case-ab.jsonl'")));
+}
+
+#[test]
+fn a_launcher_from_a_downloaded_app_still_starts_the_commands() {
+    // copied out of a quarantined app, macOS kills it at its start (137) unless deid-agent takes the mark off
+    let c = case_full("quarantine", &[], CLAUDE, true);
+    assert!(command(&c, &format!("cat '{}'", s(&c.matter.join("contract.txt")))));
+    let marks = Command::new("/usr/bin/xattr").arg(c.session.join("bin/zsh")).output().unwrap();
+    assert!(!String::from_utf8_lossy(&marks.stdout).contains("com.apple.quarantine"));
+}
+
+#[test]
+fn claude_codes_folders_are_made_before_it_starts() {
+    let c = case("folders");
+    for d in [".claude/projects", ".claude/sessions", ".claude/session-env"] {
+        assert!(c.home.join(d).is_dir(), "{d}");
+    }
+}
+
+fn check(c: &Case, sign_in: bool) -> Result<(), String> {
+    let env: Vec<(String, String)> = vec![("HOME".into(), s(&c.home)), ("PATH".into(), "/usr/bin:/bin".into()),
+                                          ("TMPDIR".into(), format!("{}/", s(&c.confined.temp)))];
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        .block_on(confine::check_claude(&c.confined, &c.matter, &env, sign_in))
+}
+
+#[test]
+fn the_check_passes_a_claude_code_that_starts_signed_in_and_whose_commands_start() {
+    let c = case("check-ok");
+    assert_eq!(check(&c, true), Ok(()));
+}
+
+#[test]
+fn the_check_finds_a_claude_code_installed_where_its_profile_does_not_reach() {
+    // as Claude Code under nvm: its Node lies in the home folder, closed to the profile
+    let c = case_full("check-start", &[], "#!/bin/sh\ncat 'OTHER/notes.txt' >/dev/null || exit 1\necho 9.9.9\n", false);
+    let why = check(&c, true).unwrap_err();
+    assert!(why.starts_with("Claude Code did not start in it"), "{why}");
+}
+
+#[test]
+fn the_check_finds_a_sign_in_read_outside_but_not_inside() {
+    let script = "#!/bin/sh\ncase \"$1\" in --version) echo 9.9.9;; auth) if cat 'OTHER/notes.txt' >/dev/null 2>&1; \
+                  then echo '{\"loggedIn\": true}'; else echo '{\"loggedIn\": false}'; fi;; esac\n";
+    let c = case_full("check-sign-in", &[], script, false);
+    assert_eq!(check(&c, true), Err("inside it Claude Code could not read the person's sign-in".into()));
+    // with the organization's key there is no sign-in of the person's to read
+    assert_eq!(check(&c, false), Ok(()));
+}
+
+#[test]
+fn the_check_finds_commands_that_cannot_start() {
+    let c = case("check-shell");
+    std::fs::set_permissions(c.session.join("bin"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::remove_file(c.session.join("bin/command.sb")).unwrap();
+    let why = check(&c, true).unwrap_err();
+    assert!(why.starts_with("its shell commands could not start"), "{why}");
 }

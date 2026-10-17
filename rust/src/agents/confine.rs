@@ -447,13 +447,88 @@ pub fn claude_profile(home: &str, folder: &str, claude: &str, session: &Path, ne
     lines.join("\n")
 }
 
-/// A confined Claude Code: the program its adapter starts, the shell it runs commands with, its temp folder.
+/// A confined Claude Code: the program its adapter starts, the shell it runs commands with, its temp folder, and
+/// the profile it runs under.
 #[derive(Debug)]
 pub struct ConfinedClaude {
     pub executable: PathBuf,
     pub shell: PathBuf,
     pub temp: PathBuf,
+    pub profile: PathBuf,
+    /// Claude Code's own program, the wrapper's (to read the sign-in outside the profile, for comparison).
+    pub binary: PathBuf,
 }
+
+/// Take macOS's quarantine off a program deid-agent copied out of the app (16.10.2026): copied out of an app that
+/// came in a downloaded disk image, it carries the mark without the person's approval of the app, and macOS kills
+/// it at its start (code 137) — every shell command would fail.
+pub fn unquarantine(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let (Ok(p), Ok(n)) = (std::ffi::CString::new(path.as_os_str().as_bytes()), std::ffi::CString::new("com.apple.quarantine")) {
+            unsafe { libc::removexattr(p.as_ptr(), n.as_ptr(), libc::XATTR_NOFOLLOW) };
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = path;
+}
+
+/// The folders Claude Code keeps a session's files in, made before it starts: inside its profile it may write in
+/// them but not make them, and a person who signed in and never ran a session has none yet.
+pub fn claude_folders(home: &str) -> std::io::Result<()> {
+    let home = PathBuf::from(real(home));
+    for d in [".claude/projects", ".claude/sessions", ".claude/session-env"] {
+        std::fs::create_dir_all(home.join(d))?;
+    }
+    Ok(())
+}
+
+/// Claude Code tried under its profile before it starts, with the environment it will have: it starts there, it
+/// reads the person's sign-in there (when it reads it outside), and its shell commands start through the launcher.
+/// Err says what failed, in a few words. What a newer Claude Code, an older macOS, or a Claude Code installed where
+/// its profile does not reach (under the home folder, as with nvm) would break is found here, not in the first task.
+pub async fn check_claude(c: &ConfinedClaude, folder: &Path, env: &[(String, String)], sign_in: bool) -> Result<(), String> {
+    use tokio::process::Command;
+    let run = |program: &Path, args: &[&str], sandboxed: bool| {
+        let mut cmd = if sandboxed {
+            let mut c2 = Command::new(SANDBOX_EXEC);
+            c2.arg("-f").arg(&c.profile).arg(program);
+            c2
+        } else {
+            Command::new(program)
+        };
+        cmd.args(args).current_dir(folder).env_clear().envs(env.iter().map(|(k, v)| (k, v)))
+            .stdin(std::process::Stdio::null()).kill_on_drop(true);
+        async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output()).await {
+                Ok(Ok(out)) => Ok(out),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("no answer in 20 s".into()),
+            }
+        }
+    };
+    let first_line = |b: &[u8]| String::from_utf8_lossy(b).lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+    let started = run(&c.executable, &["--version"], false).await.map_err(|e| format!("Claude Code did not start in it: {e}"))?;
+    if !started.status.success() {
+        return Err(format!("Claude Code did not start in it ({}): {}", started.status, first_line(&started.stderr)));
+    }
+    let shell = run(&c.shell, &["-c", "exit 0"], true).await.map_err(|e| format!("its shell commands could not start: {e}"))?;
+    if !shell.status.success() {
+        return Err(format!("its shell commands could not start ({}): {}", shell.status, first_line(&shell.stderr)));
+    }
+    if sign_in {
+        let signed_in = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).contains("\"loggedIn\": true");
+        let inside = run(&c.executable, &["auth", "status"], false).await.map_err(|e| format!("Claude Code's sign-in could not be read in it: {e}"))?;
+        if !signed_in(&inside) {
+            if run(&c.binary, &["auth", "status"], false).await.is_ok_and(|o| signed_in(&o)) {
+                return Err("inside it Claude Code could not read the person's sign-in".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 
 /// Lay out a confined Claude Code in `session`: the launcher copied in as `bin/zsh` with the commands' profile
 /// beside it, Claude Code's own profile, and the wrapper that starts Claude Code under it.
@@ -470,7 +545,9 @@ pub fn confined_claude(home: &str, folder: &str, claude: Option<&str>, launcher:
     std::fs::create_dir_all(&temp).map_err(io)?;
     let shell = bin.join("zsh");
     std::fs::copy(launcher, &shell).map_err(io)?;
+    unquarantine(&shell);
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o555)).map_err(io)?;
+    claude_folders(home).map_err(io)?;
     std::fs::write(bin.join("command.sb"), command_profile(folder, &temp.to_string_lossy())).map_err(io)?;
     let sb = session.join("claude.sb");
     std::fs::write(&sb, claude_profile(home, folder, &binary, session, network, read, write)).map_err(io)?;
@@ -478,5 +555,5 @@ pub fn confined_claude(home: &str, folder: &str, claude: Option<&str>, launcher:
     write_exec(&wrapper, &format!(
         "#!/bin/sh\n# Claude Code confined to the matter folder (deid-agent); its shell commands start through bin/zsh\nTMPDIR={}; export TMPDIR\nexec {SANDBOX_EXEC} -f {} {} \"$@\"\n",
         shquote(&format!("{}/", real(&temp.to_string_lossy()))), shquote(&sb.to_string_lossy()), shquote(&real(&binary)))).map_err(io)?;
-    Ok(ConfinedClaude { executable: wrapper, shell, temp })
+    Ok(ConfinedClaude { executable: wrapper, shell, temp, profile: sb, binary: PathBuf::from(real(&binary)) })
 }
