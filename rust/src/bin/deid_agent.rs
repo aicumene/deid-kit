@@ -43,6 +43,8 @@ const OPTS: &[Opt] = &[
     none("--record", "", "write what crossed (tokens only) to this JSONL file"),
     opt("--usage-log", "~/.deid/agent/usage.jsonl", "one JSON line per task: scope, model, seconds, tokens ('' for none)"),
     opt("--port", "8790", ""),
+    opt("--bind", "127.0.0.1", "the address the page and the proxy listen on: 0.0.0.0 in a container whose port is \
+published to its host (the token still guards the page)"),
     opt("--agent-command", DEFAULT_AGENT, "the ACP agent to start"),
     none("--agent", "NAME=COMMAND", "an agent the page switches to (repeat for each)"),
     none("--agent-upstream", "NAME=URL", "that agent's model requests go to this server of the organization's own"),
@@ -183,6 +185,8 @@ fn main() {
     let args = cli::parse(PROG, "deid-agent: a coding agent over one folder, behind deid-proxy, with a page to drive it.", OPTS, &argv);
     let _ = log::init("", "INFO");
     let port: u16 = cli::number(PROG, OPTS, "--port", &args.str("--port"), "int");
+    let bind: std::net::IpAddr = args.str("--bind").parse()
+        .unwrap_or_else(|_| die(&format!("deid-agent: --bind: not an address: {}", args.str("--bind"))));
     let timeout: f64 = cli::number(PROG, OPTS, "--subagents-timeout", &args.str("--subagents-timeout"), "float");
     let folder = py::realpath(&py::expanduser(&args.str("--folder")));
     if !folder.is_dir() {
@@ -298,9 +302,9 @@ fn main() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("the runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
-        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        let listener = match tokio::net::TcpListener::bind((bind, port)).await {
             Ok(l) => l,
-            Err(e) => die(&format!("deid-agent: 127.0.0.1:{port}: {}", deidkit::agents::acp::os_error(&e, None))),
+            Err(e) => die(&format!("deid-agent: {bind}:{port}: {}", deidkit::agents::acp::os_error(&e, None))),
         };
         let proxy = Proxy::new(store.clone(), Rc::new(StoreRestore(store)), proxy_cfg);
         let host = AgentHost::new(cfg, proxy);
