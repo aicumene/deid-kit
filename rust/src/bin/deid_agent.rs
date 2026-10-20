@@ -45,6 +45,8 @@ const OPTS: &[Opt] = &[
     opt("--port", "8790", ""),
     opt("--bind", "127.0.0.1", "the address the page and the proxy listen on: 0.0.0.0 in a container whose port is \
 published to its host (the token still guards the page)"),
+    none("--unix", "PATH", "also take the page and the proxy on this Unix socket (only its owner may connect), each \
+connection passed on to the port: a container's published socket, which reaches the host without its network"),
     opt("--agent-command", DEFAULT_AGENT, "the ACP agent to start"),
     none("--agent", "NAME=COMMAND", "an agent the page switches to (repeat for each)"),
     none("--agent-upstream", "NAME=URL", "that agent's model requests go to this server of the organization's own"),
@@ -116,6 +118,30 @@ fn watch_lifeline() -> tokio::sync::oneshot::Receiver<()> {
         let _ = tx.send(());
     });
     rx
+}
+
+/// `--unix`: the page and the proxy on a Unix socket as well, each connection passed on to the port. Apple's container
+/// publishes such a socket to its host through the machine's own channel (`container run --publish-socket`), not
+/// its network — a published port needs macOS's Local Network permission for Apple's helper, which a person never
+/// sees asked (Bernio, 20.10.2026), and deid-agent on 0.0.0.0. The socket is its owner's alone (0600).
+async fn pass_on(path: String, to: std::net::SocketAddr) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_file(&path);
+    let listener = match tokio::net::UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => die(&format!("deid-agent: --unix {path}: {}", deidkit::agents::acp::os_error(&e, None))),
+    };
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        die(&format!("deid-agent: --unix {path}: {e}"));
+    }
+    loop {
+        let Ok((mut from, _)) = listener.accept().await else { continue };
+        tokio::task::spawn_local(async move {
+            if let Ok(mut port) = tokio::net::TcpStream::connect(to).await {
+                let _ = tokio::io::copy_bidirectional(&mut from, &mut port).await;
+            }
+        });
+    }
 }
 
 fn json_object(text: &str, option: &str) -> Value {
@@ -299,6 +325,9 @@ fn main() {
     };
     let url = format!("http://127.0.0.1:{port}/{}", if token.is_empty() { format!("#t={}", cfg.token) } else { String::new() });
     let lifeline = args.on("--lifeline");
+    let unix = args.get("--unix").filter(|p| !p.is_empty()).map(str::to_string);
+    let unix_left = unix.clone();
+    let inner: std::net::IpAddr = if bind.is_unspecified() { [127, 0, 0, 1].into() } else { bind };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("the runtime");
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
@@ -316,6 +345,9 @@ fn main() {
         });
         let tunnels = Rc::new(confine::SIGN_IN.iter().map(|h| format!("{h}:443")).collect::<Vec<_>>());
         tokio::task::spawn_local(http::serve_with_tunnels(listener, handler, tunnels));
+        if let Some(path) = unix {
+            tokio::task::spawn_local(pass_on(path, (inner, port).into()));
+        }
         tokio::task::spawn_local(host.clone().start_agent());
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM");
         let gone = lifeline.then(watch_lifeline);
@@ -328,5 +360,8 @@ fn main() {
         }
         host.cleanup().await;
     });
+    if let Some(path) = unix_left {
+        let _ = std::fs::remove_file(path);
+    }
     let _ = PathBuf::new();
 }
