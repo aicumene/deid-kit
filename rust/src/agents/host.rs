@@ -942,6 +942,12 @@ impl State {
     }
 }
 
+/// What the person is asked to let go to the model.
+enum Transfer {
+    Task(String),
+    Review(String),
+}
+
 pub struct AgentHost {
     pub cfg: HostConfig,
     pub proxy: Rc<Proxy>,
@@ -2019,10 +2025,14 @@ impl AgentHost {
     /// A task the person gave: asked about first when the person approves transfers, then run.
     async fn task(self: Rc<Self>, text: String, run: String) {
         if self.cfg.approve_transfers {
-            let summary = self.text_summary(&text);
-            if let Some(verdict) = self.approval("task", &run, Some("task".into()), summary).await {
+            if let Some(verdict) = self.approval(Transfer::Task(text.clone()), &run, Some("task".into())).await {
                 self.st.borrow_mut().busy = false;
                 self.emit(json!({"kind": "turn_end", "stopReason": "not_approved", "verdict": verdict, "usage": {}, "seconds": 0.0}));
+                // as every task ends: with what changed in the folder (nothing did)
+                let mut files = Map::new();
+                files.insert("kind".into(), json!("files"));
+                files.extend(self.changes());
+                self.emit(Value::Object(files));
                 return;
             }
         }
@@ -2031,11 +2041,16 @@ impl AgentHost {
         self.st.borrow_mut().run.clear();
     }
 
-    /// The person's word before `what` ("task" or "review") sends anything: None — approved, go on;
-    /// Some(verdict) — "refused" or "cancelled", nothing is sent. `remember`: what an approval the person
-    /// asks to keep covers (a document as it is now, or "task"); covered, it is not asked again. Each
-    /// approval and refusal is kept in the matter folder with who gave it.
-    async fn approval(self: &Rc<Self>, what: &str, run: &str, remember: Option<String>, summary: Value) -> Option<String> {
+    /// The person's word before a task or a review sends anything: None — approved, go on; Some(verdict) —
+    /// "refused" or "cancelled", nothing is sent. `remember`: what an approval the person asks to keep covers
+    /// (a document as it is now, or "task"); covered, it is not asked again. Each approval and refusal is kept
+    /// in the matter folder with who gave it, and with what would go at the moment they answered (they may
+    /// have hidden names meanwhile).
+    async fn approval(self: &Rc<Self>, transfer: Transfer, run: &str, remember: Option<String>) -> Option<String> {
+        let (what, summary) = match &transfer {
+            Transfer::Task(text) => ("task", self.text_summary(text)),
+            Transfer::Review(path) => ("review", self.review_summary(path)),
+        };
         let id = py::uuid4_hex()[..16].to_string();
         let standing = remember.as_ref().is_some_and(|k| self.st.borrow().approved.contains(k));
         let (verdict, kept) = if standing {
@@ -2057,6 +2072,12 @@ impl AgentHost {
         };
         let mut record = Value::Null;
         if verdict != "cancelled" {
+            let summary = if kept { summary } else {
+                match &transfer {
+                    Transfer::Task(text) => self.text_summary(text),
+                    Transfer::Review(path) => self.review_summary(path),
+                }
+            };
             let mut r = disclosure::transfer(&id, what, run, &self.cfg.person, &verdict, &summary);
             r["standing"] = json!(kept);
             match disclosure::store_transfer(&self.cfg.folder, &r) {
@@ -2469,9 +2490,8 @@ impl AgentHost {
     async fn review(self: Rc<Self>, path: String, source: String, run: String) {
         let agent = self.current().label();
         if self.cfg.approve_transfers {
-            let summary = self.review_summary(&path);
-            let remember = summary["sha"].as_str().map(|sha| format!("review:{path}:{sha}"));
-            if self.approval("review", &run, remember, summary).await.is_some() {
+            let remember = review::read_text(&self.cfg.folder, &path).map(|(_, text)| format!("review:{path}:{}", review::sha(&text)));
+            if self.approval(Transfer::Review(path.clone()), &run, remember).await.is_some() {
                 self.st.borrow_mut().busy = false;
                 self.emit(json!({"kind": "review", "state": "failed", "path": path, "run": run, "agent": agent, "refused": true,
                                  "text": "Nothing was sent: the review was not approved."}));

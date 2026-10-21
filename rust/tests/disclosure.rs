@@ -293,6 +293,7 @@ fn a_task_and_a_review_go_only_when_the_person_approves_them() {
     next(&rx, &mut seen, |e| e["kind"] == "approval" && e["state"] == "refused");
     let end = next(&rx, &mut seen, |e| e["kind"] == "turn_end");
     assert_eq!(end["stopReason"], json!("not_approved"));
+    next(&rx, &mut seen, |e| e["kind"] == "files");
     assert!(!seen.iter().any(|e| e["kind"] == "user"), "the refused task reached the agent: {seen:#?}");
     let (status, _) = call(&a, "POST", "/deid-agent/api/approve", Some(json!({"id": id, "verdict": "approve"})));
     assert_eq!(status, 404, "an answered request is answered");
@@ -307,6 +308,9 @@ fn a_task_and_a_review_go_only_when_the_person_approves_them() {
     assert!(asked["summary"]["hidden"]["PERSON"].as_u64().is_some_and(|n| n >= 2), "{}", asked["summary"]);
     assert!(asked["summary"]["left_in_clear"].as_array().unwrap().contains(&json!(IN_CLEAR)));
     assert!(asked["summary"]["left_in_clear"].as_array().unwrap().contains(&json!(HIDDEN_LATER)));
+    // the person hides a name before answering: the record says what went when they answered
+    let (status, _) = call(&a, "POST", "/deid-agent/api/entity", Some(json!({"type": "person", "name": HIDDEN_LATER})));
+    assert_eq!(status, 200);
     seen.clear();
     let (status, _) = call(&a, "POST", "/deid-agent/api/approve",
                            Some(json!({"id": asked["id"], "verdict": "approve", "remember": true})));
@@ -341,6 +345,8 @@ fn a_task_and_a_review_go_only_when_the_person_approves_them() {
     assert_eq!(verdicts, vec![("task", "refused", false), ("review", "approved", false), ("review", "approved", true)]);
     assert!(kept.iter().all(|r| r["by"] == json!(PERSON)));
     assert_eq!(kept[1]["document"], json!("letter.md"));
+    let clear = kept[1]["left_in_clear"].as_array().unwrap();
+    assert!(clear.contains(&json!(IN_CLEAR)) && !clear.contains(&json!(HIDDEN_LATER)), "{clear:?}");
     let (_, listed) = call(&a, "GET", "/deid-agent/api/transfers", None);
     assert_eq!(listed["transfers"].as_array().unwrap().len(), 3);
 
