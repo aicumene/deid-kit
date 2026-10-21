@@ -306,8 +306,9 @@ fn a_task_and_a_review_go_only_when_the_person_approves_them() {
     assert_eq!(asked["summary"]["document"], json!("letter.md"));
     assert!(asked["summary"]["sha"].is_string());
     assert!(asked["summary"]["hidden"]["PERSON"].as_u64().is_some_and(|n| n >= 2), "{}", asked["summary"]);
-    assert!(asked["summary"]["left_in_clear"].as_array().unwrap().contains(&json!(IN_CLEAR)));
-    assert!(asked["summary"]["left_in_clear"].as_array().unwrap().contains(&json!(HIDDEN_LATER)));
+    let clear: Vec<&Value> = asked["summary"]["left_in_clear"].as_array().unwrap().iter().map(|c| &c["text"]).collect();
+    assert!(clear.contains(&&json!(IN_CLEAR)) && clear.contains(&&json!(HIDDEN_LATER)), "{clear:?}");
+    assert_eq!(asked["summary"]["left_in_clear"][0]["kind"], json!("person"));
     // the person hides a name before answering: the record says what went when they answered
     let (status, _) = call(&a, "POST", "/deid-agent/api/entity", Some(json!({"type": "person", "name": HIDDEN_LATER})));
     assert_eq!(status, 200);
@@ -345,8 +346,8 @@ fn a_task_and_a_review_go_only_when_the_person_approves_them() {
     assert_eq!(verdicts, vec![("task", "refused", false), ("review", "approved", false), ("review", "approved", true)]);
     assert!(kept.iter().all(|r| r["by"] == json!(PERSON)));
     assert_eq!(kept[1]["document"], json!("letter.md"));
-    let clear = kept[1]["left_in_clear"].as_array().unwrap();
-    assert!(clear.contains(&json!(IN_CLEAR)) && !clear.contains(&json!(HIDDEN_LATER)), "{clear:?}");
+    let clear: Vec<&Value> = kept[1]["left_in_clear"].as_array().unwrap().iter().map(|c| &c["text"]).collect();
+    assert!(clear.contains(&&json!(IN_CLEAR)) && !clear.contains(&&json!(HIDDEN_LATER)), "{clear:?}");
     let (_, listed) = call(&a, "GET", "/deid-agent/api/transfers", None);
     assert_eq!(listed["transfers"].as_array().unwrap().len(), 3);
 

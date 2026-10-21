@@ -405,7 +405,7 @@ pub fn transfers(folder: &Path) -> Vec<Value> {
 }
 
 /// What the person is asked to let go, of a text: the counts of what is hidden by type and the likely
-/// names left in clear.
+/// names left in clear (`{text, kind}`).
 pub fn summary_of(text: &str, red: &Redaction, spans: &[Value]) -> Value {
     let mut counts: ODict<usize> = ODict::new();
     for s in spans {
@@ -414,7 +414,7 @@ pub fn summary_of(text: &str, red: &Redaction, spans: &[Value]) -> Value {
         counts.insert(&kind, c + 1);
     }
     let ranges: Vec<(usize, usize)> = spans.iter().filter_map(|s| Some((s["start"].as_u64()? as usize, s["end"].as_u64()? as usize))).collect();
-    let clear: Vec<Value> = candidates(text, &ranges).into_iter().map(|c| c["text"].clone()).collect();
+    let clear: Vec<Value> = candidates(text, &ranges).into_iter().map(|c| json!({"text": c["text"], "kind": c["kind"]})).collect();
     json!({"hidden": Value::Object(counts.iter().map(|(k, v)| (k.to_string(), json!(v))).collect()), "tokens": red.mapping.len(),
            "left_in_clear": clear})
 }
