@@ -170,4 +170,10 @@ impl ScopeEngine {
     pub fn residual(&self, text: &str) -> Vec<String> {
         vault::residual_surfaces(&*self.store, &self.scope, text)
     }
+
+    /// Whether `text` still carries something a request of this scope would hide: an enrolled value or a
+    /// street address (read-only).
+    pub fn shows(&self, text: &str) -> bool {
+        !self.residual(text).is_empty() || !address::find_addresses(&text.chars().collect::<Vec<_>>()).is_empty()
+    }
 }

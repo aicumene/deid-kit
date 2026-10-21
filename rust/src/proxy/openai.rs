@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use serde_json::{json, Map, Value};
 
 use crate::odict::ODict;
-use crate::proxy::anthropic::{at, detokenize_obj, key, slot_texts, strings, subagent_tools, Holdback, Path, PrepareError, Seg};
+use crate::proxy::anthropic::{at, detokenize_obj, key, safe_restores, slot_texts, strings, subagent_tools, Holdback, Path, PrepareError, Seg};
 use crate::proxy::engine::ScopeEngine;
 use crate::proxy::spelling;
 use crate::pyre::{self, Regex, NONE};
@@ -223,10 +223,26 @@ pub fn prepare_responses(body: &Value, engine: &ScopeEngine, headers: &[(String,
             _ => return Err(refused(format!("unknown input item type {}", py::py_repr(item.get("type").unwrap_or(&Value::Null))))),
         }
     }
-    let texts = slot_texts(&root, &slots).map_err(PrepareError::Failed)?;
-    let reds = engine.tokenize_all(&texts).map_err(PrepareError::Failed)?;
+    let mut texts = slot_texts(&root, &slots).map_err(PrepareError::Failed)?;
+    let mut reds = engine.tokenize_all(&texts).map_err(PrepareError::Failed)?;
     for (p, red) in slots.iter().zip(&reds) {
         *at(&mut root, p) = Value::String(red.text.clone());
+    }
+    let (restores, dropped) = safe_restores(restores, engine);
+    // a call's arguments or input restored whole was not tokenised above: it is now, as one string
+    let mut late: Vec<Path> = Vec::new();
+    for p in dropped.into_iter().filter(|p| !slots.contains(p)) {
+        let v = crate::proxy::anthropic::get(&root, &p).clone();
+        if v.is_string() { late.push(p) } else { strings(&v, &p, &mut late) }
+    }
+    if !late.is_empty() {
+        let more = slot_texts(&root, &late).map_err(PrepareError::Failed)?;
+        let red_more = engine.tokenize_all(&more).map_err(PrepareError::Failed)?;
+        for (p, red) in late.iter().zip(&red_more) {
+            *at(&mut root, p) = Value::String(red.text.clone());
+        }
+        texts.extend(more);
+        reds.extend(red_more);
     }
     if let Some(Value::Array(items)) = root["b"].get_mut("input") {
         for item in items.iter_mut() {

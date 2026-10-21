@@ -52,6 +52,51 @@ pub fn canonical(v: &Value) -> String {
     py::dumps_with(v, true, true)
 }
 
+/// The strings of `text` (keys and values, one a line) when it is JSON — one value or several in a row, an
+/// object or a list among them —, so that an escaped letter reads as itself; else `text` as it is.
+pub fn readable(text: &str) -> String {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(m) => m.iter().for_each(|(k, x)| {
+                out.push(k.clone());
+                walk(x, out)
+            }),
+            _ => {}
+        }
+    }
+    let values: Result<Vec<Value>, _> = serde_json::Deserializer::from_str(text).into_iter::<Value>().collect();
+    match values {
+        Ok(vs) if vs.iter().any(|v| v.is_object() || v.is_array()) => {
+            let mut out = Vec::new();
+            vs.iter().for_each(|v| walk(v, &mut out));
+            out.join("\n")
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// The model's own words go back as it wrote them (the same bytes every turn), unless they carry what this
+/// scope now hides: a name the model wrote in clear before it was enrolled would otherwise cross in clear on
+/// every turn after. Returns the restores kept and the paths of those dropped; a dropped path goes as
+/// tokenised now.
+pub fn safe_restores(restores: Vec<(Path, String)>, engine: &ScopeEngine) -> (Vec<(Path, String)>, Vec<Path>) {
+    let texts: Vec<String> = restores.iter().map(|(_, o)| readable(o)).collect();
+    if texts.is_empty() || !engine.shows(&texts.join("\n\n")) {
+        return (restores, Vec::new());
+    }
+    let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+    for ((p, original), text) in restores.into_iter().zip(texts) {
+        if engine.shows(&text) {
+            dropped.push(p);
+        } else {
+            kept.push((p, original));
+        }
+    }
+    (kept, dropped)
+}
+
 /// Where a string sits in a JSON value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Seg {
@@ -271,6 +316,7 @@ pub fn prepare_request(body: &Value, engine: &ScopeEngine, restore_get: &dyn Fn(
     for (p, red) in slots.iter().zip(&reds) {
         *at(&mut body, p) = Value::String(red.text.clone());
     }
+    let (restores, _) = safe_restores(restores, engine);
     let restored = restores.len();
     for (p, original) in restores {
         let last_is_input = matches!(p.last(), Some(Seg::Key(k)) if k == "input");
