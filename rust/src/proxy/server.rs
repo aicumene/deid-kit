@@ -177,6 +177,7 @@ impl RestoreTable for StoreRestore {
 }
 
 pub type UsageHook = Box<dyn Fn(&str, &Map<String, Value>)>;
+pub type CrossingHook = Box<dyn Fn(&Value, &str)>;
 
 /// Where requests go and with which key: set from the configuration, changed by deid-agent at each
 /// switch of agents (`AgentHost.route`).
@@ -202,6 +203,8 @@ pub struct Proxy {
     pub on_key_refused: RefCell<Option<Box<dyn Fn()>>>,
     /// Called after each answer of the Messages API with the model and the answer's usage.
     pub on_usage: RefCell<Option<UsageHook>>,
+    /// Called for each request about to go to the model, with its audit line and the bytes sent.
+    pub on_crossing: RefCell<Option<CrossingHook>>,
 }
 
 const CONNECT: Duration = Duration::from_secs(30);
@@ -228,7 +231,7 @@ impl Proxy {
         let route = Route { upstream: cfg.upstream.clone(), upstream_openai: cfg.upstream_openai.clone(),
                             upstream_key: cfg.upstream_key.clone(), drop_tool_namespaces: cfg.drop_tool_namespaces.clone() };
         Rc::new(Proxy { store, restore, cfg, route: RefCell::new(route), engines: RefCell::new(HashMap::new()), audited: RefCell::new(Vec::new()),
-                        on_key_refused: RefCell::new(None), on_usage: RefCell::new(None) })
+                        on_key_refused: RefCell::new(None), on_usage: RefCell::new(None), on_crossing: RefCell::new(None) })
     }
 
     /// The request's scope: its header, else the listed folder the agent works in, else the default.
@@ -365,6 +368,9 @@ impl Proxy {
         kinds.dedup();
         let line = json!({"at": now(), "actor": scope, "action": path, "plane": "cloud", "sensitivity": "Internal",
                           "sha256": content_hash(sent), "target": target, "entity_types": kinds, "redacted_count": mapping.len()});
+        if let Some(hook) = self.on_crossing.borrow().as_ref() {
+            hook(&line, sent);
+        }
         match &self.cfg.audit {
             Some(p) => append(p, &line),
             None => self.audited.borrow_mut().push(line),

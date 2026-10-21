@@ -6,6 +6,7 @@
 pub mod acp;
 pub mod cite;
 pub mod confine;
+pub mod disclosure;
 pub mod host;
 pub mod pricing;
 pub mod review;

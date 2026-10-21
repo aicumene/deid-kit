@@ -10,7 +10,7 @@
 //! told what it has not seen gets a brief made from the record the person sees.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::agents::acp::{self, AcpAgent, AcpError};
 use crate::agents::confine;
+use crate::agents::disclosure::{self, Added, Crossings};
 use crate::agents::pricing::{self, RequestUsage};
 use crate::agents::review;
 use crate::http::{Request, Response};
@@ -120,6 +121,11 @@ pub struct HostConfig {
     pub guard: Vec<String>,
     pub guard_log: Option<PathBuf>,
     pub person: String,
+    /// Ask the person before a task or a review sends anything to the model; each answer is kept in the
+    /// matter folder (`.legix/transfers`).
+    pub approve_transfers: bool,
+    /// Where the names the person hides are kept: a seed file, read again at start.
+    pub added_file: Option<PathBuf>,
 }
 
 impl HostConfig {
@@ -130,7 +136,8 @@ impl HostConfig {
                      usage_log: None, agents: Vec::new(), style: None, session_meta: None, subagents: None,
                      subagents_command: Vec::new(), subagents_timeout: 900.0, claude_confine: true, claude_shell: None, guard: Vec::new(),
                      guard_log: None,
-                     person: std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "person".into()) }
+                     person: std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "person".into()),
+                     approve_transfers: false, added_file: None }
     }
 }
 
@@ -908,6 +915,16 @@ struct State {
     upstream: String,
     upstream_openai: String,
     requests: Vec<RequestUsage>,
+    /// Each request that went to the model in this session.
+    crossings: Crossings,
+    /// The task or review under way, which the requests to the model serve ("" between them).
+    run: String,
+    /// The transfers waiting for the person's word.
+    approvals: HashMap<String, Option<oneshot::Sender<Value>>>,
+    /// What the person let go without being asked again: a document as it is now, or tasks.
+    approved: HashSet<String>,
+    /// The names the person hid.
+    added: Vec<Added>,
 }
 
 impl State {
@@ -988,7 +1005,9 @@ impl AgentHost {
         usage.insert("tasks".into(), json!(0));
         let st = State { events: Vec::new(), listeners: Vec::new(), permissions: HashMap::new(), busy: false,
                          baseline: snapshot(&cfg.folder), status: "starting".into(), key_refused_told: false, usage, agents,
-                         current, seats: Vec::new(), handover: None, upstream, upstream_openai, requests: Vec::new() };
+                         current, seats: Vec::new(), handover: None, upstream, upstream_openai, requests: Vec::new(),
+                         crossings: Crossings::default(), run: String::new(), approvals: HashMap::new(), approved: HashSet::new(),
+                         added: cfg.added_file.as_deref().map(disclosure::load_added).unwrap_or_default() };
         let host = Rc::new(AgentHost { cfg, proxy: proxy.clone(), st: RefCell::new(st) });
         let w = Rc::downgrade(&host);
         *proxy.on_key_refused.borrow_mut() = Some(Box::new(move || {
@@ -1000,6 +1019,17 @@ impl AgentHost {
         *proxy.on_usage.borrow_mut() = Some(Box::new(move |model: &str, usage: &Map<String, Value>| {
             if let Some(h) = w.upgrade() {
                 h.st.borrow_mut().requests.push(pricing::request_usage(usage, model));
+            }
+        }));
+        let w = Rc::downgrade(&host);
+        *proxy.on_crossing.borrow_mut() = Some(Box::new(move |line: &Value, sent: &str| {
+            if let Some(h) = w.upgrade() {
+                let meta = {
+                    let mut st = h.st.borrow_mut();
+                    let run = st.run.clone();
+                    st.crossings.add(line, sent, &run)
+                };
+                h.emit(json!({"kind": "crossing", "crossing": meta}));
             }
         }));
         host
@@ -1691,6 +1721,10 @@ impl AgentHost {
         for tx in waiting {
             let _ = tx.send(json!({"outcome": "cancelled"}));
         }
+        let asked: Vec<oneshot::Sender<Value>> = self.st.borrow_mut().approvals.values_mut().filter_map(Option::take).collect();
+        for tx in asked {
+            let _ = tx.send(json!({"verdict": "cancelled"}));
+        }
     }
 
     async fn stop_if_stuck(self: Rc<Self>, seat_name: String, after: Duration) {
@@ -1823,6 +1857,8 @@ impl AgentHost {
                 m.insert("status".into(), json!(st.status));
                 m.insert("busy".into(), json!(st.busy));
                 m.insert("auth".into(), json!(auth));
+                m.insert("approve_transfers".into(), json!(self.cfg.approve_transfers));
+                m.insert("person".into(), json!(self.cfg.person));
                 m.insert("models".into(), models.unwrap_or(Value::Null));
                 let handover = st.handover.as_ref().map(|h| h.name.clone());
                 let usage = st.usage.clone();
@@ -1842,14 +1878,17 @@ impl AgentHost {
                     return err(400, "empty task");
                 }
                 {
-                    let st = self.st.borrow();
+                    let mut st = self.st.borrow_mut();
                     if st.busy || st.status != "ready" || st.handover.is_some() {
                         return err(409, "the agent is busy or not ready");
                     }
+                    st.busy = true;
                 }
                 let host = self.clone();
-                tokio::task::spawn_local(async move { host.run_prompt(text, None, None).await });
-                jr(202, json!({"ok": true}))
+                let run = py::uuid4_hex()[..12].to_string();
+                let r = run.clone();
+                tokio::task::spawn_local(async move { host.task(text, r).await });
+                jr(202, json!({"ok": true, "run": run}))
             }
             ("permission", "POST") => {
                 let Some(b) = body().filter(Value::is_object) else { return server_error() };
@@ -1868,6 +1907,33 @@ impl AgentHost {
                 });
                 jr(200, json!({"ok": true}))
             }
+            ("approve", "POST") => {
+                let Some(b) = body().filter(Value::is_object) else { return server_error() };
+                let id = b.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                let verdict = match b.get("verdict").and_then(Value::as_str) {
+                    Some("approve" | "approved") => "approved",
+                    Some("refuse" | "refused") => "refused",
+                    _ => return err(400, "the verdict is approve or refuse"),
+                };
+                let tx = self.st.borrow_mut().approvals.get_mut(&id).and_then(Option::take);
+                let Some(tx) = tx else { return err(404, "no such request") };
+                let _ = tx.send(json!({"verdict": verdict, "remember": b.get("remember") == Some(&json!(true))}));
+                jr(200, json!({"ok": true}))
+            }
+            ("transfers", "GET") => {
+                let pending: Vec<String> = self.st.borrow().approvals.keys().cloned().collect();
+                jr(200, json!({"transfers": disclosure::transfers(&self.cfg.folder), "pending": pending,
+                               "asks": self.cfg.approve_transfers, "person": self.cfg.person}))
+            }
+            ("crossings", "GET") => {
+                let run = req.query("run").filter(|r| !r.is_empty());
+                let list = self.st.borrow().crossings.list(run.as_deref());
+                jr(200, json!({"crossings": list}))
+            }
+            ("crossing", "GET") => self.crossing_view(req.query("id").and_then(|i| i.parse::<u64>().ok())),
+            ("entity", "POST") => self.add_entity(body()),
+            ("entities", "GET") => self.entities_view(),
+            ("graph", "GET") => self.graph_view(),
             ("model", "POST") => {
                 let Some(b) = body().filter(Value::is_object) else { return server_error() };
                 let Some(value) = stripped(&b, "value") else { return server_error() };
@@ -1948,6 +2014,236 @@ impl AgentHost {
         resp
     }
 
+    // ── what crosses to the model ──
+
+    /// A task the person gave: asked about first when the person approves transfers, then run.
+    async fn task(self: Rc<Self>, text: String, run: String) {
+        if self.cfg.approve_transfers {
+            let summary = self.text_summary(&text);
+            if let Some(verdict) = self.approval("task", &run, Some("task".into()), summary).await {
+                self.st.borrow_mut().busy = false;
+                self.emit(json!({"kind": "turn_end", "stopReason": "not_approved", "verdict": verdict, "usage": {}, "seconds": 0.0}));
+                return;
+            }
+        }
+        self.st.borrow_mut().run = run;
+        self.clone().run_prompt(text, None, None).await;
+        self.st.borrow_mut().run.clear();
+    }
+
+    /// The person's word before `what` ("task" or "review") sends anything: None — approved, go on;
+    /// Some(verdict) — "refused" or "cancelled", nothing is sent. `remember`: what an approval the person
+    /// asks to keep covers (a document as it is now, or "task"); covered, it is not asked again. Each
+    /// approval and refusal is kept in the matter folder with who gave it.
+    async fn approval(self: &Rc<Self>, what: &str, run: &str, remember: Option<String>, summary: Value) -> Option<String> {
+        let id = py::uuid4_hex()[..16].to_string();
+        let standing = remember.as_ref().is_some_and(|k| self.st.borrow().approved.contains(k));
+        let (verdict, kept) = if standing {
+            ("approved".to_string(), true)
+        } else {
+            let (tx, rx) = oneshot::channel::<Value>();
+            self.st.borrow_mut().approvals.insert(id.clone(), Some(tx));
+            self.emit(json!({"kind": "approval", "state": "asked", "id": id, "what": what, "run": run, "person": self.cfg.person,
+                             "summary": summary}));
+            let answer = rx.await.unwrap_or_else(|_| json!({"verdict": "cancelled"}));
+            self.st.borrow_mut().approvals.remove(&id);
+            let verdict = answer["verdict"].as_str().unwrap_or("cancelled").to_string();
+            if verdict == "approved" && answer["remember"] == json!(true) {
+                if let Some(k) = &remember {
+                    self.st.borrow_mut().approved.insert(k.clone());
+                }
+            }
+            (verdict, false)
+        };
+        let mut record = Value::Null;
+        if verdict != "cancelled" {
+            let mut r = disclosure::transfer(&id, what, run, &self.cfg.person, &verdict, &summary);
+            r["standing"] = json!(kept);
+            match disclosure::store_transfer(&self.cfg.folder, &r) {
+                Ok(p) => record = json!(p.strip_prefix(&self.cfg.folder).unwrap_or(&p).to_string_lossy()),
+                Err(e) => log::warning(&format!("the transfer {id} was not recorded: {e}")),
+            }
+        }
+        self.emit(json!({"kind": "approval", "state": verdict, "id": id, "what": what, "run": run, "by": self.cfg.person,
+                         "standing": kept, "record": record}));
+        (verdict != "approved").then_some(verdict)
+    }
+
+    /// Where the model requests of the agent at work go.
+    fn destination(&self) -> String {
+        let responses = self.current().responses();
+        let r = self.proxy.route.borrow();
+        if responses { r.upstream_openai.clone() } else { r.upstream.clone() }
+    }
+
+    fn who_receives(&self) -> Value {
+        let agent = self.current().label();
+        json!({"to": self.destination(), "agent": agent, "model": self.model_name()})
+    }
+
+    /// What a task sends to begin with, for the person to approve: the task as the model reads it.
+    fn text_summary(&self, text: &str) -> Value {
+        let mut out = self.who_receives();
+        if let Ok(reds) = self.proxy.engine(&self.cfg.scope).tokenize_all(&[text.to_string()]) {
+            let spans = review::deid_spans(text, &reds[0].text, &reds[0].surfaces, &reds[0].mapping);
+            out.as_object_mut().unwrap().extend(disclosure::summary_of(text, &reds[0], &spans).as_object().unwrap().clone());
+            out["model_text"] = json!(reds[0].text);
+        }
+        out["task"] = json!(text);
+        out
+    }
+
+    /// What a review sends, for the person to approve: the document as it is now and what of it is hidden.
+    fn review_summary(&self, path: &str) -> Value {
+        let mut out = self.who_receives();
+        out["document"] = json!(path);
+        let Some((source, text)) = review::read_text(&self.cfg.folder, path) else { return out };
+        out["source"] = json!(source);
+        out["sha"] = json!(review::sha(&text));
+        if let Ok(reds) = self.proxy.engine(&self.cfg.scope).tokenize_all(&[text.clone()]) {
+            let spans = review::deid_spans(&text, &reds[0].text, &reds[0].surfaces, &reds[0].mapping);
+            out.as_object_mut().unwrap().extend(disclosure::summary_of(&text, &reds[0], &spans).as_object().unwrap().clone());
+        }
+        out
+    }
+
+    /// The vault's rows by token, and the names the person hid.
+    fn vault_now(&self) -> (HashMap<String, crate::store::TokenRef>, Vec<Added>) {
+        let store = &self.proxy.engine(&self.cfg.scope).store;
+        (disclosure::rows_by_token(store.load_tokens(&self.cfg.scope)), self.st.borrow().added.clone())
+    }
+
+    /// The vault's token for a name, if it has one.
+    fn token_of(&self, name: &str) -> Option<String> {
+        let store = &self.proxy.engine(&self.cfg.scope).store;
+        let scope = &self.cfg.scope;
+        crate::vault::Index::new(store.load_tokens(scope), store.load_aliases(scope), store.load_salt(scope)).token_for(name)
+    }
+
+    /// One request that went to the model, with its bytes and their check: they are the bytes the audit
+    /// line hashes, and no value the vault hides is among them.
+    fn crossing_view(&self, id: Option<u64>) -> Response {
+        let found = id.and_then(|id| {
+            let st = self.st.borrow();
+            st.crossings.get(id).map(|(m, b)| (m.clone(), b.map(str::to_string)))
+        });
+        match found {
+            None => err(404, "no such request"),
+            Some((mut meta, None)) => {
+                meta["kept"] = json!(false);
+                jr(200, meta)
+            }
+            Some((meta, Some(sent))) => {
+                let residual = self.proxy.engine(&self.cfg.scope).residual(&crate::proxy::anthropic::readable(&sent));
+                let mut out = disclosure::crossing(&meta, &sent, &residual);
+                out["kept"] = json!(true);
+                jr(200, out)
+            }
+        }
+    }
+
+    /// The person hides a name: the vault takes it at once (the next request carries its token), and it
+    /// is kept with who hid it, for the next start.
+    fn add_entity(&self, body: Option<Value>) -> Response {
+        let Some(b) = body.filter(Value::is_object) else { return err(400, "bad request") };
+        let text = |k: &str| py::strip(b.get(k).and_then(Value::as_str).unwrap_or("")).to_string();
+        let name = text("name");
+        let Some(kind) = disclosure::entity_type(&text("type")) else {
+            return err(400, "the type is person, organization, vessel, account or other");
+        };
+        if py::clen(&name) < 2 || py::clen(&name) > 200 || name.contains(['\n', '\r']) {
+            return err(400, "a name is 2 to 200 characters on one line");
+        }
+        let role: String = text("role").chars().take(80).collect();
+        let scope = self.cfg.scope.clone();
+        let engine = self.proxy.engine(&scope);
+        // the matter's own list first (once), then this name
+        if engine.tokenize_all(&[]).is_err() {
+            return server_error();
+        }
+        let seeds = crate::seeds::InMemorySeedSource::default();
+        seeds.add_entity(&scope, crate::seeds::SeedEntity { r#type: kind.into(), name: name.clone(), role: role.clone(), ..Default::default() });
+        if crate::vault::seed_from_scope(&*engine.store, &scope, Some(&seeds)).and_then(|_| engine.store.commit()).is_err() {
+            return server_error();
+        }
+        let Some(token) = self.token_of(&name) else {
+            return err(422, "the vault did not take this name: a single common word, or too short");
+        };
+        let added = Added { kind: kind.into(), name: name.clone(), role, by: self.cfg.person.clone(), at: py::utc_seconds() };
+        let kept = {
+            let mut st = self.st.borrow_mut();
+            if !st.added.iter().any(|a| crate::namefold::key(&a.name) == crate::namefold::key(&name)) {
+                st.added.push(added.clone());
+            }
+            match &self.cfg.added_file {
+                Some(f) => match disclosure::save_added(f, &scope, &st.added) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warning(&format!("the hidden names were not kept: {e}"));
+                        false
+                    }
+                },
+                None => false,
+            }
+        };
+        let kind_of = token.rsplit_once('_').map_or(token.as_str(), |(k, _)| k).to_string();
+        self.emit(json!({"kind": "hidden", "token": token, "type": kind_of, "name": name, "by": added.by}));
+        jr(200, json!({"token": token, "type": kind_of, "name": name, "why": "added", "by": added.by, "at": added.at, "kept": kept}))
+    }
+
+    fn entities_view(&self) -> Response {
+        let added = self.st.borrow().added.clone();
+        let list: Vec<Value> = added.iter().map(|a| json!({"type": a.kind, "name": a.name, "role": a.role, "by": a.by, "at": a.at,
+                                                           "token": self.token_of(&a.name)})).collect();
+        jr(200, json!({"entities": list}))
+    }
+
+    /// The matter as a graph: its documents, the people and organisations in them — hidden, or in clear
+    /// where they look like names —, and the clauses its reviews found, with who acts and for whom.
+    fn graph_view(&self) -> Response {
+        const MAX_DOCS: usize = 400;
+        let engine = self.proxy.engine(&self.cfg.scope);
+        let mut files = Vec::new();
+        walk(&self.cfg.folder, &self.cfg.folder, &|d| SKIP_DIRS.contains(&d), &mut files);
+        let mut docs = Vec::new();
+        let mut skipped = 0usize;
+        for p in files {
+            let rel = p.strip_prefix(&self.cfg.folder).unwrap_or(&p).to_string_lossy().into_owned();
+            let Some((_, text)) = review::read_text(&self.cfg.folder, &rel) else { continue };
+            if docs.len() >= MAX_DOCS {
+                skipped += 1;
+                continue;
+            }
+            let Ok(reds) = engine.tokenize_all(&[text.clone()]) else { return server_error() };
+            let red = &reds[0];
+            let spans = review::deid_spans(&text, &red.text, &red.surfaces, &red.mapping);
+            let ranges: Vec<(usize, usize)> = spans.iter().filter_map(|s| Some((s["start"].as_u64()? as usize, s["end"].as_u64()? as usize))).collect();
+            let mut events = Vec::new();
+            for n in review::view(&self.cfg.folder, &rel, &text)["notes"].as_array().into_iter().flatten() {
+                let f = |k: &str| n[k].as_str().unwrap_or("").to_string();
+                if f("who").is_empty() && f("what").is_empty() && f("when").is_empty() {
+                    continue;
+                }
+                let tokens = |k: &str| -> Vec<String> {
+                    if f(k).is_empty() {
+                        return Vec::new();
+                    }
+                    engine.tokenize_all(&[f(k)]).map(|r| r[0].mapping.keys().map(str::to_string).collect()).unwrap_or_default()
+                };
+                events.push(json!({"id": n["id"], "note": f("kind"), "what": f("what"), "who": f("who"), "to_whom": f("to_whom"), "when": f("when"),
+                                   "clause_type": f("clause_type"), "aspect": f("aspect"), "importance": n["importance"],
+                                   "quote": f("quote"), "start": n["start"], "end": n["end"], "state": f("state"),
+                                   "who_tokens": tokens("who"), "to_whom_tokens": tokens("to_whom")}));
+            }
+            docs.push(disclosure::GraphDoc { path: rel, tokens: disclosure::token_counts(&spans),
+                                             candidates: disclosure::candidates(&text, &ranges), events });
+        }
+        let (rows, added) = self.vault_now();
+        let by_token = disclosure::added_tokens(&added, &|n| self.token_of(n));
+        let names = disclosure::names_of(&rows);
+        jr(200, json!({"graph": disclosure::graph(&docs, &rows, &names, &by_token), "documents": docs.len(), "skipped": skipped}))
+    }
+
     // ── review ──
 
     fn review_view(&self, path: &str) -> Response {
@@ -1968,6 +2264,9 @@ impl AgentHost {
         m.insert("path".into(), json!(path));
         m.insert("source".into(), json!(source));
         m.insert("text".into(), json!(text));
+        let (rows, added) = self.vault_now();
+        let by_token = disclosure::added_tokens(&added, &|n| self.token_of(n));
+        m.insert("hidden".into(), disclosure::hidden(&text, red, &deid, &rows, &by_token));
         m.insert("deid".into(), json!(deid));
         m.insert("norms".into(), json!(review::norm_mentions(&text)));
         m.extend(review::view(&self.cfg.folder, path, &text).as_object().unwrap().clone());
@@ -2147,7 +2446,11 @@ impl AgentHost {
     }
 
     async fn run_review(self: Rc<Self>, path: String, source: String, run: String, reviewer: Option<AgentChoice>) {
-        let Some(reviewer) = reviewer else { return self.review(path, source, run).await };
+        let Some(reviewer) = reviewer else {
+            self.clone().review(path, source, run).await;
+            self.st.borrow_mut().run.clear();
+            return;
+        };
         let back = self.current();
         if !self.at_work(reviewer.clone()).await {
             self.emit(json!({"kind": "review", "state": "failed", "path": path, "run": run, "agent": reviewer.label(),
@@ -2155,6 +2458,7 @@ impl AgentHost {
         } else {
             self.clone().review(path, source, run).await;
         }
+        self.st.borrow_mut().run.clear();
         self.st.borrow_mut().busy = true;
         if self.current().name != back.name {
             self.at_work(back).await;
@@ -2164,6 +2468,17 @@ impl AgentHost {
 
     async fn review(self: Rc<Self>, path: String, source: String, run: String) {
         let agent = self.current().label();
+        if self.cfg.approve_transfers {
+            let summary = self.review_summary(&path);
+            let remember = summary["sha"].as_str().map(|sha| format!("review:{path}:{sha}"));
+            if self.approval("review", &run, remember, summary).await.is_some() {
+                self.st.borrow_mut().busy = false;
+                self.emit(json!({"kind": "review", "state": "failed", "path": path, "run": run, "agent": agent, "refused": true,
+                                 "text": "Nothing was sent: the review was not approved."}));
+                return;
+            }
+        }
+        self.st.borrow_mut().run = run.clone();
         self.emit(json!({"kind": "review", "state": "started", "path": path, "run": run, "agent": agent}));
         let at = self.st.borrow().events.len();
         self.st.borrow_mut().busy = false;

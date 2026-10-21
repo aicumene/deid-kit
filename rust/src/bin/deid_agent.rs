@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use deidkit::agents::confine;
+use deidkit::agents::{confine, disclosure};
 use deidkit::agents::host::{shlex_split, AgentChoice, AgentHost, HostConfig};
 use deidkit::cli::{self, flag, opt, Opt};
 use deidkit::patterns::RegexDetector;
@@ -62,6 +62,8 @@ connection passed on to the port: a container's published socket, which reaches 
     none("--guard", "", "agent-guard, which decides each of Claude Code's tool calls before it runs"),
     flag("--no-guard", "start Claude Code without agent-guard"),
     none("--person", "", "who the person at this Mac is, in the notes and decisions they make on documents"),
+    flag("--approve-transfers", "ask the person before a task or a review sends anything to the model; each answer is \
+kept in the matter folder (.legix/transfers)"),
     opt("--upstream", "https://api.anthropic.com", "where the agent's model requests go"),
     opt("--api-key-env", "ANTHROPIC_API_KEY", "environment variable holding the organization's key"),
     flag("--secrets-stdin", "read the page token and the key as one JSON line on stdin"),
@@ -305,11 +307,18 @@ fn main() {
         cfg.token = token.clone();
     }
     let files = seed_files(&args.all("--seeds"), args.get("--seeds-dir"));
-    let store = match SqliteTokenStore::open(&py::expanduser(&args.str("--vault"))) {
+    let vault = py::expanduser(&args.str("--vault"));
+    cfg.approve_transfers = args.on("--approve-transfers");
+    cfg.added_file = Some(disclosure::added_file(&vault, &scope));
+    let store = match SqliteTokenStore::open(&vault) {
         Ok(s) => Rc::new(s),
         Err(e) => die(&format!("deid-agent: {e}")),
     };
     let seeds = load_seed_files(&files, &scope, InMemorySeedSource::default()).unwrap_or_else(|e| die(&format!("deid-agent: {e}")));
+    // the names the person hid on the page, as the matter's own list
+    for a in cfg.added_file.as_deref().map(disclosure::load_added).unwrap_or_default() {
+        seeds.add_entity(&scope, SeedEntity { r#type: a.kind, name: a.name, role: a.role, ..SeedEntity::default() });
+    }
     if let Some(account) = account_name() {
         seeds.add_entity(&scope, SeedEntity { r#type: "account".into(), name: account, identifier: String::new(),
                                               identifier_type: String::new(), jurisdiction_country: String::new(),

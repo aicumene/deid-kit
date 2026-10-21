@@ -231,6 +231,55 @@ enable_request_compression = false
   change it was about, and each revision a person made over a document an agent wrote — every text
   in them tokenized by the scope's engine, the person a role and not a name: data for the harness
   and for learning (RL) that can leave the Mac.
+- **What crosses, shown to the person, who answers for it** (21 October 2026; Rust only, no Python
+  twin: `rust/src/agents/disclosure.rs`).
+  - *Why each passage is hidden.* The review's `hidden` gives the text exactly as the model is sent it
+    (`model_text`), each token with its real name, how often it stands there, and why the vault hides
+    it: `added` (by the person, with who and when), `list` (the matter's seed list), `party`,
+    `identifier` (of a listed name), `mailbox` (a name read from an e-mail address), `pattern` (an
+    e-mail address, IBAN, card or phone number), `name part`, `address`, `vault` (learned earlier). It
+    also gives the counts by type, any token the walk could not place, and `candidates`: words that
+    look like a person's or an organisation's name but are not hidden. Those are judged by the vault's
+    own rules for a person's name and by its legal forms for an organisation, once a phrase's opening
+    words ("The", "Dear") are dropped.
+  - *The person hides a name.* `POST entity` with `{"type": "person" | "organization" | "vessel" |
+    "account" | "other", "name", "role"?}` enrols the name at once, so the next request carries its
+    token, and answers with the token. The name is kept with who hid it and when, in a seed file only
+    its owner reads (`<the vault's folder>/entities/<scope>-<hash>.toml`, 0600). It is read again at
+    every start, so a new vault hides it too. `GET entities` lists these names.
+  - *The model's echo of a name hidden since.* Every turn, the proxy resends the model's own words
+    exactly as the model wrote them, so the prompt cache holds. A name the model wrote in clear, before
+    the person hid it, would then cross in clear on every later turn. Now those words go back
+    tokenized instead, both in Messages and in Responses (`anthropic::safe_restores`;
+    `tests/restore_after_enrolment.rs`).
+  - *What went to the model.* Every request is recorded as it leaves: the audit line, the task or
+    review it served (`run`), and its bytes, which are kept until they pass 64 MB in all. `GET
+    crossings` (`?run=` for one run) lists them, and a `crossing` event announces each one. `GET
+    crossing?id=` gives one request's bytes with a check made on the spot:
+    - the bytes hash to the audit line's SHA-256;
+    - no value the vault now hides is among them. A request checked after the person hid a name it
+      carried says so.
+  - *The person's approval* (`--approve-transfers`). A task (`POST prompt`) or a review (`POST review`)
+    sends nothing until the person answers its `approval` event. The event carries a summary: the task
+    as the model reads it, or the document and its SHA-256; what is hidden, by type; the likely names
+    left in clear; where the requests go; the agent and the model. The person answers with `POST
+    approve {"id", "verdict": "approve" | "refuse", "remember"?}`:
+    - `remember` covers that document while it is unchanged, or tasks for the session;
+    - refused, a task ends with `turn_end` (`not_approved`), and a review with `failed` and `refused`;
+    - `cancel` withdraws the question.
+
+    Each approval and refusal is kept in `.legix/transfers/<id>.json` with who gave it and when, and a
+    standing approval is recorded each time it is used. `GET transfers` lists them.
+  - *The matter as a graph.* `GET graph` returns nodes and edges:
+    - nodes: the folder's documents; the people and organisations in them, hidden or in clear (a
+      name part counts as its owner; e-mail addresses and numbers are counted on the document, not
+      drawn); and the events its reviews found (who does what, for whom, and when, linked to the
+      tokens their who and for-whom name);
+    - edges: a document mentions a party, an event is in a document, a party acts in an event or it
+      is done for them.
+
+  `tests/disclosure.rs` drives all of this end to end with deid-agent itself, the scripted agent and a
+  stand-in model server.
 - **Not applied yet.** Initials of a known person that no document defines, which the vault can
   tokenize (`deidkit.address.tokenize_initials`), are not yet applied by the proxy.
 
