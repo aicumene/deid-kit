@@ -193,8 +193,24 @@ fn runs(t: &[char]) -> Vec<Vec<(usize, usize)>> {
 const OPENERS: [&str; 18] = ["the", "a", "an", "this", "that", "der", "die", "das", "ein", "eine", "le", "la", "les", "el", "il",
                              "dear", "sehr", "geehrte"];
 
+/// Words that name a document or a part of one: a run of capitalised words with one of them is a title or a heading
+/// ("Supply Agreement", "General Terms", "Annex Standard Contractual Clauses"), never a person. An organisation that
+/// carries a legal form is found before this (Bernio, 22.10.2026: a contract's own title was offered as a name the
+/// model could read).
+const DOCUMENT_WORDS: [&str; 64] = [
+    "agreement", "agreements", "contract", "contracts", "terms", "conditions", "schedule", "schedules", "annex", "annexes",
+    "appendix", "appendices", "exhibit", "addendum", "amendment", "policy", "deed", "lease", "licence", "license",
+    "memorandum", "protocol", "statement", "clause", "clauses", "section", "article", "chapter", "definitions",
+    "recitals", "preamble", "order", "notice", "invoice", "specification", "regulation", "directive",
+    "vertrag", "vereinbarung", "anlage", "anhang", "bedingungen", "geschäftsbedingungen", "nachtrag", "satzung",
+    "protokoll", "verordnung", "richtlinie", "vollmacht",
+    "договор", "соглашение", "приложение", "дополнение", "устав", "доверенность", "положение",
+    "contrat", "accord", "annexe", "contrato", "acuerdo", "anexo", "contratto", "allegato",
+];
+
 /// `(kind, start, end)` of the name a run holds, by the vault's own rules for a person and its legal
-/// forms for an organisation, once the words that open a phrase are dropped.
+/// forms for an organisation, once the words that open a phrase are dropped; a run with a word that names a
+/// document is no person ([`DOCUMENT_WORDS`]).
 fn name_in(t: &[char], run: &[(usize, usize)]) -> Option<(&'static str, usize, usize)> {
     let word = |i: usize| t[run[i].0..run[i].1].iter().collect::<String>();
     let mut from = 0;
@@ -208,6 +224,9 @@ fn name_in(t: &[char], run: &[(usize, usize)]) -> Option<(&'static str, usize, u
     let surface: String = t[s..e].iter().collect();
     if nf::has_legal_form(&surface) && nf::strip_legal_form(&surface).iter().any(|p| !nf::is_common_word(p)) {
         return Some(("organization", s, e));
+    }
+    if (from..run.len()).any(|i| DOCUMENT_WORDS.contains(&word(i).to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()))) {
+        return None;
     }
     nf::admit_person(&surface).0.then_some(("person", s, e))
 }

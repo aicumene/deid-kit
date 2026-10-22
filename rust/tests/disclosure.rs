@@ -387,3 +387,18 @@ fn without_the_flag_nothing_is_asked() {
     assert!(!seen.iter().any(|e| e["kind"] == "approval"), "{seen:#?}");
     assert!(records(&m).is_empty());
 }
+
+/// A contract's own title and headings are no names to hide (Bernio, 22.10.2026: "Supply Agreement" was offered as a
+/// name the model could read); the people and companies in it still are.
+#[test]
+fn a_title_or_a_heading_is_not_offered_as_a_name() {
+    let text = "# Supply Agreement\n\n## General Terms\n\nAnnex Standard Contractual Clauses apply. \
+                Tamsin Okafor signs for Brightwater Maritime Ltd under the Liefervertrag Anlage.";
+    let found: Vec<(String, String)> = deidkit::agents::disclosure::candidates(text, &[]).iter()
+        .map(|c| (c["text"].as_str().unwrap().to_string(), c["kind"].as_str().unwrap().to_string())).collect();
+    let texts: Vec<&str> = found.iter().map(|(t, _)| t.as_str()).collect();
+    assert!(!texts.iter().any(|t| t.contains("Agreement") || t.contains("Terms") || t.contains("Clauses") || t.contains("Anlage")),
+            "no title or heading: {found:?}");
+    assert!(found.contains(&("Tamsin Okafor".into(), "person".into())), "{found:?}");
+    assert!(found.iter().any(|(t, k)| t.contains("Brightwater Maritime Ltd") && k == "organization"), "{found:?}");
+}
