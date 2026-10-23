@@ -32,7 +32,9 @@ use crate::{log, py};
 
 const HOP: [&str; 13] = ["host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
     "proxy-authorization", "proxy-connection", "accept-encoding", "content-encoding", "x-deid-scope"];
-const BACK_DROP: [&str; 5] = ["content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"];
+/// The path of ChatGPT's backend: `chatgpt_base_url` of a confined Codex is deid-agent's own, under it.
+pub const CHATGPT_BACKEND: &str = "/backend-api/";
+const BACK_DROP: [&str; 5] =["content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"];
 
 pub struct ProxyConfig {
     pub default_scope: String,
@@ -302,8 +304,14 @@ impl Proxy {
         if chatgpt { self.cfg.upstream_chatgpt.trim_end_matches('/').to_string() } else { self.route.borrow().upstream_openai.trim_end_matches('/').to_string() }
     }
 
-    /// Where a request goes: Anthropic for Claude Code, OpenAI or ChatGPT for Codex.
+    /// Where a request goes: Anthropic for Claude Code, OpenAI or ChatGPT for Codex — and ChatGPT's backend itself for
+    /// Codex's own calls there (its plan, its limits, its workspace's policies), which a confined Codex makes here.
     pub fn url(&self, req: &Request) -> String {
+        if req.path.starts_with(CHATGPT_BACKEND) {
+            let base = &self.cfg.upstream_chatgpt;
+            let origin = base.find(CHATGPT_BACKEND).map_or(base.trim_end_matches('/'), |i| &base[..i]);
+            return origin.to_string() + &req.path_qs;
+        }
         if req.path.ends_with("/responses") || req.header("chatgpt-account-id").is_some() || req.header("originator").is_some() {
             let path = req.path_qs.strip_prefix("/v1").unwrap_or(&req.path_qs);
             return self.openai_base(req) + path;

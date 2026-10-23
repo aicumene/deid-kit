@@ -29,7 +29,7 @@ use crate::agents::disclosure::{self, Added, Crossings};
 use crate::agents::pricing::{self, RequestUsage};
 use crate::agents::review;
 use crate::http::{Request, Response};
-use crate::proxy::server::Proxy;
+use crate::proxy::server::{Proxy, CHATGPT_BACKEND};
 use crate::pyre::{self, Regex};
 use crate::{log, py, pyjson};
 
@@ -1290,6 +1290,10 @@ impl AgentHost {
                     }
                 }
                 if self.cfg.codex_confine {
+                    // its calls to ChatGPT's own backend come here too: its network reaches deid-agent alone
+                    let mut codex_args = codex_args.clone();
+                    codex_args.extend(["-c".to_string(), format!("chatgpt_base_url={}", py::dumps(&json!(
+                        format!("{base_url}{CHATGPT_BACKEND}"))))]);
                     let extra_read = server.as_ref().map(|s| self.subagent_paths(s)).unwrap_or_default();
                     let made = dir.as_ref().ok_or_else(|| confine::ConfinementUnavailable("no folder for its profile".into()))
                         .and_then(|d| confine::confined_codex(&self.cfg.folder.to_string_lossy(), self.cfg.codex_executable.as_deref(), d,
@@ -1392,6 +1396,7 @@ impl AgentHost {
                 m.insert("mcpStartupAwaitTimeoutMs".into(), json!(30000));
                 meta = Some(Value::Object(m));
             }
+            crate::http::take_refused();
             let started: Result<(Value, String), AcpError> = async {
                 let info = agent.start().await?;
                 let servers = match &server {
@@ -1418,7 +1423,11 @@ impl AgentHost {
                 }
                 Err(e) => {
                     log::error(&format!("the agent did not start: {e}"));
-                    self.fail(format!("The agent did not start: {e}"));
+                    let refused = crate::http::take_refused();
+                    let why = if refused.is_empty() { String::new() } else {
+                        format!(" It could not reach {}: an agent here reaches only deid-agent and its sign-in.", refused.join(", "))
+                    };
+                    self.fail(format!("The agent did not start: {e}.{why}"));
                 }
             }
         })

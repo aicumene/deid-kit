@@ -191,12 +191,29 @@ pub async fn serve_with_tunnels(listener: TcpListener, handler: Handler, tunnels
     }
 }
 
+thread_local! {
+    static REFUSED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The places a CONNECT was refused for since the last call, each once, in the order first refused: what an agent
+/// that did not start was kept from.
+pub fn take_refused() -> Vec<String> {
+    REFUSED.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
 /// A CONNECT: a tunnel to one of `tunnels`, any other refused — and said so in the log.
 async fn tunnel(tunnels: &[String], req: hyper::Request<Incoming>) -> hyper::Response<OutBody> {
     let Some((host, port)) = req.uri().authority().map(|a| (a.host().to_ascii_lowercase(), a.port_u16().unwrap_or(443))) else {
         return build(Response::text(400, "CONNECT names host:port"));
     };
     if !tunnels.iter().any(|t| t.eq_ignore_ascii_case(&format!("{host}:{port}"))) {
+        let place = format!("{host}:{port}");
+        REFUSED.with(|r| {
+            let mut r = r.borrow_mut();
+            if !r.contains(&place) {
+                r.push(place);
+            }
+        });
         crate::log::warning(&format!("refused an agent's connection to {host}:{port}: it reaches only deid-agent and its sign-in"));
         return build(Response::text(403, &format!("deid-agent opens no connection to {host}:{port}")));
     }
