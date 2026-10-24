@@ -188,8 +188,12 @@ pub struct Route {
     pub upstream: String,
     pub upstream_openai: String,
     pub upstream_key: Option<String>,
-    /// `upstream` is the agent's own server (`--agent-upstream`), and `upstream_key` the key it takes.
+    /// `upstream` is the agent's own server (`--agent-upstream`), and `upstream_key` the key it takes, if any: no
+    /// credential a request brings goes to it.
     pub own: bool,
+    /// Only requests with the agent's stand-in (`agent_key`) go on: with a key held, and at the own server of an agent
+    /// that carries the stand-in.
+    pub guarded: bool,
     pub drop_tool_namespaces: HashSet<String>,
 }
 
@@ -233,7 +237,8 @@ fn back_headers(up: &http::Upstream) -> Headers {
 impl Proxy {
     pub fn new(store: Rc<dyn TokenStore>, restore: Rc<dyn RestoreTable>, cfg: ProxyConfig) -> Rc<Proxy> {
         let route = Route { upstream: cfg.upstream.clone(), upstream_openai: cfg.upstream_openai.clone(),
-                            upstream_key: cfg.upstream_key.clone(), own: false, drop_tool_namespaces: cfg.drop_tool_namespaces.clone() };
+                            upstream_key: cfg.upstream_key.clone(), own: false, guarded: cfg.upstream_key.is_some(),
+                            drop_tool_namespaces: cfg.drop_tool_namespaces.clone() };
         Rc::new(Proxy { store, restore, cfg, route: RefCell::new(route), engines: RefCell::new(HashMap::new()), audited: RefCell::new(Vec::new()),
                         on_key_refused: RefCell::new(None), on_usage: RefCell::new(None), on_crossing: RefCell::new(None) })
     }
@@ -271,16 +276,16 @@ impl Proxy {
         out.retain(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding"));
         out.push(("Accept-Encoding".into(), "identity".into()));
         let (key, own) = { let r = self.route.borrow(); (r.upstream_key.clone(), r.own) };
-        if let Some(key) = key {
-            let lend = self.from_agent(req);
+        // the credentials a request brings stay here: at Anthropic the key held goes instead, at an own server its key or none
+        if key.is_some() || own {
             out.retain(|(k, _)| !k.eq_ignore_ascii_case("x-api-key") && !k.eq_ignore_ascii_case("authorization"));
-            if lend {
-                // an own server may read either: llama-server and OpenAI's shape the bearer, Anthropic's shape x-api-key
-                if own {
-                    out.push(("Authorization".into(), format!("Bearer {key}")));
-                }
-                out.push(("x-api-key".into(), key));
+        }
+        if let Some(key) = key.filter(|_| self.from_agent(req)) {
+            // an own server may read either: llama-server and OpenAI's shape the bearer, Anthropic's shape x-api-key
+            if own {
+                out.push(("Authorization".into(), format!("Bearer {key}")));
             }
+            out.push(("x-api-key".into(), key));
         }
         out
     }
@@ -298,8 +303,12 @@ impl Proxy {
                 return None;
             }
             log::warning(&format!("refused {} {}: not the agent's key", req.method, req.path));
-            return Some(error(401, if self.route.borrow().own { "deid proxy: this proxy holds the model server's key and lends it only to its own agent" }
-                                   else { "deid proxy: this proxy holds the organization's key and lends it only to its own agent" }));
+            let (own, keyed) = { let r = self.route.borrow(); (r.own, r.upstream_key.is_some()) };
+            return Some(error(401, match (own, keyed) {
+                (true, true) => "deid proxy: this proxy holds the model server's key and lends it only to its own agent",
+                (true, false) => "deid proxy: only the agent at work reaches its own model server",
+                _ => "deid proxy: this proxy holds the organization's key and lends it only to its own agent",
+            }));
         }
         let own = self.route.borrow().own;
         if (!own && req.path.ends_with("/responses")) || !self.url(req).starts_with(self.route.borrow().upstream.trim_end_matches('/')) {
@@ -336,7 +345,7 @@ impl Proxy {
         if req.header("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
             return Response::text(426, "deid proxy: HTTP only");
         }
-        if self.route.borrow().upstream_key.is_some() {
+        if self.route.borrow().guarded {
             if let Some(refused) = self.lend_key(&req) {
                 return refused;
             }

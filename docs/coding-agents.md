@@ -170,7 +170,9 @@ enable_request_compression = false
   (llama-server's `--api-key`, Strata) gets it from the secrets line: `--secrets-stdin` with
   `"upstream_keys": {"NAME": "…"}`. The proxy holds the key and the agent gets a stand-in, as with the
   organization's key. Only the agent's requests go out with it, as `Authorization: Bearer` and
-  `x-api-key`, and a refusal is told as that server's. `--agent-unavailable NAME=REASON`
+  `x-api-key`, and a refusal is told as that server's. With or without a key, an own server gets only
+  the agent's requests (those with its stand-in), and no credential a request brings: an idle Claude
+  Code's background requests, with its own sign-in, are refused. `--agent-unavailable NAME=REASON`
   lists an agent that cannot start on this machine, and why, without offering it. The usage line
   names the agent.
 - **Switching keeps the work.** Each agent the person has worked with keeps its process and session

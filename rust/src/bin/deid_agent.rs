@@ -338,8 +338,9 @@ fn main() {
         scope_paths: load_scope_paths(&files, &scope).unwrap_or_default(), detector: Some(Rc::new(RegexDetector::default())),
         record: args.get("--record").filter(|r| !r.is_empty()).map(py::expanduser),
         audit: Some(py::expanduser(&args.str("--audit"))),
-        // the stand-in the agents send: for the organization's key and for the keys of their own servers
-        upstream_key: api_key.clone(), agent_key: (api_key.is_some() || !upstream_keys.is_empty()).then(|| cfg.agent_key.clone()),
+        // the stand-in the agents send: for the organization's key, and at their own servers (with a key or without)
+        upstream_key: api_key.clone(),
+        agent_key: (api_key.is_some() || cfg.agents.iter().any(|c| c.upstream.is_some())).then(|| cfg.agent_key.clone()),
         ..ProxyConfig::default()
     };
     let url = format!("http://127.0.0.1:{port}/{}", if token.is_empty() { format!("#t={}", cfg.token) } else { String::new() });

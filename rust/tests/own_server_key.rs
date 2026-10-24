@@ -3,7 +3,8 @@
 //! The key of an agent's own model server (`upstream_keys` of `--secrets-stdin`), end to end with deid-agent itself and
 //! the scripted agent tests/fake_acp_agent.py: the proxy holds the key and the agent gets a stand-in, as with the
 //! organization's key; only the agent's requests reach its server with the key, as both headers an own server may read
-//! (`Authorization: Bearer` and `x-api-key`); a key the server refuses is told as that server's. Needs python3.
+//! (`Authorization: Bearer` and `x-api-key`); a key the server refuses is told as that server's. An own server without
+//! a key gets the agent's requests too and no one else's, and no credential a request brings. Needs python3.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -30,8 +31,9 @@ struct Seen {
     api_key: Option<String>,
 }
 
-/// A stand-in for the agent's own server: takes `SERVER_KEY` in either header, else answers 401 as llama-server does.
-fn server() -> (u16, Arc<Mutex<Vec<Seen>>>) {
+/// A stand-in for the agent's own server: `keyed`, it takes `SERVER_KEY` in either header, else answers 401 as
+/// llama-server does; not, it takes any request.
+fn server(keyed: bool) -> (u16, Arc<Mutex<Vec<Seen>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -58,7 +60,7 @@ fn server() -> (u16, Arc<Mutex<Vec<Seen>>>) {
             let mut body = vec![0u8; length];
             r.read_exact(&mut body).unwrap();
             let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
-            let ok = authorization.as_deref() == Some(&format!("Bearer {SERVER_KEY}")) || api_key.as_deref() == Some(SERVER_KEY);
+            let ok = !keyed || authorization.as_deref() == Some(&format!("Bearer {SERVER_KEY}")) || api_key.as_deref() == Some(SERVER_KEY);
             s.lock().unwrap().push(Seen { path: path.clone(), authorization, api_key });
             let (status, answer) = match (ok, path.as_str()) {
                 (false, _) => ("401 Unauthorized", json!({"error": {"code": 401, "message": "Invalid API Key", "type": "authentication_error"}})),
@@ -108,11 +110,12 @@ fn command(name: &str, upstream: u16) -> (Command, PathBuf, u16) {
     (cmd, root, port)
 }
 
-/// deid-agent with `Local` on its own server at `upstream`, the server's key `key` in the secrets on stdin.
+/// deid-agent with `Local` on its own server at `upstream`, the server's key `key` (if any) in the secrets on stdin.
 fn start(name: &str, upstream: u16, key: &str) -> Agent {
     let (mut cmd, root, port) = command(name, upstream);
     let mut child = cmd.spawn().unwrap();
-    writeln!(child.stdin.take().unwrap(), "{}", json!({"token": TOKEN, "upstream_keys": {"Local": key}})).unwrap();
+    let secrets = if key.is_empty() { json!({"token": TOKEN}) } else { json!({"token": TOKEN, "upstream_keys": {"Local": key}}) };
+    writeln!(child.stdin.take().unwrap(), "{secrets}").unwrap();
     let agent = Agent { child, port, root };
     let until = Instant::now() + Duration::from_secs(30);
     while Instant::now() < until {
@@ -186,7 +189,7 @@ fn ask(a: &Agent, key: &str) -> u16 {
 
 #[test]
 fn an_own_servers_key_goes_only_with_the_agents_requests_and_in_both_headers() {
-    let (upstream, seen) = server();
+    let (upstream, seen) = server(true);
     let a = start("lend", upstream, SERVER_KEY);
     let stand_in = lent(&a);
     assert!(stand_in != SERVER_KEY && stand_in.starts_with("deid-agent-"), "the agent gets a stand-in, not the key: {stand_in}");
@@ -204,9 +207,30 @@ fn an_own_servers_key_goes_only_with_the_agents_requests_and_in_both_headers() {
     assert_eq!((status, models["data"][0]["id"].as_str()), (200, Some("local-model")), "the agent asks its server for the window too");
 }
 
+/// Without a key the agent still gets a stand-in, and the server gets only its requests, with no credential:
+/// not an idle Claude Code's background request with its own sign-in.
+#[test]
+fn a_keyless_own_server_gets_only_the_agents_requests_and_no_ones_credentials() {
+    let (upstream, seen) = server(false);
+    let a = start("keyless", upstream, "");
+    let stand_in = lent(&a);
+    assert!(stand_in.starts_with("deid-agent-"), "the agent gets a stand-in without a key too: {stand_in}");
+    let body = json!({"model": "local-model", "max_tokens": 10, "messages": [{"role": "user", "content": "Hello"}]});
+    let (status, _) = request(a.port, "POST", "/v1/messages", &[("x-api-key", &stand_in), ("Authorization", "Bearer someones-own-sign-in")],
+                              Some(&body)).unwrap();
+    assert_eq!(status, 200);
+    let last = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!((last.authorization, last.api_key), (None, None), "no credential goes to the own server");
+    let before = seen.lock().unwrap().len();
+    let (status, _) = request(a.port, "POST", "/v1/messages/count_tokens", &[("Authorization", "Bearer someones-own-sign-in")],
+                              Some(&body)).unwrap();
+    assert_eq!(status, 401, "a request without the stand-in is refused");
+    assert_eq!(seen.lock().unwrap().len(), before, "and never reaches the server");
+}
+
 #[test]
 fn a_key_the_own_server_refuses_is_told_as_that_servers() {
-    let (upstream, _) = server();
+    let (upstream, _) = server(true);
     let a = start("refused", upstream, "a-wrong-key");
     let rx = events(a.port);
     let stand_in = lent(&a);

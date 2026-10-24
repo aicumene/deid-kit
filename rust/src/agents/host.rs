@@ -1175,8 +1175,10 @@ impl AgentHost {
         Some(json!({"current": st.current.name, "options": options}))
     }
 
-    /// Point the proxy at `choice`'s model; whether the agent is lent the key: the organization's for Anthropic, or
-    /// the one its own server takes (`upstream_key`).
+    /// Point the proxy at `choice`'s model; whether the agent is lent the stand-in: for the organization's key at
+    /// Anthropic, and always at its own server (with the key that server takes, `upstream_key`, or none), where only
+    /// the agent at work may reach — not an idle Claude Code's background requests with its own sign-in. Codex never
+    /// carries the stand-in (its provider sends its own sign-in), so its own server is not guarded so.
     pub fn route(&self, choice: &AgentChoice) -> bool {
         let own_server = choice.upstream.is_some();
         let (upstream, upstream_openai) = {
@@ -1197,8 +1199,9 @@ impl AgentHost {
             (false, false) => self.cfg.api_key.clone(),
         }.filter(|k| !k.is_empty());
         r.own = own_server;
+        r.guarded = r.upstream_key.is_some() || (own_server && !choice.codex());
         r.drop_tool_namespaces = if server && choice.codex() { ["collaboration".to_string()].into() } else { Default::default() };
-        r.upstream_key.is_some()
+        r.guarded
     }
 
     /// `choice` becomes the agent at work; true when its seat was alive and goes on.
