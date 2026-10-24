@@ -6,7 +6,7 @@ names the one it works on in its answer. It reports its window (usage_update) an
 cost (usage on its answer), as ACP has them. Given a name (its first argument), it says it in its
 answer: the tests that switch agents tell them apart by it. A ``session/cancel`` ends the turn at its
 next step with ``cancelled``. With ``echo-prompt`` among its arguments it also says which turn of its
-session this is and the text blocks of the prompt it was given. With ``review`` among them it answers a
+session this is and the text blocks of the prompt it was given. With ``say-key`` it says the key the proxy lent it (the stand-in). With ``review`` among them it answers a
 review task (deidkit.agents.review) with notes: one on the document's third line, its apostrophes curled
 the way models write them, one on words the document does not have, and — when the document calls a party
 "HFL" — one on a line of it with the party named in full, as a quote comes back through the proxy."""
@@ -124,6 +124,8 @@ for line in sys.stdin:
             said += f"[turn {turns}] [prompt {json.dumps([b.get('text') for b in params.get('prompt') or []])}] "
         if mcp:
             said += f"[mcp {json.dumps(mcp, sort_keys=True)}] "
+        if "say-key" in sys.argv[2:]:
+            said += f"[key {os.environ.get('ANTHROPIC_API_KEY', '-')}] "
         if sys.argv[2:]:
             said += f"[argv {json.dumps(sys.argv[2:])}] "
         if os.environ.get("CODEX_PATH") and os.path.isfile(os.environ["CODEX_PATH"]):

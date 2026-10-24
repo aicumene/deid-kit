@@ -166,7 +166,11 @@ enable_request_compression = false
 - **More than one agent.** `--agent NAME=COMMAND`, repeated, lists the agents the page offers,
   instead of `--agent-command`; the first that can start works first. `--agent-upstream NAME=URL`
   sends that agent's model requests to a server of the organization's own (the Messages API) and
-  gives it no key, since the organization's key is for Anthropic. `--agent-unavailable NAME=REASON`
+  gives it no key, since the organization's key is for Anthropic. A server that takes a key of its own
+  (llama-server's `--api-key`, Strata) gets it from the secrets line: `--secrets-stdin` with
+  `"upstream_keys": {"NAME": "…"}`. The proxy holds the key and the agent gets a stand-in, as with the
+  organization's key. Only the agent's requests go out with it, as `Authorization: Bearer` and
+  `x-api-key`, and a refusal is told as that server's. `--agent-unavailable NAME=REASON`
   lists an agent that cannot start on this machine, and why, without offering it. The usage line
   names the agent.
 - **Switching keeps the work.** Each agent the person has worked with keeps its process and session

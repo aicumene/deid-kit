@@ -188,6 +188,8 @@ pub struct Route {
     pub upstream: String,
     pub upstream_openai: String,
     pub upstream_key: Option<String>,
+    /// `upstream` is the agent's own server (`--agent-upstream`), and `upstream_key` the key it takes.
+    pub own: bool,
     pub drop_tool_namespaces: HashSet<String>,
 }
 
@@ -231,7 +233,7 @@ fn back_headers(up: &http::Upstream) -> Headers {
 impl Proxy {
     pub fn new(store: Rc<dyn TokenStore>, restore: Rc<dyn RestoreTable>, cfg: ProxyConfig) -> Rc<Proxy> {
         let route = Route { upstream: cfg.upstream.clone(), upstream_openai: cfg.upstream_openai.clone(),
-                            upstream_key: cfg.upstream_key.clone(), drop_tool_namespaces: cfg.drop_tool_namespaces.clone() };
+                            upstream_key: cfg.upstream_key.clone(), own: false, drop_tool_namespaces: cfg.drop_tool_namespaces.clone() };
         Rc::new(Proxy { store, restore, cfg, route: RefCell::new(route), engines: RefCell::new(HashMap::new()), audited: RefCell::new(Vec::new()),
                         on_key_refused: RefCell::new(None), on_usage: RefCell::new(None), on_crossing: RefCell::new(None) })
     }
@@ -268,10 +270,15 @@ impl Proxy {
         let mut out: Headers = dedupe(req.headers.iter().filter(|(k, _)| !HOP.contains(&k.to_lowercase().as_str())).cloned().collect());
         out.retain(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding"));
         out.push(("Accept-Encoding".into(), "identity".into()));
-        if let Some(key) = self.route.borrow().upstream_key.clone() {
+        let (key, own) = { let r = self.route.borrow(); (r.upstream_key.clone(), r.own) };
+        if let Some(key) = key {
             let lend = self.from_agent(req);
             out.retain(|(k, _)| !k.eq_ignore_ascii_case("x-api-key") && !k.eq_ignore_ascii_case("authorization"));
             if lend {
+                // an own server may read either: llama-server and OpenAI's shape the bearer, Anthropic's shape x-api-key
+                if own {
+                    out.push(("Authorization".into(), format!("Bearer {key}")));
+                }
                 out.push(("x-api-key".into(), key));
             }
         }
@@ -291,10 +298,13 @@ impl Proxy {
                 return None;
             }
             log::warning(&format!("refused {} {}: not the agent's key", req.method, req.path));
-            return Some(error(401, "deid proxy: this proxy holds the organization's key and lends it only to its own agent"));
+            return Some(error(401, if self.route.borrow().own { "deid proxy: this proxy holds the model server's key and lends it only to its own agent" }
+                                   else { "deid proxy: this proxy holds the organization's key and lends it only to its own agent" }));
         }
-        if req.path.ends_with("/responses") || !self.url(req).starts_with(self.route.borrow().upstream.trim_end_matches('/')) {
-            return Some(error(403, "deid proxy: the organization's key is for Anthropic only"));
+        let own = self.route.borrow().own;
+        if (!own && req.path.ends_with("/responses")) || !self.url(req).starts_with(self.route.borrow().upstream.trim_end_matches('/')) {
+            return Some(error(403, if own { "deid proxy: the key is for this agent's own server only" }
+                                   else { "deid proxy: the organization's key is for Anthropic only" }));
         }
         None
     }

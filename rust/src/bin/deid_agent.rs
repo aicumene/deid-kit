@@ -6,7 +6,8 @@
 //!     deid-agent --folder ~/matters/client-a --scope client-a --seeds ~/.deid/seeds/client-a.toml
 //!
 //! The page's address, with its token, is printed on start. A program that starts deid-agent and opens
-//! the page itself passes `--secrets-stdin` and writes one JSON line, `{"token": "…", "api_key": "…"}`.
+//! the page itself passes `--secrets-stdin` and writes one JSON line, `{"token": "…", "api_key": "…"}`, and for an
+//! agent's own server that takes a key, `"upstream_keys": {"<agent>": "…"}` (the agent gets a stand-in).
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -66,7 +67,7 @@ connection passed on to the port: a container's published socket, which reaches 
 kept in the matter folder (.legix/transfers)"),
     opt("--upstream", "https://api.anthropic.com", "where the agent's model requests go"),
     opt("--api-key-env", "ANTHROPIC_API_KEY", "environment variable holding the organization's key"),
-    flag("--secrets-stdin", "read the page token and the key as one JSON line on stdin"),
+    flag("--secrets-stdin", "read the page token and the key as one JSON line on stdin (and upstream_keys: the keys of the agents' own servers)"),
     flag("--lifeline", "keep reading stdin (after the secrets); when it closes, whoever started deid-agent is gone \
 (even killed): stop the agents and exit"),
     flag("--dev-login", "allow the machine's own Claude sign-in when no API key is set"),
@@ -87,7 +88,7 @@ fn account_name() -> Option<String> {
     (py::clen(&name) >= 3 && !GENERIC_ACCOUNTS.contains(&deidkit::unicode::casefold(&name).as_str())).then_some(name)
 }
 
-/// The one JSON line a starting program writes: `token` and `api_key`.
+/// The one JSON line a starting program writes: `token`, `api_key` and `upstream_keys` (`{agent: key}`).
 fn read_secrets() -> Value {
     let mut line = String::new();
     let _ = std::io::stdin().read_line(&mut line);
@@ -220,14 +221,16 @@ fn main() {
     if !folder.is_dir() {
         die(&format!("deid-agent: no such folder: {}", folder.display()));
     }
-    let (token, api_key) = if args.on("--secrets-stdin") {
+    let (token, api_key, upstream_keys) = if args.on("--secrets-stdin") {
         let given = read_secrets();
         let s = |k: &str| given.get(k).filter(|v| py::truthy(Some(v))).map(py::py_str);
-        (s("token").unwrap_or_default(), s("api_key"))
+        let keys: Vec<(String, String)> = given.get("upstream_keys").and_then(Value::as_object).into_iter().flatten()
+            .filter_map(|(name, key)| key.as_str().filter(|k| !k.is_empty()).map(|k| (name.clone(), k.to_string()))).collect();
+        (s("token").unwrap_or_default(), s("api_key"), keys)
     } else {
         let token = std::env::var("DEID_AGENT_TOKEN").unwrap_or_default();
         std::env::remove_var("DEID_AGENT_TOKEN");
-        (token, std::env::var(args.str("--api-key-env")).ok().filter(|k| !k.is_empty()))
+        (token, std::env::var(args.str("--api-key-env")).ok().filter(|k| !k.is_empty()), Vec::new())
     };
     if api_key.is_none() && !args.on("--dev-login") {
         die(&format!("deid-agent: no organization key (set {}, or pass it with --secrets-stdin), or pass --dev-login for development",
@@ -250,6 +253,12 @@ fn main() {
     }
     cfg.usage_log = args.get("--usage-log").filter(|u| !u.is_empty()).map(py::expanduser);
     cfg.agents = agent_choices(&args);
+    for (name, key) in &upstream_keys {
+        match cfg.agents.iter_mut().find(|c| &c.name == name && c.upstream.is_some()) {
+            Some(choice) => choice.upstream_key = Some(key.clone()),
+            None => die(&format!("deid-agent: upstream_keys names no agent with --agent-upstream: {name}")),
+        }
+    }
     cfg.session_meta = args.get("--session-meta").filter(|m| !m.is_empty()).map(|m| json_object(m, "--session-meta"));
     cfg.style = args.get("--style").filter(|s| !s.is_empty()).map(py::expanduser);
     cfg.subagents = args.get("--subagents").filter(|s| !s.is_empty()).map(|s| py::realpath(&py::expanduser(s)));
@@ -329,7 +338,8 @@ fn main() {
         scope_paths: load_scope_paths(&files, &scope).unwrap_or_default(), detector: Some(Rc::new(RegexDetector::default())),
         record: args.get("--record").filter(|r| !r.is_empty()).map(py::expanduser),
         audit: Some(py::expanduser(&args.str("--audit"))),
-        upstream_key: api_key.clone(), agent_key: api_key.as_ref().map(|_| cfg.agent_key.clone()),
+        // the stand-in the agents send: for the organization's key and for the keys of their own servers
+        upstream_key: api_key.clone(), agent_key: (api_key.is_some() || !upstream_keys.is_empty()).then(|| cfg.agent_key.clone()),
         ..ProxyConfig::default()
     };
     let url = format!("http://127.0.0.1:{port}/{}", if token.is_empty() { format!("#t={}", cfg.token) } else { String::new() });

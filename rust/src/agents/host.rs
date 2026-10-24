@@ -48,13 +48,24 @@ pub fn subagent_kinds() -> Vec<String> {
 // ── the agents ────────────────────────────────────────────────────────────────────────────────────
 
 /// An agent the person can pick on the page (`--agent`).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct AgentChoice {
     pub name: String,
     pub command: Vec<String>,
     pub upstream: Option<String>,
+    /// The key `upstream` takes (`upstream_keys` of `--secrets-stdin`): the proxy holds it and the agent gets the
+    /// stand-in, as with the organization's key.
+    pub upstream_key: Option<String>,
     pub unavailable: Option<String>,
     pub meta: Option<Value>,
+}
+
+impl std::fmt::Debug for AgentChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentChoice").field("name", &self.name).field("command", &self.command).field("upstream", &self.upstream)
+            .field("upstream_key", &self.upstream_key.as_ref().map(|_| "…")).field("unavailable", &self.unavailable)
+            .field("meta", &self.meta).finish()
+    }
 }
 
 fn base_name(part: &str) -> &str {
@@ -1164,7 +1175,8 @@ impl AgentHost {
         Some(json!({"current": st.current.name, "options": options}))
     }
 
-    /// Point the proxy at `choice`'s model; whether the agent is lent the key.
+    /// Point the proxy at `choice`'s model; whether the agent is lent the key: the organization's for Anthropic, or
+    /// the one its own server takes (`upstream_key`).
     pub fn route(&self, choice: &AgentChoice) -> bool {
         let own_server = choice.upstream.is_some();
         let (upstream, upstream_openai) = {
@@ -1179,9 +1191,14 @@ impl AgentHost {
         } else {
             upstream_openai
         };
-        r.upstream_key = if own_server || choice.responses() { None } else { self.cfg.api_key.clone() };
+        r.upstream_key = match (own_server, choice.responses()) {
+            (true, _) => choice.upstream_key.clone(),
+            (false, true) => None,
+            (false, false) => self.cfg.api_key.clone(),
+        }.filter(|k| !k.is_empty());
+        r.own = own_server;
         r.drop_tool_namespaces = if server && choice.codex() { ["collaboration".to_string()].into() } else { Default::default() };
-        self.cfg.api_key.as_ref().is_some_and(|k| !k.is_empty()) && !own_server && !choice.responses()
+        r.upstream_key.is_some()
     }
 
     /// `choice` becomes the agent at work; true when its seat was alive and goes on.
@@ -1585,23 +1602,29 @@ impl AgentHost {
 
     /// The provider refused the organization's key: the person is told, a running turn stopped.
     pub fn key_refused(&self) {
-        let (busy, agent, sid) = {
+        let (busy, agent, sid, own) = {
             let mut st = self.st.borrow_mut();
             if st.key_refused_told {
                 return;
             }
             st.key_refused_told = true;
             let busy = st.busy;
+            let own = st.current.upstream.is_some().then(|| st.current.name.clone());
             let seat = st.seat();
-            (busy, seat.agent.clone(), seat.session_id.clone())
+            (busy, seat.agent.clone(), seat.session_id.clone(), own)
+        };
+        // the key of the agent's own server (`upstream_key`), or the organization's
+        let (whose, refuses, refused) = match &own {
+            Some(name) => (format!("{name}'s model server"), "refuses its key", "refused its key"),
+            None => ("Anthropic".to_string(), "refuses the organization's key", "refused the organization's key"),
         };
         let text = if let (true, Some(agent), Some(sid)) = (busy, agent, sid.filter(|s| !s.is_empty())) {
             tokio::task::spawn_local(async move {
                 let _ = agent.cancel(&sid).await;
             });
-            "Anthropic refused the organization's key, so the turn was stopped."
+            format!("{whose} {refused}, so the turn was stopped.")
         } else {
-            "Anthropic refuses the organization's key."
+            format!("{whose} {refuses}.")
         };
         self.emit(json!({"kind": "error", "text": format!("{text} The key is wrong or revoked: replace it, then open the agent again.")}));
     }
