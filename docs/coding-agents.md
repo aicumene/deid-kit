@@ -163,6 +163,23 @@ enable_request_compression = false
   prints nothing, so Claude Code's own permission flow still asks the person. `--no-guard` leaves it
   out. Codex is confined by deid-agent's own Seatbelt profile too (its network as Claude Code's), and
   matteragent has no shell.
+- **Codex and ChatGPT's own backend.** Codex signed in with ChatGPT reads its plan, its limits and its
+  workspace's policies at `chatgpt.com/backend-api/` before its first session; refused there, the
+  session fails (ACP -32603, "failed to load workspace requirements"; measured 23.10.2026 with 0.163).
+  A Codex whose network reaches deid-agent alone therefore starts with deid-agent's `/backend-api/` as
+  its `chatgpt_base_url`. deid-agent passes a GET or HEAD there to ChatGPT's backend at the same path
+  and refuses anything else, like every request it cannot de-identify; the model's requests go where
+  they went. Such a Codex also starts with deid-agent as its model provider (`model_provider = "deid"`
+  and the provider above, as `-c` settings), not only each session: before any session it asks for
+  its list of models with the provider it started with, and signed in with ChatGPT that was
+  `chatgpt.com/backend-api/codex/models`, straight. Refused, Codex falls back to the list it carries,
+  so the session still starts; through deid-agent it gets the list ChatGPT gives (measured 24.10.2026
+  with 0.159.3). A confined Codex gets this. So does an unconfined one with `--agents-walled`: the agents
+  are walled in by what runs deid-agent (a container's firewall, as in bernio-agents-container),
+  though deid-agent does not confine them. deid-agent then writes Codex's wrapper in a folder another
+  user may pass through, since a container runs Codex as a user of its own. An unconfined Codex
+  without the flag is started as it is. When an agent does not start, the page names the hosts
+  deid-agent refused it a tunnel to.
 - **More than one agent.** `--agent NAME=COMMAND`, repeated, lists the agents the page offers,
   instead of `--agent-command`; the first that can start works first. `--agent-upstream NAME=URL`
   sends that agent's model requests to a server of the organization's own (the Messages API) and

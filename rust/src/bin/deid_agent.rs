@@ -59,6 +59,8 @@ connection passed on to the port: a container's published socket, which reaches 
     none("--codex-executable", "", "the person's own codex binary, for an agent that is Codex (codex-acp)"),
     none("--codex-home", "DIR", "Codex's home for this matter (default ~/.deid/agent/codex/<scope>)"),
     flag("--codex-unconfined", "start Codex without confining it to the folder"),
+    flag("--agents-walled", "the agents reach only deid-agent all the same, walled in by what runs it (a container's \
+firewall): Codex's calls to ChatGPT's backend come here, as a confined Codex's do"),
     flag("--claude-unconfined", "run Claude Code's shell commands outside its sandbox"),
     none("--guard", "", "agent-guard, which decides each of Claude Code's tool calls before it runs"),
     flag("--no-guard", "start Claude Code without agent-guard"),
@@ -246,6 +248,7 @@ fn main() {
     cfg.claude_executable = args.get("--claude-executable").map(str::to_string).or_else(|| confine::which("claude"));
     cfg.codex_executable = args.get("--codex-executable").map(str::to_string).or_else(|| confine::which("codex"));
     cfg.codex_confine = !args.on("--codex-unconfined");
+    cfg.agents_walled = args.on("--agents-walled");
     cfg.codex_home = args.get("--codex-home").filter(|h| !h.is_empty()).map(py::expanduser);
     cfg.port = port;
     if let Some(p) = args.get("--person") {

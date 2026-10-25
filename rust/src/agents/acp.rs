@@ -328,14 +328,36 @@ pub fn agent_env(base_url: &str, scope: &str, api_key: Option<&str>, extra: &[(S
     env
 }
 
-/// What Codex behind the proxy needs, through its ACP adapter: the proxy as its model provider.
-pub fn codex_env(base_url: &str, scope: &str, codex_path: Option<&str>, codex_home: Option<&str>) -> Vec<(String, String)> {
+/// The proxy as Codex's model provider: `model_providers.deid`.
+fn codex_provider(base_url: &str, scope: &str) -> Map<String, Value> {
     let mut provider = Map::new();
     provider.insert("name".into(), json!("OpenAI through deid-agent"));
     provider.insert("base_url".into(), json!(format!("{}/v1", base_url.trim_end_matches('/'))));
     provider.insert("requires_openai_auth".into(), json!(true));
     provider.insert("wire_api".into(), json!("responses"));
     provider.insert("http_headers".into(), json!({"x-deid-scope": scope}));
+    provider
+}
+
+/// The same provider as Codex's own from its start (`-c`, before `app-server`): the adapter gives it to each session
+/// only, and Codex asks for its list of models before any, with the provider it started with — ChatGPT's backend,
+/// straight, when signed in with ChatGPT.
+pub fn codex_provider_args(base_url: &str, scope: &str) -> Vec<String> {
+    let toml = |v: &Value| match v {
+        Value::Object(m) => format!("{{{}}}", m.iter().map(|(k, v)| format!("{} = {}", py::dumps(&json!(k)), py::dumps(v)))
+            .collect::<Vec<_>>().join(", ")),
+        v => py::dumps(v),
+    };
+    let mut args = vec!["-c".to_string(), "model_provider=\"deid\"".to_string()];
+    for (k, v) in codex_provider(base_url, scope) {
+        args.extend(["-c".to_string(), format!("model_providers.deid.{k}={}", toml(&v))]);
+    }
+    args
+}
+
+/// What Codex behind the proxy needs, through its ACP adapter: the proxy as its model provider.
+pub fn codex_env(base_url: &str, scope: &str, codex_path: Option<&str>, codex_home: Option<&str>) -> Vec<(String, String)> {
+    let provider = codex_provider(base_url, scope);
     let config = json!({"model_providers": {"deid": provider}, "features": {"enable_request_compression": false}});
     let mut env = vec![("MODEL_PROVIDER".to_string(), "deid".to_string()),
                        ("CODEX_CONFIG".to_string(), py::dumps_ascii(&config)),

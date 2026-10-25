@@ -145,12 +145,15 @@ pub fn confined_codex(folder: &str, codex: Option<&str>, workdir: &Path, codex_h
     Ok(wrapper)
 }
 
-/// A wrapper that starts Codex with `args` before the adapter's own, for Codex not confined.
+/// A wrapper that starts Codex with `args` before the adapter's own, for Codex not confined. `workdir` is opened
+/// for others to pass through (not to list): Codex may run as a user of its own (a container's `codex`, by sudo),
+/// who must reach its wrapper; nothing in it is secret.
 pub fn codex_with(codex: Option<&str>, workdir: &Path, args: &[String]) -> Result<PathBuf, ConfinementUnavailable> {
     let binary = codex.filter(|c| !c.is_empty()).map(str::to_string).or_else(|| which("codex"))
         .ok_or_else(|| ConfinementUnavailable("no Codex executable was found: give it with --codex-executable".into()))?;
     let io = |e: std::io::Error| ConfinementUnavailable(e.to_string());
     std::fs::create_dir_all(workdir).map_err(io)?;
+    std::fs::set_permissions(workdir, std::fs::Permissions::from_mode(0o711)).map_err(io)?;
     let wrapper = workdir.join("codex");
     let extra: String = args.iter().map(|a| format!(" {}", shquote(a))).collect();
     write_exec(&wrapper, &format!("#!/bin/sh\n# Codex with settings it takes only at its start (deid-agent)\nexec {}{extra} \"$@\"\n",

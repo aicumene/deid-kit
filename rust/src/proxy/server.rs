@@ -32,7 +32,7 @@ use crate::{log, py};
 
 const HOP: [&str; 13] = ["host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
     "proxy-authorization", "proxy-connection", "accept-encoding", "content-encoding", "x-deid-scope"];
-/// The path of ChatGPT's backend: `chatgpt_base_url` of a confined Codex is deid-agent's own, under it.
+/// The path of ChatGPT's backend: `chatgpt_base_url` of a confined or walled-in Codex is deid-agent's own, under it.
 pub const CHATGPT_BACKEND: &str = "/backend-api/";
 const BACK_DROP: [&str; 5] =["content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"];
 
@@ -207,8 +207,9 @@ pub struct Proxy {
     engines: RefCell<HashMap<String, Rc<ScopeEngine>>>,
     /// Audit records when no file is set (`InMemoryAuditSink`).
     pub audited: RefCell<Vec<Value>>,
-    /// Called when the provider refuses the held key (401).
-    pub on_key_refused: RefCell<Option<Box<dyn Fn()>>>,
+    /// Called when the provider refuses the held key (401), with the route the request went by: the key it held then,
+    /// which a switch of agents while the request was out does not change.
+    pub on_key_refused: RefCell<Option<Box<dyn Fn(&Route)>>>,
     /// Called after each answer of the Messages API with the model and the answer's usage.
     pub on_usage: RefCell<Option<UsageHook>>,
     /// Called for each request about to go to the model, with its audit line and the bytes sent.
@@ -272,10 +273,15 @@ impl Proxy {
     }
 
     fn headers(&self, req: &Request) -> Headers {
+        self.headers_by(req, &self.route.borrow())
+    }
+
+    /// The headers a request goes on with by `route`.
+    fn headers_by(&self, req: &Request, route: &Route) -> Headers {
         let mut out: Headers = dedupe(req.headers.iter().filter(|(k, _)| !HOP.contains(&k.to_lowercase().as_str())).cloned().collect());
         out.retain(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding"));
         out.push(("Accept-Encoding".into(), "identity".into()));
-        let (key, own) = { let r = self.route.borrow(); (r.upstream_key.clone(), r.own) };
+        let (key, own) = (route.upstream_key.clone(), route.own);
         // the credentials a request brings stay here: at Anthropic the key held goes instead, at an own server its key or none
         if key.is_some() || own {
             out.retain(|(k, _)| !k.eq_ignore_ascii_case("x-api-key") && !k.eq_ignore_ascii_case("authorization"));
@@ -324,7 +330,8 @@ impl Proxy {
     }
 
     /// Where a request goes: Anthropic for Claude Code, OpenAI or ChatGPT for Codex — and ChatGPT's backend itself for
-    /// Codex's own calls there (its plan, its limits, its workspace's policies), which a confined Codex makes here.
+    /// Codex's own calls there (its plan, its limits, its workspace's policies), which a confined or walled-in Codex
+    /// makes here.
     pub fn url(&self, req: &Request) -> String {
         if req.path.starts_with(CHATGPT_BACKEND) {
             let base = &self.cfg.upstream_chatgpt;
@@ -513,19 +520,23 @@ impl Proxy {
             }
         };
         let sent = py::dumps_with(&prep.body, false, true);
-        let upstream = self.route.borrow().upstream.clone();
+        // the route as it is now, for this request to its end: a switch of agents while it is out changes neither
+        // where it went, nor with which key, nor whose key a refusal is (25.10.2026: Anthropic's 401s on Claude Code's
+        // requests, out when the chat switched to MatterAgent's own server, were told as its key refused)
+        let route = self.route.borrow().clone();
+        let upstream = route.upstream.clone();
         self.audit(&scope, &req.path, &sent, &prep.mapping, &upstream);
         self.record(json!({"dir": "out", "scope": scope, "path": req.path_qs, "body": prep.body, "withheld": prep.withheld}));
         log::info(&format!("{} scope={scope} tokens={} withheld={} restored={}", req.path, prep.mapping.len(), prep.withheld.len(), prep.restored));
         let url = format!("{}{}", upstream.trim_end_matches('/'), req.path_qs);
-        let mut up = match http::fetch("POST", &url, &self.headers(&req), Bytes::from(sent), CONNECT, READ).await {
+        let mut up = match http::fetch("POST", &url, &self.headers_by(&req, &route), Bytes::from(sent), CONNECT, READ).await {
             Ok(u) => u,
             Err(e) => return error(502, &format!("deid proxy: {e}")),
         };
-        if self.route.borrow().upstream_key.is_some() && up.status == 401 {
+        if route.upstream_key.is_some() && up.status == 401 {
             log::warning("the provider refused the held key");
             if let Some(hook) = self.on_key_refused.borrow().as_ref() {
-                hook();
+                hook(&route);
             }
         }
         let headers = back_headers(&up);

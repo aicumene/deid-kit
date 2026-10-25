@@ -29,7 +29,7 @@ use crate::agents::disclosure::{self, Added, Crossings};
 use crate::agents::pricing::{self, RequestUsage};
 use crate::agents::review;
 use crate::http::{Request, Response};
-use crate::proxy::server::{Proxy, CHATGPT_BACKEND};
+use crate::proxy::server::{Proxy, Route, CHATGPT_BACKEND};
 use crate::pyre::{self, Regex};
 use crate::{log, py, pyjson};
 
@@ -114,6 +114,9 @@ pub struct HostConfig {
     pub claude_executable: Option<String>,
     pub codex_executable: Option<String>,
     pub codex_confine: bool,
+    /// The agents reach deid-agent alone though deid-agent does not confine them: walled in by what runs it (a
+    /// container's firewall). Codex's calls to ChatGPT's own backend then come here, as a confined Codex's do.
+    pub agents_walled: bool,
     pub codex_home: Option<PathBuf>,
     pub port: u16,
     pub token: String,
@@ -142,7 +145,7 @@ pub struct HostConfig {
 impl HostConfig {
     pub fn new(folder: PathBuf, scope: &str, title: &str, agent_command: Vec<String>) -> HostConfig {
         HostConfig { folder, scope: scope.into(), title: title.into(), agent_command, api_key: None, dev_login: false,
-                     claude_executable: None, codex_executable: None, codex_confine: true, codex_home: None, port: 8790,
+                     claude_executable: None, codex_executable: None, codex_confine: true, agents_walled: false, codex_home: None, port: 8790,
                      token: py::token_urlsafe(24), agent_key: format!("deid-agent-{}", py::token_urlsafe(24)),
                      usage_log: None, agents: Vec::new(), style: None, session_meta: None, subagents: None,
                      subagents_command: Vec::new(), subagents_timeout: 900.0, claude_confine: true, claude_shell: None, guard: Vec::new(),
@@ -1027,9 +1030,9 @@ impl AgentHost {
                          added: cfg.added_file.as_deref().map(disclosure::load_added).unwrap_or_default() };
         let host = Rc::new(AgentHost { cfg, proxy: proxy.clone(), st: RefCell::new(st) });
         let w = Rc::downgrade(&host);
-        *proxy.on_key_refused.borrow_mut() = Some(Box::new(move || {
+        *proxy.on_key_refused.borrow_mut() = Some(Box::new(move |route: &Route| {
             if let Some(h) = w.upgrade() {
-                h.key_refused();
+                h.key_refused(route);
             }
         }));
         let w = Rc::downgrade(&host);
@@ -1290,7 +1293,14 @@ impl AgentHost {
                     Err(e) => return self.fail(format!("Codex was not started: {}.", acp::os_error(&e, Some(&home.to_string_lossy())))),
                 };
                 extra = acp::codex_env(&base_url, &self.cfg.scope, self.cfg.codex_executable.as_deref(), Some(&home.to_string_lossy()));
-                let codex_args = server.as_ref().map(|s| self.codex_server_args(s)).unwrap_or_default();
+                let mut codex_args = server.as_ref().map(|s| self.codex_server_args(s)).unwrap_or_default();
+                if self.cfg.codex_confine || self.cfg.agents_walled {
+                    // its calls to ChatGPT's own backend come here too: its network reaches deid-agent alone; and so
+                    // does its list of models, asked for at its start
+                    codex_args.extend(["-c".to_string(), format!("chatgpt_base_url={}", py::dumps(&json!(
+                        format!("{base_url}{CHATGPT_BACKEND}"))))]);
+                    codex_args.extend(acp::codex_provider_args(&base_url, &self.cfg.scope));
+                }
                 if self.cfg.codex_confine || !codex_args.is_empty() {
                     self.drop_codex_dir(&choice.name);
                     let dir = make_temp_dir("deid-codex-");
@@ -1310,10 +1320,6 @@ impl AgentHost {
                     }
                 }
                 if self.cfg.codex_confine {
-                    // its calls to ChatGPT's own backend come here too: its network reaches deid-agent alone
-                    let mut codex_args = codex_args.clone();
-                    codex_args.extend(["-c".to_string(), format!("chatgpt_base_url={}", py::dumps(&json!(
-                        format!("{base_url}{CHATGPT_BACKEND}"))))]);
                     let extra_read = server.as_ref().map(|s| self.subagent_paths(s)).unwrap_or_default();
                     let made = dir.as_ref().ok_or_else(|| confine::ConfinementUnavailable("no folder for its profile".into()))
                         .and_then(|d| confine::confined_codex(&self.cfg.folder.to_string_lossy(), self.cfg.codex_executable.as_deref(), d,
@@ -1604,21 +1610,30 @@ impl AgentHost {
     }
 
     /// The provider refused the organization's key: the person is told, a running turn stopped.
-    pub fn key_refused(&self) {
+    /// The key held for `route` was refused: the route the refused request went by, which may no longer be the one
+    /// at work — the agent switched while the request was out. Its turn is stopped only while it is.
+    pub fn key_refused(&self, route: &Route) {
+        let still = {
+            let now = self.proxy.route.borrow();
+            now.upstream == route.upstream && now.upstream_key == route.upstream_key
+        };
         let (busy, agent, sid, own) = {
             let mut st = self.st.borrow_mut();
             if st.key_refused_told {
                 return;
             }
             st.key_refused_told = true;
-            let busy = st.busy;
-            let own = st.current.upstream.is_some().then(|| st.current.name.clone());
+            let busy = st.busy && still;
+            let own = route.own.then(|| {
+                st.agents.iter().find(|a| a.upstream.as_deref().is_some_and(|u| u.trim_end_matches('/') == route.upstream))
+                    .map_or_else(|| format!("The model server at {}", route.upstream), |a| format!("{}'s model server", a.name))
+            });
             let seat = st.seat();
             (busy, seat.agent.clone(), seat.session_id.clone(), own)
         };
         // the key of the agent's own server (`upstream_key`), or the organization's
-        let (whose, refuses, refused) = match &own {
-            Some(name) => (format!("{name}'s model server"), "refuses its key", "refused its key"),
+        let (whose, refuses, refused) = match own {
+            Some(server) => (server, "refuses its key", "refused its key"),
             None => ("Anthropic".to_string(), "refuses the organization's key", "refused the organization's key"),
         };
         let text = if let (true, Some(agent), Some(sid)) = (busy, agent, sid.filter(|s| !s.is_empty())) {
