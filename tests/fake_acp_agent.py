@@ -97,6 +97,15 @@ for line in sys.stdin:
                    "text": "The model's server did not answer (500 Internal Server Error). Try again in a moment."}})
             send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
             continue
+        if "review" in sys.argv[2:] and "They selected this passage of it:" in asked:
+            # a question about a passage: one note on it, with new words when asked for them
+            passage = asked.split("<<<\n", 1)[1].split("\n>>>", 1)[0]
+            question = asked.split("and they ask you: ", 1)[1].split("\n\n", 1)[0]
+            notes = {"notes": [{"quote": passage[:60], "kind": "point", "aspect": "other", "importance": 3,
+                                "suggestion": "Stricter: " + passage[:60], "note": "Asked: " + question}]}
+            update("s1", {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": json.dumps(notes)}})
+            send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+            continue
         if "review" in sys.argv[2:] and "Review the document" in asked:
             time.sleep(0.3)                  # a review takes a while: a second request meets it under way
             source = asked.split('Its text is in the file "', 1)[1].split('"', 1)[0]

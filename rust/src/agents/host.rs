@@ -2009,7 +2009,10 @@ impl AgentHost {
                 let Some(b) = body() else { return server_error() };
                 let b = if b.is_object() { b } else { json!({}) };
                 let s = |k: &str| py::strip(&or_text(&b, k, "")).to_string();
-                self.review_start(s("path"), s("agent"))
+                // a question about a passage the person selected (30.10.2026): `ask`, with its `start` and `end`
+                let ask = s("ask");
+                let ask = (!ask.is_empty()).then(|| (b.get("start").and_then(Value::as_i64), b.get("end").and_then(Value::as_i64), ask));
+                self.review_start(s("path"), s("agent"), ask)
             }
             ("review-suggest" | "review-decide" | "review-text" | "review-vote", "POST") => {
                 let Some(b) = body() else { return server_error() };
@@ -2481,9 +2484,24 @@ impl AgentHost {
         jr(200, json!({"ok": true, "sha": review::sha(text)}))
     }
 
-    fn review_start(self: Rc<Self>, path: String, agent: String) -> Response {
-        let Some((source, _)) = review::read_text(&self.cfg.folder, &path) else {
+    fn review_start(self: Rc<Self>, path: String, agent: String, ask: Option<(Option<i64>, Option<i64>, String)>) -> Response {
+        let Some((source, text)) = review::read_text(&self.cfg.folder, &path) else {
             return jr(404, json!({"error": "no text for this document", "source": review::text_source(&path)}));
+        };
+        // the passage asked about, from the text as it is now: the agent gets these words, the notes go near them
+        let ask = match ask {
+            None => None,
+            Some((Some(start), Some(end), question)) if 0 <= start && start < end && end <= py::clen(&text) as i64 => {
+                let passage: String = text.chars().skip(start as usize).take((end - start) as usize).collect();
+                if py::clen(&passage) > review::MAX_PASSAGE {
+                    return err(400, &format!("the passage is too long to ask about: at most {} characters", review::MAX_PASSAGE));
+                }
+                if passage.trim().is_empty() {
+                    return err(400, "select some words of the document to ask about");
+                }
+                Some(Ask { start, passage, question })
+            }
+            Some(_) => return err(400, "the passage asked about is not in the document"),
         };
         let current = self.current();
         let mut reviewer = None;
@@ -2505,7 +2523,7 @@ impl AgentHost {
         let run = py::uuid4_hex()[..12].to_string();
         let host = self.clone();
         let r = run.clone();
-        tokio::task::spawn_local(async move { host.run_review(path, source, r, reviewer).await });
+        tokio::task::spawn_local(async move { host.run_review(path, source, r, reviewer, ask).await });
         jr(202, json!({"ok": true, "run": run}))
     }
 
@@ -2516,9 +2534,9 @@ impl AgentHost {
         self.status() == "ready"
     }
 
-    async fn run_review(self: Rc<Self>, path: String, source: String, run: String, reviewer: Option<AgentChoice>) {
+    async fn run_review(self: Rc<Self>, path: String, source: String, run: String, reviewer: Option<AgentChoice>, ask: Option<Ask>) {
         let Some(reviewer) = reviewer else {
-            self.clone().review(path, source, run).await;
+            self.clone().review(path, source, run, ask).await;
             self.st.borrow_mut().run.clear();
             return;
         };
@@ -2527,7 +2545,7 @@ impl AgentHost {
             self.emit(json!({"kind": "review", "state": "failed", "path": path, "run": run, "agent": reviewer.label(),
                              "text": format!("{} did not start", reviewer.name)}));
         } else {
-            self.clone().review(path, source, run).await;
+            self.clone().review(path, source, run, ask).await;
         }
         self.st.borrow_mut().run.clear();
         self.st.borrow_mut().busy = true;
@@ -2537,8 +2555,9 @@ impl AgentHost {
         self.st.borrow_mut().busy = false;
     }
 
-    async fn review(self: Rc<Self>, path: String, source: String, run: String) {
+    async fn review(self: Rc<Self>, path: String, source: String, run: String, ask: Option<Ask>) {
         let agent = self.current().label();
+        let asked = ask.as_ref().map(|a| a.question.clone());
         if self.cfg.approve_transfers {
             let remember = review::read_text(&self.cfg.folder, &path).map(|(_, text)| format!("review:{path}:{}", review::sha(&text)));
             if self.approval(Transfer::Review(path.clone()), &run, remember).await.is_some() {
@@ -2549,10 +2568,18 @@ impl AgentHost {
             }
         }
         self.st.borrow_mut().run = run.clone();
-        self.emit(json!({"kind": "review", "state": "started", "path": path, "run": run, "agent": agent}));
+        let mut started = json!({"kind": "review", "state": "started", "path": path, "run": run, "agent": agent});
+        if let Some(q) = &asked {
+            started["ask"] = json!(q);
+        }
+        self.emit(started);
         let at = self.st.borrow().events.len();
         self.st.borrow_mut().busy = false;
-        self.clone().run_prompt(review::prompt(&path, &source), None, Some(format!("Review {path}"))).await;
+        let (prompt, title) = match &ask {
+            Some(a) => (review::ask_prompt(&path, &source, &a.passage, &a.question), format!("Ask about {path}")),
+            None => (review::prompt(&path, &source), format!("Review {path}")),
+        };
+        self.clone().run_prompt(prompt, None, Some(title)).await;
         let (answer, failed) = {
             let st = self.st.borrow();
             let since = &st.events[at.min(st.events.len())..];
@@ -2579,7 +2606,8 @@ impl AgentHost {
             creator["model"] = json!(model);
         }
         let quotes: Vec<String> = notes.iter().map(|n| n["quote"].as_str().unwrap_or("").to_string()).collect();
-        let found = review::find_quotes(&text, &quotes, Some(&self.proxy.engine(&self.cfg.scope)));
+        let near = ask.as_ref().map(|a| a.start);
+        let found = review::find_quotes_near(&text, &quotes, Some(&self.proxy.engine(&self.cfg.scope)), near);
         let kept = match review::keep(&self.cfg.folder, &path, &text, &notes, &creator, &run, Some(&found)) {
             Ok(k) => k,
             Err(e) => {
@@ -2589,6 +2617,9 @@ impl AgentHost {
         };
         let mut e = json!({"kind": "review", "state": "done", "path": path, "run": run, "agent": agent, "model": model,
                            "kept": kept["kept"].as_array().map_or(0, Vec::len), "refused": kept["refused"]});
+        if let Some(q) = &asked {
+            e["ask"] = json!(q);
+        }
         if cut {
             e["cut"] = json!(true);
         }
@@ -2785,4 +2816,12 @@ fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<S
     use std::io::Read;
     child.stdout.take()?.read_to_string(&mut out).ok()?;
     Some(out)
+}
+
+/// A question about a passage of a document (30.10.2026): where it starts in the text (characters), its words, the
+/// person's question.
+struct Ask {
+    start: i64,
+    passage: String,
+    question: String,
 }

@@ -66,21 +66,20 @@ At most 20 points, the most important first. Answer with one JSON object and not
 \"who\": \"\", \"what\": \"\", \"to_whom\": \"\", \"when\": \"\", \"norm\": \"\", \"suggestion\": \"\", \"note\": \"...\"}]}";
 
 pub fn prompt(path: &str, source: &str) -> String {
-    // str.format substitutes each field once, in one pass: a path holding "{source}" stays as it is
+    fill(PROMPT, &[("{path}", path.to_string()), ("{source}", source.to_string()), ("{aspects}", ASPECTS.join(", ")),
+                   ("{clause_types}", CLAUSE_TYPES.join(", "))])
+}
+
+/// The template's `{fields}` filled once, in one pass, as str.format does: a value holding "{source}" stays as it is.
+fn fill(template: &str, fields: &[(&str, String)]) -> String {
     let mut out = String::new();
-    let mut rest = PROMPT;
+    let mut rest = template;
     while let Some(open) = rest.find('{') {
         out.push_str(&rest[..open]);
         let after = &rest[open..];
-        let field = ["{path}", "{source}", "{aspects}", "{clause_types}"].iter().find(|f| after.starts_with(**f));
-        match field {
-            Some(f) => {
-                out.push_str(&match *f {
-                    "{path}" => path.to_string(),
-                    "{source}" => source.to_string(),
-                    "{aspects}" => ASPECTS.join(", "),
-                    _ => CLAUSE_TYPES.join(", "),
-                });
+        match fields.iter().find(|(f, _)| after.starts_with(f)) {
+            Some((f, value)) => {
+                out.push_str(value);
                 rest = &after[f.len()..];
             }
             None => {
@@ -91,6 +90,39 @@ pub fn prompt(path: &str, source: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The longest passage the person may ask an agent about, in characters.
+pub const MAX_PASSAGE: usize = 6000;
+
+const ASK_PROMPT: &str = "The lawyer is working on the document \"{path}\". Its text is in the file \"{source}\" in this \
+folder: read as much of it as you need to understand the passage below in its context. Do not change any file.
+
+They selected this passage of it:
+<<<
+{passage}
+>>>
+and they ask you: {ask}
+
+Answer about that passage only, with one to three points. For each, copy the words of the passage it is about — \
+exactly, character for character, at most 300 characters, enough to be found in the text — and say:
+- \"suggestion\": if they ask for new words (to rewrite, shorten, translate, correct, complete or draft), the words \
+to put in place of the quote, exactly as they should read — the lawyer accepts or rejects them; otherwise empty;
+- \"note\": your answer or why you suggest the change, for the lawyer, in the language they write to you in — under \
+300 characters;
+- \"kind\": \"risk\", \"question\", \"point\" or \"clause\"; \"aspect\": one of {aspects}; \"importance\": 1 to 5; \
+\"norm\": the statute or regulation it turns on, as usually cited, or empty; \"clause_type\", \"who\", \"what\", \
+\"to_whom\", \"when\": empty unless the passage is a clause you describe.
+
+Answer with one JSON object and nothing else:
+{\"notes\": [{\"quote\": \"...\", \"kind\": \"point\", \"aspect\": \"other\", \"importance\": 3, \"clause_type\": \"\", \
+\"who\": \"\", \"what\": \"\", \"to_whom\": \"\", \"when\": \"\", \"norm\": \"\", \"suggestion\": \"\", \"note\": \"...\"}]}";
+
+/// What the agent is asked about a passage the person selected (30.10.2026): the review's answer, about that passage
+/// only, so it comes back as notes on it — a change to accept or reject, or an answer.
+pub fn ask_prompt(path: &str, source: &str, passage: &str, ask: &str) -> String {
+    fill(ASK_PROMPT, &[("{path}", path.to_string()), ("{source}", source.to_string()), ("{passage}", passage.to_string()),
+                       ("{ask}", ask.to_string()), ("{aspects}", ASPECTS.join(", "))])
 }
 
 // ── characters ────────────────────────────────────────────────────────────────────────────────────
@@ -292,8 +324,14 @@ fn to_original(pieces: &[(usize, usize, usize, usize, bool)], a: usize, b: usize
 /// its one token — the model saw "ORG_…" where the document says "HFL", and the proxy gave the quote back
 /// "Harrowgate Freight Ltd". Found there, it is the document's own words at that place (review.py `find_quotes`).
 pub fn find_quotes(text: &str, quotes: &[String], engine: Option<&ScopeEngine>) -> Vec<Option<(usize, usize)>> {
+    find_quotes_near(text, quotes, engine, None)
+}
+
+/// [`find_quotes`], and of several places the one nearest `near` (a character offset): the passage the person asked
+/// about, when the same words are elsewhere too.
+pub fn find_quotes_near(text: &str, quotes: &[String], engine: Option<&ScopeEngine>, near: Option<i64>) -> Vec<Option<(usize, usize)>> {
     let folded = Folded::of(text);
-    let mut found: Vec<Option<(usize, usize)>> = quotes.iter().map(|q| if q.is_empty() { None } else { folded.find(q, None) }).collect();
+    let mut found: Vec<Option<(usize, usize)>> = quotes.iter().map(|q| if q.is_empty() { None } else { folded.find(q, near) }).collect();
     let missing: Vec<usize> = (0..quotes.len()).filter(|&i| !quotes[i].is_empty() && found[i].is_none()).collect();
     let Some(engine) = engine.filter(|_| !missing.is_empty()) else { return found };
     let mut texts = vec![text.to_string()];

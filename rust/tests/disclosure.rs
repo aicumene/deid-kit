@@ -402,3 +402,53 @@ fn a_title_or_a_heading_is_not_offered_as_a_name() {
     assert!(found.contains(&("Tamsin Okafor".into(), "person".into())), "{found:?}");
     assert!(found.iter().any(|(t, k)| t.contains("Brightwater Maritime Ltd") && k == "organization"), "{found:?}");
 }
+
+/// A question about a passage the person selected (30.10.2026): the agent gets the passage and the question, and its
+/// answer comes back as notes on that passage — a change to accept or reject, or an answer; a passage that is not
+/// in the document is refused.
+#[test]
+fn a_question_about_a_passage_comes_back_as_notes_on_that_passage() {
+    let m = matter("ask");
+    let a = start(&m, "vault.sqlite", false);
+    let rx = events(&a);
+    let mut seen = Vec::new();
+    let (_, view) = call(&a, "GET", "/deid-agent/api/review?path=letter.md", None);
+    let text = view["text"].as_str().unwrap().to_string();
+    let words = "The Tenant may break the lease on two weeks' notice.";
+    let start = text[..text.find(words).expect("the words")].chars().count() as i64;
+    let end = start + words.chars().count() as i64;
+    let (status, run) = call(&a, "POST", "/deid-agent/api/review",
+                             Some(json!({"path": "letter.md", "ask": "Make it stricter", "start": start, "end": end})));
+    assert_eq!(status, 202, "{run}");
+    let started = next(&rx, &mut seen, |e| e["kind"] == "review" && e["state"] == "started");
+    assert_eq!(started["ask"], json!("Make it stricter"));
+    let done = next(&rx, &mut seen, |e| e["kind"] == "review" && e["state"] != "started");
+    assert_eq!((done["state"].clone(), done["ask"].clone()), (json!("done"), json!("Make it stricter")), "{done}");
+    let (_, view) = call(&a, "GET", "/deid-agent/api/review?path=letter.md", None);
+    let note = view["notes"].as_array().unwrap().iter()
+        .find(|n| n.to_string().contains("Stricter: The Tenant may break")).cloned().expect("the note on the passage");
+    assert!(note.to_string().contains("Asked: Make it stricter"), "{note}");
+    let at = |k: &str| note.get(k).and_then(Value::as_i64).or_else(|| note.pointer(&format!("/target/{k}")).and_then(Value::as_i64));
+    if let (Some(s), Some(e)) = (at("start"), at("end")) {
+        assert!(start <= s && e <= end, "on the passage: {s}..{e} in {start}..{end}");
+    }
+    // not in the document, or no passage at all: nothing is asked
+    let (status, _) = call(&a, "POST", "/deid-agent/api/review", Some(json!({"path": "letter.md", "ask": "?", "start": 0, "end": 1_000_000})));
+    assert_eq!(status, 400);
+    let (status, _) = call(&a, "POST", "/deid-agent/api/review", Some(json!({"path": "letter.md", "ask": "?"})));
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn the_question_and_the_passage_go_into_the_prompt_as_written_and_a_quote_lands_near_them() {
+    let p = deidkit::agents::review::ask_prompt("letter.md", ".legix/text/letter.md", "Pay {amount} by {date}.", "Shorter, please");
+    assert!(p.contains("<<<\nPay {amount} by {date}.\n>>>") && p.contains("and they ask you: Shorter, please"), "{p}");
+    assert!(p.contains("\"letter.md\"") && p.contains(".legix/text/letter.md") && !p.contains("{aspects}"), "{p}");
+    let text = "the fee is due. Later on: the fee is due.";
+    let quotes = vec!["the fee is due".to_string()];
+    let first = deidkit::agents::review::find_quotes_near(text, &quotes, None, Some(0))[0];
+    let second = deidkit::agents::review::find_quotes_near(text, &quotes, None, Some(30))[0];
+    assert!(first.is_some() && second.is_some() && first != second, "{first:?} {second:?}");
+    assert!(second.unwrap().0 > 20, "the one asked about: {second:?}");
+}
+
