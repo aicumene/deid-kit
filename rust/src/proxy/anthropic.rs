@@ -158,6 +158,45 @@ fn child(path: &[Seg], seg: Seg) -> Path {
 }
 
 /// Every string value inside a JSON value (keys untouched).
+/// Request fields that carry settings, not text: sent as they are.
+const PLAIN_FIELDS: [&str; 9] = ["model", "max_tokens", "stream", "temperature", "top_p", "top_k", "thinking", "tool_choice", "service_tier"];
+
+/// The descriptions and titles in tool definitions, at any depth (a tool's own, its parameters'): tools keep their
+/// names, which the conversation's tool calls name too.
+pub fn described(v: &Value, path: &[Seg], slots: &mut Vec<Path>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                if (k == "description" || k == "title") && x.is_string() {
+                    slots.push(child(path, Seg::Key(k.clone())));
+                } else if !x.is_string() {
+                    described(x, &child(path, Seg::Key(k.clone())), slots);
+                }
+            }
+        }
+        Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                described(x, &child(path, Seg::Idx(i)), slots);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The text of every field of `body` but `handled` and the settings in `plain`, as slots under `base` (31.10.2026: the
+/// baseline found names in `metadata.user_id` and in a tool's description going out as written).
+pub fn other_fields(body: &Value, base: &[Seg], handled: &[&str], plain: &[&str], slots: &mut Vec<Path>) {
+    let Some(o) = body.as_object() else { return };
+    for (k, v) in o.iter().filter(|(k, _)| !handled.contains(&k.as_str()) && !plain.contains(&k.as_str())) {
+        let p = child(base, Seg::Key(k.clone()));
+        match v {
+            Value::String(_) => slots.push(p),
+            v if k == "tools" => described(v, &p, slots),
+            v => strings(v, &p, slots),
+        }
+    }
+}
+
 pub fn strings(v: &Value, path: &[Seg], slots: &mut Vec<Path>) {
     match v {
         Value::Object(m) => {
@@ -311,6 +350,7 @@ pub fn prepare_request(body: &Value, engine: &ScopeEngine, restore_get: &dyn Fn(
             _ => return Err(PrepareError::Refused(format!("message {m} has no content list"))),
         }
     }
+    other_fields(&body.clone(), &[], &["system", "messages"], &PLAIN_FIELDS, &mut slots);
     let texts = slot_texts(&body, &slots).map_err(PrepareError::Failed)?;
     let reds = engine.tokenize_all(&texts).map_err(PrepareError::Failed)?;
     for (p, red) in slots.iter().zip(&reds) {

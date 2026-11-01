@@ -32,6 +32,44 @@ use crate::{log, py};
 
 const HOP: [&str; 13] = ["host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
     "proxy-authorization", "proxy-connection", "accept-encoding", "content-encoding", "x-deid-scope"];
+
+/// Headers that carry the protocol, not text: sent as they are. Any other header's value is de-identified (31.10.2026:
+/// a header the agent set, `x-matter-note: Tamsin Okafor`, reached the provider as written).
+const PLAIN_HEADERS: [&str; 24] = ["content-type", "content-length", "accept", "user-agent", "anthropic-version", "anthropic-beta",
+    "x-api-key", "authorization", "host", "connection", "x-app", "x-request-id", "traceparent", "tracestate",
+    "anthropic-dangerous-direct-browser-access", "chatgpt-account-id", "originator", "session_id", "version", "openai-beta",
+    "openai-organization", "openai-project", "x-client-request-id", "idempotency-key"];
+const PLAIN_PREFIXES: [&str; 3] = ["x-stainless-", "sec-", "x-claude-code-"];
+
+/// A query value read back into text: `%XX` as UTF-8 bytes, `+` as a space.
+fn query_decode(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
+                    Ok(x) => {
+                        out.push(x);
+                        i += 3;
+                        continue;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Text as a query value: unreserved characters as they are, the rest `%XX`.
+fn query_encode(v: &str) -> String {
+    v.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
 /// The path of ChatGPT's backend: `chatgpt_base_url` of a confined or walled-in Codex is deid-agent's own, under it.
 pub const CHATGPT_BACKEND: &str = "/backend-api/";
 const BACK_DROP: [&str; 5] =["content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"];
@@ -255,6 +293,37 @@ impl Proxy {
         (!self.cfg.require_scope).then(|| self.cfg.default_scope.clone())
     }
 
+    /// The request with its query's values and its headers' text de-identified as its body is (31.10.2026: a GET's query
+    /// string and an agent's own header went out as written). The body is the request builders' work.
+    pub fn clean_request(&self, req: &mut Request, engine: &ScopeEngine) -> Result<(), String> {
+        if let Some((path, qs)) = req.path_qs.clone().split_once('?') {
+            let pairs: Vec<(String, Option<String>)> = qs.split('&')
+                .map(|p| match p.split_once('=') { Some((k, v)) => (k.to_string(), Some(v.to_string())), None => (p.to_string(), None) }).collect();
+            let values: Vec<String> = pairs.iter().map(|(_, v)| v.as_deref().map(query_decode).unwrap_or_default()).collect();
+            if values.iter().any(|v| v.chars().any(char::is_alphabetic)) {
+                let reds = engine.tokenize_all(&values)?;
+                let parts: Vec<String> = pairs.iter().zip(values.iter().zip(&reds)).map(|((k, v), (plain, red))| match v {
+                    Some(_) if red.text != *plain => format!("{k}={}", query_encode(&red.text)),
+                    Some(v) => format!("{k}={v}"),
+                    None => k.clone(),
+                }).collect();
+                req.path_qs = format!("{path}?{}", parts.join("&"));
+            }
+        }
+        let texts: Vec<usize> = req.headers.iter().enumerate().filter(|(_, (k, _))| {
+            let k = k.to_lowercase();
+            !PLAIN_HEADERS.contains(&k.as_str()) && !PLAIN_PREFIXES.iter().any(|p| k.starts_with(p)) && !HOP.contains(&k.as_str())
+        }).map(|(i, _)| i).collect();
+        if !texts.is_empty() {
+            let values: Vec<String> = texts.iter().map(|&i| req.headers[i].1.clone()).collect();
+            let reds = engine.tokenize_all(&values)?;
+            for (&i, red) in texts.iter().zip(&reds) {
+                req.headers[i].1 = red.text.clone();
+            }
+        }
+        Ok(())
+    }
+
     pub fn engine(&self, scope: &str) -> Rc<ScopeEngine> {
         self.engines.borrow_mut().entry(scope.to_string()).or_insert_with(|| {
             Rc::new(ScopeEngine::new(self.store.clone(), scope, self.cfg.seeds.clone(), self.cfg.detector.clone(), None))
@@ -370,7 +439,20 @@ impl Proxy {
         error(403, &format!("deid proxy: {} {} is not forwarded, because the proxy cannot de-identify it", req.method, req.path))
     }
 
-    async fn pass(&self, req: Request) -> Response {
+    async fn pass(&self, mut req: Request) -> Response {
+        match self.scope(&req, &Value::Null) {
+            Some(scope) => {
+                if let Err(f) = self.clean_request(&mut req, &self.engine(&scope)) {
+                    log::error(&format!("de-identification failed; nothing sent: {f}"));
+                    return error(500, "deid proxy: de-identification failed, so nothing was sent");
+                }
+            }
+            None if req.path_qs.split_once('?').is_some_and(|(_, q)| q.chars().any(char::is_alphabetic)) => {
+                log::warning(&format!("refused {} {}: no scope to de-identify its query with", req.method, req.path));
+                return error(400, "deid proxy: this request has no scope to de-identify its query with; send an x-deid-scope header");
+            }
+            None => {}
+        }
         let url = self.url(&req);
         let mut up = match http::fetch(&req.method, &url, &self.headers(&req), Bytes::new(), CONNECT, READ).await {
             Ok(u) => u,
@@ -428,7 +510,7 @@ impl Proxy {
         }
     }
 
-    async fn responses(self: Rc<Self>, req: Request) -> Response {
+    async fn responses(self: Rc<Self>, mut req: Request) -> Response {
         let body = match self.body(&req) {
             Ok(b) => b,
             Err(r) => return r,
@@ -437,6 +519,10 @@ impl Proxy {
             return error(400, "deid proxy: this folder has no scope; list it under `paths` in a seed file, or send an x-deid-scope header");
         };
         let engine = self.engine(&scope);
+        if let Err(f) = self.clean_request(&mut req, &engine) {
+            log::error(&format!("de-identification failed; nothing sent: {f}"));
+            return error(500, "deid proxy: de-identification failed, so nothing was sent");
+        }
         let restore = self.restore.clone();
         let drop = self.route.borrow().drop_tool_namespaces.clone();
         let prep = match openai::prepare_responses(&body, &engine, &self.headers(&req), &|k| restore.get(k), &self.cfg.binary,
@@ -497,7 +583,7 @@ impl Proxy {
         resp
     }
 
-    async fn messages(self: Rc<Self>, req: Request) -> Response {
+    async fn messages(self: Rc<Self>, mut req: Request) -> Response {
         let counting = req.path.ends_with("/count_tokens");
         let body = match self.body(&req) {
             Ok(b) => b,
@@ -507,6 +593,10 @@ impl Proxy {
             return error(400, "deid proxy: this folder has no scope; list it under `paths` in a seed file, or send an x-deid-scope header");
         };
         let engine = self.engine(&scope);
+        if let Err(f) = self.clean_request(&mut req, &engine) {
+            log::error(&format!("de-identification failed; nothing sent: {f}"));
+            return error(500, "deid proxy: de-identification failed, so nothing was sent");
+        }
         let restore = self.restore.clone();
         let prep = match anthropic::prepare_request(&body, &engine, &|k| restore.get(k), &self.cfg.binary) {
             Ok(p) => p,

@@ -12,6 +12,7 @@ pub mod detect;
 pub mod difflib;
 pub mod gateway;
 pub mod http;
+pub mod legal;
 pub mod log;
 pub mod namefold;
 pub mod odict;

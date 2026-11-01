@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use serde_json::{json, Map, Value};
 
 use crate::odict::ODict;
-use crate::proxy::anthropic::{at, detokenize_obj, key, safe_restores, slot_texts, strings, subagent_tools, Holdback, Path, PrepareError, Seg};
+use crate::proxy::anthropic::{at, detokenize_obj, key, other_fields, safe_restores, slot_texts, strings, subagent_tools, Holdback, Path, PrepareError, Seg};
 use crate::proxy::engine::ScopeEngine;
 use crate::proxy::spelling;
 use crate::pyre::{self, Regex, NONE};
@@ -139,6 +139,10 @@ pub fn drop_namespaces(body: &mut Value, names: &HashSet<String>) -> usize {
     dropped
 }
 
+/// Request fields that carry settings, not text: sent as they are.
+const PLAIN_FIELDS: [&str; 16] = ["model", "stream", "store", "reasoning", "tool_choice", "parallel_tool_calls", "temperature", "top_p",
+    "max_output_tokens", "truncation", "include", "service_tier", "previous_response_id", "text", "prompt_cache_key", "background"];
+
 /// The request as it may cross, the headers that carry metadata, and the mapping back.
 pub fn prepare_responses(body: &Value, engine: &ScopeEngine, headers: &[(String, String)], restore_get: &dyn Fn(&str) -> Option<String>,
                          binary: &str, drop: &HashSet<String>) -> Result<PreparedResponses, PrepareError> {
@@ -156,6 +160,9 @@ pub fn prepare_responses(body: &Value, engine: &ScopeEngine, headers: &[(String,
     if let Some(meta) = root["b"].get("client_metadata").filter(|m| m.is_object()).cloned() {
         strings(&meta, &child(&bp, Seg::Key("client_metadata".into())), &mut slots);
     }
+    // every other field with text in it: tools' descriptions, `metadata`, `user` (31.10.2026)
+    let b = root["b"].clone();
+    other_fields(&b, &bp, &["instructions", "input", "client_metadata"], &PLAIN_FIELDS, &mut slots);
     for (name, _) in headers {
         if name.to_lowercase() == "x-codex-turn-metadata" {
             slots.push(vec![Seg::Key("h".into()), Seg::Key(name.clone())]);

@@ -17,7 +17,7 @@ use serde_json::Value;
 use deidkit::agents::{confine, disclosure};
 use deidkit::agents::host::{shlex_split, AgentChoice, AgentHost, HostConfig};
 use deidkit::cli::{self, flag, opt, Opt};
-use deidkit::patterns::RegexDetector;
+use deidkit::legal::LegalDetector;
 use deidkit::proxy::server::{Proxy, ProxyConfig, StoreRestore};
 use deidkit::pyre;
 use deidkit::seeds::{load_scope_paths, load_seed_files, InMemorySeedSource, SeedEntity};
@@ -338,7 +338,7 @@ fn main() {
     }
     let proxy_cfg = ProxyConfig {
         default_scope: scope.clone(), seeds: Some(Rc::new(seeds)), upstream: args.str("--upstream").trim_end_matches('/').to_string(),
-        scope_paths: load_scope_paths(&files, &scope).unwrap_or_default(), detector: Some(Rc::new(RegexDetector::default())),
+        scope_paths: load_scope_paths(&files, &scope).unwrap_or_default(), detector: Some(Rc::new(LegalDetector::default())),
         record: args.get("--record").filter(|r| !r.is_empty()).map(py::expanduser),
         audit: Some(py::expanduser(&args.str("--audit"))),
         // the stand-in the agents send: for the organization's key, and at their own servers (with a key or without)

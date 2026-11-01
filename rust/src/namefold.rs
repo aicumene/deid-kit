@@ -79,6 +79,25 @@ pub fn fold(raw: &str) -> Folded {
             i += 1;
             continue;
         }
+        // a space written for a link, `%20` or a query's `+` between two letters, is a space (31.10.2026):
+        // "Tamsin%20Okafor" in a URL is the name "Tamsin Okafor"
+        let letter = |j: usize| chars.get(j).is_some_and(|c| c.is_alphanumeric() || *c == '.');
+        let url_space = if chars[i] == '%' && chars.get(i + 1) == Some(&'2') && chars.get(i + 2) == Some(&'0') && i > 0
+            && letter(i - 1) && letter(i + 3) {
+            3
+        } else if chars[i] == '+' && i > 0 && chars[i - 1].is_alphabetic() && chars.get(i + 1).is_some_and(|c| c.is_alphabetic()) {
+            1
+        } else {
+            0
+        };
+        if url_space > 0 {
+            pending_ws = Some(match pending_ws {
+                Some((ps, _)) => (ps, i + url_space),
+                None => (i, i + url_space),
+            });
+            i += url_space;
+            continue;
+        }
         let s = i;
         i += 1;
         while i < n && !skip[i] && is_cluster_mark(chars[i]) {

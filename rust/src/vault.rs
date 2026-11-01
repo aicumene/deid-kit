@@ -838,6 +838,16 @@ fn trim_frame_words(surface: &str) -> String {
     if klen(&trimmed) >= 4 { trimmed } else { surface.to_string() }
 }
 
+/// The surname of a title and one name (31.10.2026): "Mr Duffy" -> "Duffy", which is then the person's surface, the
+/// title an alias. A name that is ordinary vocabulary, short, or has digits is none.
+fn titled_surname(surface: &str) -> Option<String> {
+    let parts = nf::name_parts(py::strip(surface));
+    let [title, name] = parts.as_slice() else { return None };
+    let capital = name.chars().next().is_some_and(char::is_uppercase);
+    (nf::is_honorific(title) && !nf::is_honorific(name) && capital && klen(name) >= 3 && !nf::is_common_word(name)
+        && !name.chars().any(|c| c.is_ascii_digit())).then(|| name.clone())
+}
+
 /// Should a residual detection be enrolled at all?
 fn admit(surface: &str, kind: &str, idx: Option<&Index>, language: Option<&str>, vetoed: Option<&HashSet<String>>) -> (bool, String) {
     if detect::structural(kind) {
@@ -859,7 +869,8 @@ fn admit(surface: &str, kind: &str, idx: Option<&Index>, language: Option<&str>,
         return if nf::token_in_text(surface).is_some() { (false, "contains a token".into()) } else { (true, "non-person".into()) };
     }
     let (ok, reason) = nf::admit_person(surface);
-    if !ok {
+    // a title and a surname ("Mr Duffy", "Frau Hartmann") is a person, though one name part
+    if !ok && !(reason == "single word" && titled_surname(surface).is_some()) {
         return (ok, reason);
     }
     if vetoed.is_some_and(|v| v.contains(&normalize(surface))) {
@@ -943,7 +954,7 @@ fn absorb(store: &dyn TokenStore, scope: &str, detected: &[(String, String)], la
                 continue;
             }
         }
-        let value = if kind == "PERSON" { trim_frame_words(&surface) } else { surface.clone() };
+        let value = if kind == "PERSON" { titled_surname(&surface).unwrap_or_else(|| trim_frame_words(&surface)) } else { surface.clone() };
         let tok = register_surface(store, &mut idx, scope, &value, kind, Some(attrs(&[("source", json!("residual"))])), "residual",
                                    matches!(kind.as_str(), "PERSON" | "ORG" | "VESSEL"), Some(&mut pending));
         if let Some(t) = &tok {
